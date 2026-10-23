@@ -172,7 +172,7 @@ Linux-based M1-M5 of draft 0.
 |---|---|---|---|
 | M0 | Knowledge base | Wiki + this doc (done) | n/a |
 | B1 | Broker protocol on a host | Grant, attenuate, revoke-by-forwarder and audit for one agent, as a userspace prototype on Linux | The protocol needs ambient authority to do real work |
-| B2 | Kernel spike | CoW clone, threads with interrupt/redirect, IPC with cancel, capability space and agent object on OSTD (or a Redox fork); boots in QEMU | OSTD fights the object model and a Redox fork costs more than it saves. Revisit ADR 0002 |
+| B2 | Kernel spike ([done 2026-10-23](b2-spike-report.md)) | CoW clone, threads with interrupt/redirect, IPC with cancel, capability space and agent object on OSTD (or a Redox fork); boots in QEMU | OSTD fights the object model and a Redox fork costs more than it saves. Revisit ADR 0002 |
 | B3 | POSIX core | procmgr, vfs, exec, a libc; BusyBox shell runs; os-test wired into CI with allowlists; fork+exec and signal cost measured | Layer cost exceeds the target; or the kernel-heavy suites stall |
 | B4 | Agents native | Agents as kernel objects running a POSIX tool under a grant; inference server with snapshot cost measured; trusted-path escalation | An agent escapes its grant by design, or needs `/` to do useful work |
 | B5 | Adherence tier | os-test at the chosen tier; BusyBox and bash suites pass against triaged lists | n/a |

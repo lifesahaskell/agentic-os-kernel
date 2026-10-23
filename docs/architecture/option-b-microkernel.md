@@ -173,7 +173,8 @@ are where microkernels score worst: Redox pty 6%, MINIX process 16%.
 
 ## 7. Open questions for Corey
 
-- **B1. Build base:** an OSTD spike first, or go straight to a Redox fork?
+- **B1. Build base:** an OSTD spike first, or go straight to a Redox fork? **Spiked 2026-10-23:** OSTD
+  held up for the B2 primitives; continue on it ([b2-spike-report.md](b2-spike-report.md)).
 - **B2. Target architecture:** x86-64 only for v1? Asterinas tiers it first; Moss is AArch64 only.
 - **B3. libc:** relibc or musl plus shim? This sets the ceiling on the os-test headline.
 - **B4. Adherence tier and date:** which of 70%, 84% or 90%, and by when? Without a date the tier
