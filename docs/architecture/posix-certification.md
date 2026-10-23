@@ -1,5 +1,10 @@
 # POSIX Certification: What It Takes (as of 2026-10-23)
 
+> **Status, 2026-10-23: reference only.** Certification is no longer a goal
+> ([ADR 0002](adr/0002-rust-microkernel.md)). The project targets POSIX adherence measured with
+> free suites ([option-b-microkernel.md section 5](option-b-microkernel.md#5-posix-adherence-bar-replaces-certification)).
+> This page stays as the record of what full 1003.1-2016 Base would require.
+
 Research summary for the "formally POSIX certified" requirement. Every claim has a URL. Claims
 marked **[verified]** were re-checked against the primary page on 2026-10-23. The rest come from
 a research pass whose fetches went through a summarizing model; re-check them before relying on

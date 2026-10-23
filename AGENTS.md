@@ -1,7 +1,7 @@
 # agentic-os-kernel
 
-Research workspace for scoping a natively agentic, POSIX-certified operating system. No kernel code
-yet. Two layers:
+Research workspace for scoping a natively agentic, POSIX-adherent operating system (formal
+certification dropped 2026-10-23). No kernel code yet. Two layers:
 
 - `wiki/`: an LLM-maintained wiki compiled from the sources in `raw/`. Its `[[wikilinks]]` form the
   knowledge graph.

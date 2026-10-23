@@ -1,6 +1,9 @@
 # ADR 0001: Kernel substrate
 
-- Status: **Proposed** (needs Corey's decision)
+- Status: **Superseded** by [ADR 0002](0002-rust-microkernel.md) (2026-10-23). Not accepted.
+  The goal changed from formal POSIX certification to POSIX adherence without certification,
+  which removes the criterion that carried option A. This record keeps the original argument,
+  with the three errors found in review corrected below.
 - Date: 2026-10-23
 - Inputs: [scoping.md](../scoping.md), [posix-certification.md](../posix-certification.md),
   [wiki bridge page](../../../wiki/concepts/aios-ostep-mapping.md)
@@ -16,8 +19,12 @@ are a library-level layer with no protection boundary
 
 **A. Linux kernel + agent subsystem.** Agents run as Linux processes under a dedicated
 credential/namespace. Mediation is kernel-enforced through existing hooks: an LSM (or Landlock)
-for files, seccomp user-notification for trapping selected syscalls to a broker, cgroups for
-accounting, and namespaces for isolation. A privileged agent broker (the agentic "kernel
+for files and network, cgroups for accounting, and namespaces for isolation. *(Corrected
+2026-10-23.)* seccomp user-notification is **not** an enforcement point: its man page warns
+against using it for security policy, because pointer arguments can change between the check
+and the use (TOCTOU, `seccomp_unotify(2)`). It is safe only when the broker performs the
+operation itself and hands back an fd; enforcement has to come from Landlock, an LSM, or
+namespaces. A privileged agent broker (the agentic "kernel
 server") holds capabilities and policy. Inference is a scheduled device behind that broker.
 
 **B. New Rust microkernel + POSIX personality.** Agents are native kernel objects with
@@ -30,18 +37,25 @@ pattern).
 - *C2, seL4*: formally verified and capability-native, with a thin POSIX story. No seL4 system
   has been certified.
 
+**D. Microkernel hosting a Linux VM.** *(Added 2026-10-23; missing from the first draft.)*
+Agents and the broker run natively on a capability microkernel (seL4 or new). POSIX software
+runs unmodified inside a Linux guest, and its side effects reach the outside only through
+broker-owned virtual devices ([[virtual-machine-monitor]], ostep pp. 783-785). This trades POSIX
+fidelity for a two-world system: an agent that shells out lands in the guest, where the broker
+sees device traffic, not syscalls. Not scored below.
+
 ## Scoring
 
 The scores are judgments, with the evidence noted. 3 is best.
 
 | Criterion | Weight | A. Linux | B. New kernel | C1. Redox | C2. seL4 |
 |---|---|---|---|---|---|
-| Certification feasibility | 3 | **3**: a Linux system has passed UNIX 03 (EulerOS 2016); glibc, bash and coreutils already target POSIX | 1: must pass ~34,600 tests from zero | 1-2: years in, no attempt yet | 1: no POSIX userland to speak of |
+| Certification feasibility | 3 | **2** *(corrected from 3)*: a Linux system has passed UNIX 03 (EulerOS 2016), but that was a vendor-patched distro, nobody holds 1003.1-2016 Base, and the agent layer adds surface the suites would exercise | 1: must pass ~34,600 tests from zero | 1-2: years in, no attempt yet | 1: no POSIX userland to speak of |
 | Agent mediation strength | 3 | 2: seccomp-unotify and LSM are real trap points, but the TCB is huge (the whole Linux kernel) | **3**: designed in | 2-3: capability-ish schemes | **3**: capabilities plus a verified kernel |
 | "Natively agentic" fit | 2 | 2: agents are processes with extra kernel-enforced policy, not new kernel objects | **3** | 2 | 3 |
 | Time to first measurable prototype | 2 | **3**: weeks | 1: years | 2 | 1 |
 | Reversibility | 1 | **3**: the broker/policy API can be ported to B or C later | 1 | 2 | 1 |
-| **Weighted total** (max 33) | | **28** | 21 | 19-25 | 21 |
+| **Weighted total** (max 33) | | **25** *(corrected from 28)* | 21 | 19-25 | 21 |
 
 ## Recommendation
 
