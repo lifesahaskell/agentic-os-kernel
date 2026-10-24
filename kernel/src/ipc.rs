@@ -2,7 +2,7 @@
 //! blocked receive can be cancelled by `Thread::interrupt`. A ring-3 server answers a call
 //! through a reply handle the kernel parks in its own thread's `ReplyTable`.
 
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{
     fmt,
     mem::offset_of,
@@ -30,6 +30,8 @@ pub struct Message {
     pub tid: u64,
     pub tag: u64,
     pub words: [u64; 4],
+    /// The bytes of the sender's `send_buf`, copied at send time.
+    pub data: Vec<u8>,
     /// Chosen by the sender and opaque to the kernel, unlike `sender`.
     pub label: u64,
     /// Present on a `call`: the server answers through it.
@@ -38,21 +40,25 @@ pub struct Message {
 
 /// The rendezvous between a `call`er blocked for its answer and the server that replies.
 pub struct ReplyWait {
-    words: SpinLock<Option<[u64; 4]>>,
+    answer: SpinLock<Option<([u64; 4], Vec<u8>)>>,
     wq: WaitQueue,
 }
 
 impl ReplyWait {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            words: SpinLock::new(None),
+            answer: SpinLock::new(None),
             wq: WaitQueue::new(),
         })
     }
 
     /// Hands the answer to the caller and wakes it. A caller that gave up never sees it.
     pub fn reply(&self, words: [u64; 4]) {
-        *self.words.lock() = Some(words);
+        self.reply_with(words, Vec::new());
+    }
+
+    pub fn reply_with(&self, words: [u64; 4], data: Vec<u8>) {
+        *self.answer.lock() = Some((words, data));
         self.wq.wake_all();
     }
 }
@@ -155,7 +161,7 @@ impl Endpoint {
     }
 
     pub fn send(&self, from: &Thread, words: [u64; 4]) -> Result<(), IpcError> {
-        self.push(from, 0, words, None)
+        self.push(from, 0, words, Vec::new(), None)
     }
 
     /// Queues a message and blocks until the server replies. The sender credential is taken
@@ -163,9 +169,20 @@ impl Endpoint {
     // shortcut: an interrupt abandons the message in the queue and the server's late reply goes
     // nowhere; 01-06 replaces this with Cancel-then-wait.
     pub fn call(&self, from: &Thread, label: u64, words: [u64; 4]) -> Result<[u64; 4], IpcError> {
+        Ok(self.call_bulk(from, label, words, Vec::new())?.0)
+    }
+
+    /// `call` with request bytes, returning the reply's words and bytes.
+    pub fn call_bulk(
+        &self,
+        from: &Thread,
+        label: u64,
+        words: [u64; 4],
+        data: Vec<u8>,
+    ) -> Result<([u64; 4], Vec<u8>), IpcError> {
         let reply = ReplyWait::new();
-        self.push(from, label, words, Some(reply.clone()))?;
-        Ok(from.block_until(&reply.wq, || reply.words.lock().take(), None)?)
+        self.push(from, label, words, data, Some(reply.clone()))?;
+        Ok(from.block_until(&reply.wq, || reply.answer.lock().take(), None)?)
     }
 
     fn push(
@@ -173,6 +190,7 @@ impl Endpoint {
         from: &Thread,
         label: u64,
         words: [u64; 4],
+        data: Vec<u8>,
         reply: Option<Arc<ReplyWait>>,
     ) -> Result<(), IpcError> {
         let mut q = self.queue.lock();
@@ -184,6 +202,7 @@ impl Endpoint {
             tid: from.tid(),
             tag: from.tag(),
             words,
+            data,
             label,
             reply,
         });
@@ -260,14 +279,37 @@ fn read_args(space: &VmSpace, args: UserPtr<IpcArgs>) -> Result<IpcArgs, Errno> 
     let slice = UserSlice::new(args.addr(), raw.len())?;
     copy_from_user(space, &mut raw, slice)?;
     let a = IpcArgs::from_bytes(&raw);
-    // Buffers and capability transfer are not implemented yet, so those fields must be zero.
-    if [a.send_buf, a.send_len, a.recv_buf, a.recv_len, a.ncaps]
-        .iter()
-        .any(|&x| x != 0)
-    {
+    // Capability transfer is not implemented yet (01-06), so `ncaps` must be zero.
+    if a.ncaps != 0 {
         return Err(Errno::EINVAL);
     }
     Ok(a)
+}
+
+/// A bulk buffer named by the caller: EINVAL above `MAX_IPC_BYTES`, EFAULT outside user space.
+fn user_slice(addr: u64, len: u64) -> Result<UserSlice, Errno> {
+    UserSlice::new(addr as usize, len as usize)
+}
+
+/// Copies the caller's bytes into kernel memory, in the caller's own context.
+// shortcut: staging memory is not charged to the sender's agent, so a client can pin
+// MAX_IPC_BYTES * QUEUE_LEN of kernel heap per endpoint; Phase 2 resource accounting charges it.
+fn read_bytes(space: &VmSpace, src: UserSlice) -> Result<Vec<u8>, Errno> {
+    let mut buf = vec![0u8; src.len()];
+    if !buf.is_empty() {
+        copy_from_user(space, &mut buf, src)?;
+    }
+    Ok(buf)
+}
+
+/// Writes the first `min(data.len(), dst.len())` bytes of `data` to `dst`, breaking
+/// copy-on-write there, charged to `t`'s agent.
+fn write_bytes(t: &Thread, space: &VmSpace, dst: UserSlice, data: &[u8]) -> Result<(), Errno> {
+    let n = data.len().min(dst.len());
+    if n == 0 {
+        return Ok(());
+    }
+    copy_to_user(space, t.agent(), UserSlice::new(dst.addr(), n)?, &data[..n])
 }
 
 /// Writes `bytes` at `offset` in the `IpcArgs` at `args`. Only the fields the call produces are
@@ -287,8 +329,15 @@ fn quads<const N: usize, const B: usize>(q: [u64; N]) -> [u8; B] {
     core::array::from_fn(|i| q[i / 8].to_le_bytes()[i % 8])
 }
 
+/// Reports how many bytes arrived (possibly more than fit in `recv_buf`) in `IpcArgs.send_len`.
+fn write_len(t: &Thread, space: &VmSpace, args: UserPtr<IpcArgs>, n: usize) -> Result<(), Errno> {
+    let at = offset_of!(IpcArgs, send_len);
+    write_args(t, space, args, at, &(n as u64).to_le_bytes())
+}
+
 /// `SYS_CALL`: sends `IpcArgs` (read from `args` in the caller's active `space`) to the endpoint
-/// in `ep` and writes the reply words back to `IpcArgs.words`.
+/// in `ep`, writes the reply words back to `IpcArgs.words`, the first `recv_len` reply bytes to
+/// `recv_buf`, and the full reply length to `send_len`.
 pub fn sys_call(
     t: &Thread,
     space: &VmSpace,
@@ -297,29 +346,41 @@ pub fn sys_call(
 ) -> Result<(), Errno> {
     let ep = endpoint(t, ep.index(), Rights::SEND)?;
     let a = read_args(space, args)?;
-    let words = ep.call(t, a.label, a.words)?;
+    let (send, recv) = (
+        user_slice(a.send_buf, a.send_len)?,
+        user_slice(a.recv_buf, a.recv_len)?,
+    );
+    let data = read_bytes(space, send)?;
+    let (words, reply) = ep.call_bulk(t, a.label, a.words, data)?;
+    write_bytes(t, space, recv, &reply)?;
     write_args(
         t,
         space,
         args,
         offset_of!(IpcArgs, words),
         &quads::<4, 32>(words),
-    )
+    )?;
+    write_len(t, space, args, reply.len())
 }
 
-/// Receives into the `IpcArgs` at `args`: `label`, `words`, `tid`, `tag` and `reply` are written;
-/// everything the sender could influence besides `label` and `words` is kernel-stamped.
+/// Receives into the `IpcArgs` at `args`: `label`, `words`, `tid`, `tag` and `reply` are written,
+/// the first `recv_len` message bytes go to `recv_buf` and the full length to `send_len`;
+/// everything the sender could influence besides `label`, `words` and the bytes is
+/// kernel-stamped. A failed delivery puts the message back.
 fn recv_into(
     t: &Thread,
     space: &VmSpace,
     ep: &Endpoint,
     args: UserPtr<IpcArgs>,
+    recv: UserSlice,
 ) -> Result<(), Errno> {
     let (m, handle) = ep.recv_parked(t)?;
     let head = quads::<5, 40>([m.label, m.words[0], m.words[1], m.words[2], m.words[3]]);
     let tail = quads::<3, 24>([m.tid, m.tag, handle]);
-    let delivered = write_args(t, space, args, offset_of!(IpcArgs, label), &head)
-        .and_then(|()| write_args(t, space, args, offset_of!(IpcArgs, tid), &tail));
+    let delivered = write_bytes(t, space, recv, &m.data)
+        .and_then(|()| write_args(t, space, args, offset_of!(IpcArgs, label), &head))
+        .and_then(|()| write_args(t, space, args, offset_of!(IpcArgs, tid), &tail))
+        .and_then(|()| write_len(t, space, args, m.data.len()));
     if delivered.is_err() {
         ep.unreceive(t, m, handle);
     }
@@ -334,20 +395,22 @@ pub fn sys_recv_args(
     args: UserPtr<IpcArgs>,
 ) -> Result<(), Errno> {
     let ep = endpoint(t, ep.index(), Rights::RECV)?;
-    read_args(space, args)?;
-    recv_into(t, space, &ep, args)
+    let a = read_args(space, args)?;
+    recv_into(t, space, &ep, args, user_slice(a.recv_buf, a.recv_len)?)
 }
 
-/// Answers the call parked under `handle` in `t`'s own table.
-fn answer(t: &Thread, a: &IpcArgs) -> Result<(), Errno> {
+/// Answers the call parked under `a.reply` in `t`'s own table with `a.words` and the bytes of
+/// `send_buf`, copied in the server's context. A bad buffer leaves the handle usable.
+fn answer(t: &Thread, space: &VmSpace, a: &IpcArgs) -> Result<(), Errno> {
+    let data = read_bytes(space, user_slice(a.send_buf, a.send_len)?)?;
     let w = t.replies.lock().take(a.reply).ok_or(Errno::EBADF)?;
-    w.reply(a.words);
+    w.reply_with(a.words, data);
     Ok(())
 }
 
-/// `SYS_REPLY`: answers the call named by `args.reply` with `args.words`.
+/// `SYS_REPLY`: answers the call named by `args.reply`.
 pub fn sys_reply(t: &Thread, space: &VmSpace, args: UserPtr<IpcArgs>) -> Result<(), Errno> {
-    answer(t, &read_args(space, args)?)
+    answer(t, space, &read_args(space, args)?)
 }
 
 /// `SYS_REPLY_RECV`: `sys_reply`, then `sys_recv_args` into the same block. The endpoint is
@@ -359,13 +422,16 @@ pub fn sys_reply_recv(
     args: UserPtr<IpcArgs>,
 ) -> Result<(), Errno> {
     let ep = endpoint(t, ep.index(), Rights::RECV)?;
-    answer(t, &read_args(space, args)?)?;
-    recv_into(t, space, &ep, args)
+    let a = read_args(space, args)?;
+    let recv = user_slice(a.recv_buf, a.recv_len)?;
+    answer(t, space, &a)?;
+    recv_into(t, space, &ep, args, recv)
 }
 
 #[cfg(ktest)]
 mod test {
     use ostd::{
+        mm::{FallibleVmRead, PAGE_SIZE, VmWriter},
         prelude::*,
         task::{Task, TaskOptions},
     };
@@ -613,9 +679,10 @@ mod test {
             words: [9, 0, 0, 0],
             ..IpcArgs::default()
         };
-        assert_eq!(answer(&s2, &a), Err(Errno::EBADF));
-        assert_eq!(answer(&s1, &a), Ok(()));
-        assert_eq!(answer(&s1, &a), Err(Errno::EBADF));
+        let nowhere = VmSpace::new();
+        assert_eq!(answer(&s2, &nowhere, &a), Err(Errno::EBADF));
+        assert_eq!(answer(&s1, &nowhere, &a), Ok(()));
+        assert_eq!(answer(&s1, &nowhere, &a), Err(Errno::EBADF));
         wait_len(&log, 1);
         assert_eq!(log.lock()[0], (5, [9, 0, 0, 0]));
     }
@@ -632,11 +699,76 @@ mod test {
         // Not the active space, so the write-back fails after the message was taken.
         let elsewhere = VmSpace::new();
         let args = UserPtr::new(0x1000).unwrap();
-        assert!(recv_into(&s, &elsewhere, &ep, args).is_err());
+        let none = user_slice(0, 0).unwrap();
+        assert!(recv_into(&s, &elsewhere, &ep, args, none).is_err());
         let m = ep.recv(&s).unwrap();
         assert_eq!(m.label, 6);
         m.reply.unwrap().reply([1, 2, 3, 4]);
         wait_len(&log, 1);
         assert_eq!(log.lock()[0], (6, [1, 2, 3, 4]));
+    }
+
+    /// Runs `bulk` (in a copy-on-write clone of its loaded image) against `bulk_srv` and checks
+    /// both exit 0 and that the parent's pages past the code, `.bss` included, are still zero.
+    fn bulk_round_trip(client_arg: u64, server_arg: u64) {
+        let ep = Endpoint::new();
+        let server_agent = agent_with(&ep);
+        let client_agent = server_agent
+            .spawn_child(&[(0, Rights::SEND)], 32, 1)
+            .unwrap();
+        let parent = load_image(user_image!("bulk")).unwrap();
+        let child = Image {
+            space: Arc::new(cow_clone(
+                &parent.space,
+                abi::IMAGE_BASE..abi::USER_STACK_TOP,
+            )),
+            entry: parent.entry,
+            handler: parent.handler,
+            text: parent.text.clone(),
+        };
+        let server_img = load_image(user_image!("bulk_srv")).unwrap();
+        let (client, server) = (Thread::new(client_agent), Thread::new(server_agent));
+        let server_exit = spawn_image(&server, &server_img, server_arg);
+        let client_exit = spawn_image(&client, &child, client_arg);
+        assert_eq!(join(&client_exit), Exit::Code(0));
+        assert_eq!(join(&server_exit), Exit::Code(0));
+
+        // The image header's last quad is `mem_end`.
+        let header = user_image!("bulk");
+        let mem_end = u64::from_le_bytes(header[32..40].try_into().unwrap()) as usize;
+        parent.space.activate();
+        let mut page = vec![0u8; PAGE_SIZE];
+        for va in (parent.text.end..mem_end.next_multiple_of(PAGE_SIZE)).step_by(PAGE_SIZE) {
+            let mut r = parent.space.reader(va, PAGE_SIZE).unwrap();
+            r.read_fallible(&mut VmWriter::from(&mut page[..])).unwrap();
+            assert!(
+                page.iter().all(|&b| b == 0),
+                "parent page {va:#x} was written"
+            );
+        }
+    }
+
+    #[ktest]
+    fn multi_page_bulk_round_trip_matches_after_clone() {
+        bulk_round_trip(0, 0);
+    }
+
+    #[ktest]
+    fn short_receive_buffers_truncate_and_report_the_full_length() {
+        // The client's reply buffer holds 100 of the 12411 reply bytes.
+        bulk_round_trip(100 << 8, 0);
+        // The server's request buffer holds 100 of the 12411 request bytes; it replies with those
+        // 100 and the client sees a reply of 100.
+        bulk_round_trip(100 << 32, 100 << 8);
+    }
+
+    #[ktest]
+    fn bulk_buffers_are_bounded_and_must_be_user_memory() {
+        assert_eq!(
+            user_slice(0x40_0000, abi::MAX_IPC_BYTES as u64 + 1),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(user_slice(0xffff_8000_0000_0000, 8), Err(Errno::EFAULT));
+        assert!(user_slice(0x40_0000, abi::MAX_IPC_BYTES as u64).is_ok());
     }
 }

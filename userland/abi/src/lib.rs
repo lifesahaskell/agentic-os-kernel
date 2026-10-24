@@ -81,6 +81,20 @@ impl IpcArgs {
         out
     }
 
+    /// Points `send_buf` and `send_len` at `buf`. The kernel copies the bytes at call time.
+    pub fn with_send(mut self, buf: &[u8]) -> Self {
+        self.send_buf = buf.as_ptr() as u64;
+        self.send_len = buf.len() as u64;
+        self
+    }
+
+    /// Points `recv_buf` and `recv_len` at `buf`. The kernel writes at most `buf.len()` bytes.
+    pub fn with_recv(mut self, buf: &mut [u8]) -> Self {
+        self.recv_buf = buf.as_mut_ptr() as u64;
+        self.recv_len = buf.len() as u64;
+        self
+    }
+
     pub fn from_bytes(b: &[u8; 168]) -> Self {
         let mut q = b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c));
         let mut next = || q.next().unwrap();
