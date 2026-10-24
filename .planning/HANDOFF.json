@@ -1,35 +1,40 @@
 {
   "version": "1.0",
-  "timestamp": "2026-10-24T15:08:34.376Z",
+  "timestamp": "2026-10-24T19:09:53.224Z",
   "phase": "1",
   "phase_name": "Userland, syscall ABI and IPC v2",
   "phase_dir": ".planning/phases/01-userland-syscall-abi-and-ipc-v2",
-  "plan": null,
-  "task": null,
+  "plan": 6,
+  "task": 2,
   "total_tasks": null,
   "status": "paused",
   "completed_tasks": [
-    {"id": 1, "name": "project init, config, PROJECT.md", "status": "done", "commit": "7f731fa"},
-    {"id": 2, "name": "research (4 files + SUMMARY)", "status": "done", "commit": "bb28ab5"},
-    {"id": 3, "name": "REQUIREMENTS.md (73 v1) and ROADMAP.md (6 phases)", "status": "done", "commit": "25fb89b"},
-    {"id": 4, "name": "contained-unsafe policy, SAFE-01", "status": "done", "commit": "8f8d29b"}
+    {"id": "01-01", "name": "Tracer: ring-3 Rust image, syscall entry, call/reply", "status": "done", "commit": "433ae60"},
+    {"id": "01-02", "name": "Unsafe ledger, check.sh, CI, FPU route", "status": "done", "commit": "8422111"},
+    {"id": "01-03", "name": "Typed syscall decode, user copy, fuzz", "status": "done", "commit": "ff4a490"},
+    {"id": "01-04", "name": "Growable CSpace, MAX_SLOTS=65536", "status": "done", "commit": "926f4eb"},
+    {"id": "01-05", "name": "block_until, reply handles, tid/tag stamping, bulk copy", "status": "done", "commit": "1ae5158"},
+    {"id": "01-06", "name": "Cancel-then-wait and cap transfer", "status": "in_progress", "progress": "executor worktree has task 1 commit 2d9ee3e (Cancel-then-wait); cap transfer and SUMMARY not seen yet"}
   ],
   "remaining_tasks": [
-    {"id": 5, "name": "/gsd-discuss-phase 1 --auto (not started; no phase dir yet)", "status": "not_started"},
-    {"id": 6, "name": "/gsd-plan-phase 1 with research-phase flag", "status": "not_started"}
+    {"id": "01-06", "name": "finish or recover worktree, merge", "status": "in_progress"},
+    {"id": "01-07", "name": "Port B2 programs to Rust bins, null-IPC measurement, full gate", "status": "not_started"},
+    {"id": "verify", "name": "code review gate, gsd-verifier, phase.complete 1, transition", "status": "not_started"}
   ],
   "blockers": [
-    {"description": "Errno ADR: ESRCH vs EPERM (cross-domain kill), EROFS vs EACCES (read-only grant) amends option-b; needs Corey sign-off, due Phase 3", "type": "human_action", "workaround": "requirements assume research recommendation"}
+    {"description": "Boot check 'aok: cpu budget check' flaky (~1 in 4 runs, child one tick over bound); reproduces on 37dc2fd, predates 01-05", "type": "technical", "workaround": "re-run check.sh once; needs a real fix before phase sign-off"},
+    {"description": "REQUIREMENTS.md marks KERN-03 and IPC-01 complete early (set by 01-01 executor); KERN-03 port lands in 01-07", "type": "technical", "workaround": "verifier should correct; check at verify step"}
   ],
-  "async_jobs": [],
-  "human_actions_pending": [
-    {"action": "Decide whether --auto should chain into plan-phase, or run /gsd-discuss-phase 1 interactively", "context": "--auto skips roadmap review", "blocking": false}
+  "async_jobs": [
+    {"manifest": "/home/rakdos/.claude/jobs/31bc7b5d/tmp/wave5-manifest.json", "job_id": "gsd-executor 01-06 (worktree agent a19a5455c01cf224b)", "backend": "claude-code subagent, harness worktree", "status": "running at pause", "expected_artifacts": ["branch worktree-agent-a19a5455c01cf224b with task commits + docs(01-06) SUMMARY commit"], "verification_command": "git log --oneline 6668a7a..worktree-agent-a19a5455c01cf224b", "resume_command": "if SUMMARY commit present: worktree.record-agent + worktree.cleanup-wave (see .continue-here.md); else remove worktree and re-dispatch 01-06 with EXPECTED_BASE=6668a7abd2eaf8c874859ca41a96845558cc20b7"}
   ],
+  "human_actions_pending": [],
   "decisions": [
-    {"decision": "B3 only; B4/B5 in v2; B1 out of scope", "rationale": "B4/B5 depend on B3 outcomes", "phase": "0"},
-    {"decision": "unsafe allowed if contained and ledgered (docs/architecture/unsafe-ledger.md); OSTD patches still a re-score signal", "rationale": "avoid Redox switch over one low-level need like FPU state", "phase": "1"}
+    {"decision": "FPU via safe OSTD route (per-thread FpuContext swap), no kernel unsafe", "rationale": "keeps deny(unsafe_code)", "phase": "1"},
+    {"decision": "Executors dispatched with isolation=worktree, model sonnet, shared rules file", "rationale": "isolation-guard hook blocks non-worktree gsd-executor dispatch", "phase": "1"},
+    {"decision": "Accepted 01-05 out-of-plan cow_clone fix in kernel/src/vm.rs", "rationale": "latent panic on second clone; adds no unsafe", "phase": "1"}
   ],
-  "uncommitted_files": [],
-  "next_action": "/clear, then /gsd-discuss-phase 1 --auto (or without --auto to review first)",
-  "context_notes": "Branch planning/gsd-init, main untouched. Research is MEDIUM confidence, unverified. FPU/SSE under OSTD is the Phase 1 stop/go gate. No Co-Authored-By/Claude-Session trailers (user rule). Out-of-scope: README says 17/17 tests, b2 report 27/27 plus stale 17/17 and 15/15 lines."
+  "uncommitted_files": [" M .planning/config.json", "?? .claude/worktrees/", "?? .planning/milestone.lock", "?? .planning/state.json"],
+  "next_action": "Check branch worktree-agent-a19a5455c01cf224b for the 01-06 SUMMARY commit; merge or re-dispatch, then wave 6 (01-07)",
+  "context_notes": "Resume via /gsd-execute-phase 1; it resumes at the first plan without a SUMMARY. config.json, milestone.lock, state.json were dirty before this session; leave them."
 }
