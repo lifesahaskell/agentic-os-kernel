@@ -123,6 +123,8 @@ impl Cap {
 
 pub struct CSpace {
     slots: Vec<Option<Cap>>,
+    /// Indices of `None` slots in `slots`.
+    free: Vec<usize>,
 }
 
 impl Default for CSpace {
@@ -132,22 +134,28 @@ impl Default for CSpace {
 }
 
 impl CSpace {
-    pub const SLOTS: usize = 64;
+    /// Bound on slots per agent; keeps an agent from growing kernel memory without limit.
+    pub const MAX_SLOTS: usize = 65_536;
 
     pub fn new() -> Self {
         Self {
-            slots: (0..Self::SLOTS).map(|_| None).collect(),
+            slots: Vec::new(),
+            free: Vec::new(),
         }
     }
 
+    /// Lowest-free reuse is not guaranteed. POSIX lowest-fd semantics belong to the fd table in
+    /// the vfs/procmgr phases, not to the CSpace.
     pub fn insert(&mut self, cap: Cap) -> Result<usize, CapError> {
-        let i = self
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .ok_or(CapError::Full)?;
-        self.slots[i] = Some(cap);
-        Ok(i)
+        if let Some(i) = self.free.pop() {
+            self.slots[i] = Some(cap);
+            return Ok(i);
+        }
+        if self.slots.len() >= Self::MAX_SLOTS {
+            return Err(CapError::Full);
+        }
+        self.slots.push(Some(cap));
+        Ok(self.slots.len() - 1)
     }
 
     pub fn get(&self, slot: usize) -> Result<&Cap, CapError> {
@@ -158,10 +166,13 @@ impl CSpace {
     }
 
     pub fn remove(&mut self, slot: usize) -> Result<Cap, CapError> {
-        self.slots
+        let cap = self
+            .slots
             .get_mut(slot)
             .and_then(Option::take)
-            .ok_or(CapError::NoSlot)
+            .ok_or(CapError::NoSlot)?;
+        self.free.push(slot);
+        Ok(cap)
     }
 }
 
@@ -217,12 +228,19 @@ mod test {
     fn cspace_slots() {
         let mut cs = CSpace::new();
         let s = cs.insert(ep_cap(Rights::SEND)).unwrap();
+        assert_eq!(s, 0);
         assert!(cs.get(s).is_ok());
         cs.remove(s).unwrap();
         assert_eq!(cs.get(s).err(), Some(CapError::NoSlot));
-        for _ in 0..CSpace::SLOTS {
-            cs.insert(ep_cap(Rights::SEND)).unwrap();
+        assert_eq!(cs.remove(s).err(), Some(CapError::NoSlot));
+        assert_eq!(cs.get(CSpace::MAX_SLOTS).err(), Some(CapError::NoSlot));
+        let cap = ep_cap(Rights::SEND);
+        for i in 0..CSpace::MAX_SLOTS {
+            assert_eq!(cs.insert(cap.clone()).unwrap(), i);
         }
-        assert_eq!(cs.insert(ep_cap(Rights::SEND)).err(), Some(CapError::Full));
+        assert_eq!(cs.insert(cap.clone()).err(), Some(CapError::Full));
+        // Freeing one slot makes room again without growing past the bound.
+        cs.remove(7).unwrap();
+        assert_eq!(cs.insert(cap).unwrap(), 7);
     }
 }
