@@ -1,0 +1,35 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-10-24T15:08:34.376Z",
+  "phase": "1",
+  "phase_name": "Userland, syscall ABI and IPC v2",
+  "phase_dir": ".planning/phases/01-userland-syscall-abi-and-ipc-v2",
+  "plan": null,
+  "task": null,
+  "total_tasks": null,
+  "status": "paused",
+  "completed_tasks": [
+    {"id": 1, "name": "project init, config, PROJECT.md", "status": "done", "commit": "7f731fa"},
+    {"id": 2, "name": "research (4 files + SUMMARY)", "status": "done", "commit": "bb28ab5"},
+    {"id": 3, "name": "REQUIREMENTS.md (73 v1) and ROADMAP.md (6 phases)", "status": "done", "commit": "25fb89b"},
+    {"id": 4, "name": "contained-unsafe policy, SAFE-01", "status": "done", "commit": "8f8d29b"}
+  ],
+  "remaining_tasks": [
+    {"id": 5, "name": "/gsd-discuss-phase 1 --auto (not started; no phase dir yet)", "status": "not_started"},
+    {"id": 6, "name": "/gsd-plan-phase 1 with research-phase flag", "status": "not_started"}
+  ],
+  "blockers": [
+    {"description": "Errno ADR: ESRCH vs EPERM (cross-domain kill), EROFS vs EACCES (read-only grant) amends option-b; needs Corey sign-off, due Phase 3", "type": "human_action", "workaround": "requirements assume research recommendation"}
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [
+    {"action": "Decide whether --auto should chain into plan-phase, or run /gsd-discuss-phase 1 interactively", "context": "--auto skips roadmap review", "blocking": false}
+  ],
+  "decisions": [
+    {"decision": "B3 only; B4/B5 in v2; B1 out of scope", "rationale": "B4/B5 depend on B3 outcomes", "phase": "0"},
+    {"decision": "unsafe allowed if contained and ledgered (docs/architecture/unsafe-ledger.md); OSTD patches still a re-score signal", "rationale": "avoid Redox switch over one low-level need like FPU state", "phase": "1"}
+  ],
+  "uncommitted_files": [],
+  "next_action": "/clear, then /gsd-discuss-phase 1 --auto (or without --auto to review first)",
+  "context_notes": "Branch planning/gsd-init, main untouched. Research is MEDIUM confidence, unverified. FPU/SSE under OSTD is the Phase 1 stop/go gate. No Co-Authored-By/Claude-Session trailers (user rule). Out-of-scope: README says 17/17 tests, b2 report 27/27 plus stale 17/17 and 15/15 lines."
+}
