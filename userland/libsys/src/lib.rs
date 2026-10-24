@@ -21,8 +21,10 @@ pub fn sched_yield() {
     raw::syscall6(SYS_SCHED_YIELD, [0; 6]);
 }
 
-/// Sends `args` to the endpoint in slot `ep` and waits for the reply, which overwrites
-/// `args.words`. `Err` carries the positive errno.
+/// Sends `args` (with the `ncaps` capabilities named in `caps`, attenuated by `cap_rights`) to the
+/// endpoint in slot `ep` and waits for the reply, which overwrites `args.words` and the capability
+/// list (`caps`, `cap_rights`, `ncaps` hold the slots the reply installed). `Err` carries the
+/// positive errno.
 pub fn call(ep: u64, args: &mut IpcArgs) -> Result<(), isize> {
     let r = raw::syscall6(
         SYS_CALL,
@@ -32,7 +34,8 @@ pub fn call(ep: u64, args: &mut IpcArgs) -> Result<(), isize> {
 }
 
 /// Waits for a message on the endpoint in slot `ep`. On success `args` holds its `label`,
-/// `words`, `tid` and `tag`, and `reply` holds the handle to answer a `call` (0 for a `send`).
+/// `words`, `tid` and `tag`, `reply` holds the handle to answer a `call` (0 for a `send`), and
+/// `caps`, `cap_rights`, `ncaps` hold the slots and rights of the capabilities it installed.
 pub fn recv(ep: u64, args: &mut IpcArgs) -> Result<(), isize> {
     let r = raw::syscall6(
         SYS_RECV,

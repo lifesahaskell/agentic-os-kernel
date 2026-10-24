@@ -33,6 +33,7 @@ impl Errno {
     pub const ENOMEM: Errno = Errno(errno::ENOMEM);
     pub const EFAULT: Errno = Errno(errno::EFAULT);
     pub const EINVAL: Errno = Errno(errno::EINVAL);
+    pub const EMFILE: Errno = Errno(errno::EMFILE);
     pub const ENOSYS: Errno = Errno(errno::ENOSYS);
     pub const EMSGSIZE: Errno = Errno(errno::EMSGSIZE);
     pub const ETIMEDOUT: Errno = Errno(errno::ETIMEDOUT);
@@ -52,8 +53,9 @@ impl From<IpcError> for Errno {
     fn from(e: IpcError) -> Self {
         match e {
             IpcError::Cap(c) => c.into(),
-            IpcError::WrongType => Errno::EINVAL,
+            IpcError::WrongType | IpcError::Invalid => Errno::EINVAL,
             IpcError::Full => Errno::EAGAIN,
+            IpcError::NoRoom => Errno::EMFILE,
             IpcError::Interrupted => Errno::EINTR,
             IpcError::TimedOut => Errno::ETIMEDOUT,
         }
@@ -163,7 +165,7 @@ impl UserSlice {
 pub struct Handle(usize);
 
 impl Handle {
-    pub const LIMIT: usize = 65_536;
+    pub const LIMIT: usize = crate::cap::CSpace::MAX_SLOTS;
 
     pub fn new(raw: usize) -> Result<Self, Errno> {
         if raw < Self::LIMIT {
@@ -459,7 +461,7 @@ mod test {
         }
     }
 
-    const KNOWN: [isize; 10] = [
+    const KNOWN: [isize; 11] = [
         errno::EPERM,
         errno::EINTR,
         errno::EBADF,
@@ -467,6 +469,7 @@ mod test {
         errno::ENOMEM,
         errno::EFAULT,
         errno::EINVAL,
+        errno::EMFILE,
         errno::ENOSYS,
         errno::EMSGSIZE,
         errno::ETIMEDOUT,

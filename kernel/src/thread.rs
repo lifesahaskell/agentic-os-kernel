@@ -4,7 +4,11 @@
 //! pending redirect. The thread applies the redirect itself between `UserMode::execute` calls, so
 //! the register rewrite can never race syscall entry.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ostd::{
@@ -95,6 +99,8 @@ pub(crate) static FPU_SWAP_DISABLED: core::sync::atomic::AtomicBool =
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
 pub struct Thread {
+    /// This thread's own `Arc`, so a wait that outlives a borrow can name it weakly.
+    me: Weak<Thread>,
     agent: Arc<Agent>,
     /// Kernel-assigned and stamped on every message this thread sends (IPC-03).
     tid: u64,
@@ -102,6 +108,9 @@ pub struct Thread {
     tag: u64,
     /// Calls this thread has received and not yet answered, by reply handle.
     pub(crate) replies: SpinLock<ReplyTable>,
+    /// Handles of calls this thread has received whose caller was interrupted; the next receive
+    /// delivers each as a Cancel message.
+    pub(crate) cancels: SpinLock<VecDeque<u64>>,
     /// This thread's saved FPU/SSE state; live in the CPU only while `FPU_OWNER` points here.
     fpu: SharedFpu,
     // IRQ-safe: a timer callback may interrupt the thread.
@@ -120,11 +129,13 @@ impl Thread {
     /// A thread whose messages carry `tag`. This is the kernel half of `thread_create` until
     /// Phase 2 adds Thread capabilities.
     pub fn new_tagged(agent: Arc<Agent>, tag: u64) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             agent,
             tid: NEXT_TID.fetch_add(1, Ordering::Relaxed),
             tag,
             replies: SpinLock::new(ReplyTable::default()),
+            cancels: SpinLock::new(VecDeque::new()),
             fpu: Arc::new(SpinLock::new(FpuContext::default())),
             state: SpinLock::new(State {
                 redirect: None,
@@ -135,6 +146,10 @@ impl Thread {
             exc_handler: SpinLock::new(None),
             exc_wq: WaitQueue::new(),
         })
+    }
+
+    pub fn downgrade(&self) -> Weak<Thread> {
+        self.me.clone()
     }
 
     pub fn agent(&self) -> &Arc<Agent> {
@@ -198,6 +213,16 @@ impl Thread {
         }
     }
 
+    /// Queues a Cancel for the call parked under `handle` and wakes this thread if it is blocked,
+    /// so a receive in progress delivers it. Unlike `interrupt`, nothing is redirected.
+    pub(crate) fn push_cancel(&self, handle: u64) {
+        self.cancels.lock().push_back(handle);
+        let waker = self.state.lock().blocked.clone();
+        if let Some(w) = waker {
+            w.wake_up();
+        }
+    }
+
     pub fn take_redirect(&self) -> Option<Vaddr> {
         self.state.lock().redirect.take()
     }
@@ -223,8 +248,28 @@ impl Thread {
     pub fn block_until<R>(
         &self,
         wq: &WaitQueue,
+        cond: impl FnMut() -> Option<R>,
+        deadline: Option<u64>,
+    ) -> Result<R, BlockError> {
+        self.block(wq, cond, deadline, true)
+    }
+
+    /// `block_until` that no interrupt can abort and with no deadline: for a caller whose request
+    /// the server already holds, which must see the answer (Cancel-then-wait). Only returns once
+    /// `cond` yields.
+    pub fn block_until_committed<R>(&self, wq: &WaitQueue, cond: impl FnMut() -> Option<R>) -> R {
+        match self.block(wq, cond, None, false) {
+            Ok(r) => r,
+            Err(_) => unreachable!("an uninterruptible wait without a deadline cannot give up"),
+        }
+    }
+
+    fn block<R>(
+        &self,
+        wq: &WaitQueue,
         mut cond: impl FnMut() -> Option<R>,
         deadline: Option<u64>,
+        interruptible: bool,
     ) -> Result<R, BlockError> {
         let (waiter, waker) = Waiter::new_pair();
         // Published under the same lock `interrupt` takes, so an interrupt either sees this
@@ -245,7 +290,9 @@ impl Thread {
                 r
             },
             || {
-                if self.state.lock().redirect.is_some() {
+                if !interruptible {
+                    Ok(())
+                } else if self.state.lock().redirect.is_some() {
                     Err(BlockError::Interrupted)
                 } else if deadline.is_some_and(|due| Jiffies::elapsed().as_u64() >= due) {
                     Err(BlockError::TimedOut)
