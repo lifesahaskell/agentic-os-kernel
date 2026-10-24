@@ -107,7 +107,7 @@ mod test {
             .insert(Cap::new(Object::Endpoint(Endpoint::new()), Rights::ALL))
             .unwrap();
         assert_eq!(slot, 0);
-        let client = server.spawn_child(&[(slot, Rights::SEND)], 1).unwrap();
+        let client = server.spawn_child(&[(slot, Rights::SEND)], 1, 1).unwrap();
         (Thread::new(server), Thread::new(client))
     }
 

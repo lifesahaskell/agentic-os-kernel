@@ -7,7 +7,7 @@
 use alloc::sync::Arc;
 
 use ostd::{
-    mm::Vaddr,
+    mm::{Vaddr, VmSpace},
     sync::{LocalIrqDisabled, SpinLock, WaitQueue, Waiter, Waker},
     user::UserModeHooks,
 };
@@ -22,6 +22,8 @@ struct State {
     redirect: Option<Vaddr>,
     /// The waker of the IPC this thread is blocked in, if any.
     blocked: Option<Arc<Waker>>,
+    /// The address space the thread runs in, loaded on every switch to its task.
+    space: Option<Arc<VmSpace>>,
 }
 
 pub struct Thread {
@@ -37,12 +39,22 @@ impl Thread {
             state: SpinLock::new(State {
                 redirect: None,
                 blocked: None,
+                space: None,
             }),
         })
     }
 
     pub fn agent(&self) -> &Arc<Agent> {
         &self.agent
+    }
+
+    pub fn set_space(&self, space: Arc<VmSpace>) {
+        // Bound so the old space, if any, drops after the IRQ-disabled lock is released.
+        let _old = self.state.lock().space.replace(space);
+    }
+
+    pub fn space(&self) -> Option<Arc<VmSpace>> {
+        self.state.lock().space.clone()
     }
 
     pub fn is_blocked(&self) -> bool {

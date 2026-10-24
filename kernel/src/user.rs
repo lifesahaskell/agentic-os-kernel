@@ -1,16 +1,20 @@
 //! Runs a thread in user mode: syscalls, CoW faults, and redirects applied between `execute`
-//! calls. The spike's only syscall is `exit(code)`.
+//! calls. The spike's syscalls are `exit(code)` and `sched_yield()`.
 
 use alloc::sync::Arc;
 
 use ostd::{
     arch::cpu::context::{CpuException, PageFaultErrorCode, UserContext},
-    mm::{Vaddr, VmSpace},
+    mm::{
+        CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmIo, VmSpace,
+    },
+    task::{Task, disable_preempt},
     user::{ReturnReason, UserMode},
 };
 
 use crate::{thread::Thread, vm::handle_cow_fault};
 
+const SYS_SCHED_YIELD: usize = 24;
 const SYS_EXIT: usize = 60;
 const ENOSYS: isize = 38;
 
@@ -23,7 +27,58 @@ pub enum Exit {
     Budget,
 }
 
+/// Position-independent test programs. Each touches only the counter page at `DATA`.
+/// Hand-assembled; `objdump -D -b binary -mi386:x86-64` reproduces the listing.
+pub mod prog {
+    use ostd::mm::Vaddr;
+
+    pub const DATA: Vaddr = 0x50_0000;
+    /// `do { [DATA] += 1; sched_yield(); } while [DATA] < 100; exit(0)`
+    pub const YIELDER: usize = 0x00;
+    /// `loop { [DATA] += 1 }`, 10 bytes long.
+    pub const SPINNER: usize = 0x30;
+    /// `exit(rdi)`: a redirect target that exits with the interrupted pc.
+    pub const HANDLER: usize = 0x40;
+
+    #[rustfmt::skip]
+    pub const BYTES: [u8; 0x47] = [
+        // 0x00 YIELDER: inc qword [0x500000]; mov eax, 24; syscall
+        0x48, 0xff, 0x04, 0x25, 0x00, 0x00, 0x50, 0x00, 0xb8, 0x18, 0, 0, 0, 0x0f, 0x05,
+        //               cmp qword [0x500000], 100; jb YIELDER
+        0x48, 0x83, 0x3c, 0x25, 0x00, 0x00, 0x50, 0x00, 0x64, 0x72, 0xe6,
+        //               xor edi, edi; mov eax, 60; syscall
+        0x31, 0xff, 0xb8, 0x3c, 0, 0, 0, 0x0f, 0x05,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        // 0x30 SPINNER: inc qword [0x500000]; jmp SPINNER
+        0x48, 0xff, 0x04, 0x25, 0x00, 0x00, 0x50, 0x00, 0xeb, 0xf6,
+        0, 0, 0, 0, 0, 0,
+        // 0x40 HANDLER: mov eax, 60; syscall
+        0xb8, 0x3c, 0, 0, 0, 0x0f, 0x05,
+    ];
+}
+
+/// A new space with `prog::BYTES` mapped RX at `code` and a zeroed RW page at `prog::DATA`.
+pub fn load(code: Vaddr) -> Arc<VmSpace> {
+    let text = FrameAllocOptions::new().alloc_frame().unwrap();
+    text.write_bytes(0, &prog::BYTES).unwrap();
+    let data = FrameAllocOptions::new().alloc_frame().unwrap();
+    let space = VmSpace::new();
+    let guard = disable_preempt();
+    for (va, frame, flags) in [
+        (code, text, PageFlags::RX),
+        (prog::DATA, data, PageFlags::RW),
+    ] {
+        let mut c = space.cursor_mut(&guard, &(va..va + PAGE_SIZE)).unwrap();
+        c.map(
+            frame.into(),
+            PageProperty::new_user(flags, CachePolicy::Writeback),
+        );
+    }
+    Arc::new(space)
+}
+
 pub fn run(thread: &Thread, space: &Arc<VmSpace>, entry: Vaddr) -> Exit {
+    thread.set_space(space.clone());
     space.activate();
     let mut ctx = UserContext::default();
     ctx.set_rip(entry);
@@ -34,6 +89,10 @@ pub fn run(thread: &Thread, space: &Arc<VmSpace>, entry: Vaddr) -> Exit {
         match reason {
             ReturnReason::UserSyscall => match ctx.rax() {
                 SYS_EXIT => return Exit::Code(ctx.rdi()),
+                SYS_SCHED_YIELD => {
+                    Task::yield_now();
+                    ctx.set_rax(0);
+                }
                 _ => ctx.set_rax(-ENOSYS as usize),
             },
             // shortcut: non-CoW exceptions end the run; B3 delivers them as messages to a

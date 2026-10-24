@@ -1,10 +1,10 @@
 //! The agent object: a protection domain with a kernel-stamped credential, a root capability
-//! space, a parent link, and a memory budget carved out of its parent's.
+//! space, a parent link, and memory and CPU budgets carved out of its parent's.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use ostd::sync::SpinLock;
+use ostd::sync::{LocalIrqDisabled, SpinLock};
 
 use crate::cap::{CSpace, Cap, CapError, Rights};
 
@@ -29,22 +29,50 @@ impl From<CapError> for AgentError {
     }
 }
 
+/// CPU budgets are timer ticks per period of this many ticks (10 ms at OSTD's 1000 Hz timer).
+pub const CPU_PERIOD_TICKS: u64 = 10;
+
+#[derive(Default)]
+struct CpuUse {
+    period: u64,
+    used: u64,
+    total: u64,
+}
+
 pub struct Agent {
     cred: Credential,
     pub cspace: SpinLock<CSpace>,
     mem_limit_pages: usize,
     mem_used_pages: AtomicUsize,
+    cpu_quota_ticks: u64,
+    /// Ticks per period handed to children; the agent's own threads get the rest.
+    cpu_carved_ticks: AtomicU64,
+    // IRQ-safe: charged from the timer interrupt.
+    cpu: SpinLock<CpuUse, LocalIrqDisabled>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl Agent {
-    /// A root agent. Only the kernel's boot path creates these; everything else is a child.
+    /// A root agent with a whole CPU. Only the kernel's boot path creates these; everything
+    /// else is a child.
     pub fn new_root(on_behalf_of: u64, mem_limit_pages: usize) -> Arc<Self> {
-        Self::build(on_behalf_of, None, mem_limit_pages, CSpace::new())
+        Self::build(
+            on_behalf_of,
+            None,
+            mem_limit_pages,
+            CPU_PERIOD_TICKS,
+            CSpace::new(),
+        )
     }
 
-    fn build(on_behalf_of: u64, parent: Option<u64>, limit: usize, cspace: CSpace) -> Arc<Self> {
+    fn build(
+        on_behalf_of: u64,
+        parent: Option<u64>,
+        limit: usize,
+        cpu_quota_ticks: u64,
+        cspace: CSpace,
+    ) -> Arc<Self> {
         let agent_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         Arc::new(Self {
             cred: Credential {
@@ -55,6 +83,9 @@ impl Agent {
             cspace: SpinLock::new(cspace),
             mem_limit_pages: limit,
             mem_used_pages: AtomicUsize::new(0),
+            cpu_quota_ticks,
+            cpu_carved_ticks: AtomicU64::new(0),
+            cpu: SpinLock::new(CpuUse::default()),
         })
     }
 
@@ -77,13 +108,44 @@ impl Agent {
             .map_err(|_| AgentError::Budget)
     }
 
-    /// A child agent holding only attenuated copies of the listed parent slots, with a memory
-    /// budget carved out of the parent's. The child inherits the human principal.
+    /// Whether this agent's threads may run in the period containing tick `now`.
+    pub fn has_cpu(&self, now: u64) -> bool {
+        let c = self.cpu.lock();
+        let used = if c.period == now / CPU_PERIOD_TICKS {
+            c.used
+        } else {
+            0
+        };
+        used < self.cpu_quota_ticks - self.cpu_carved_ticks.load(Ordering::Relaxed)
+    }
+
+    /// Charges the tick at `now` to this agent.
+    // shortcut: sampled at the tick, so a thread that runs between ticks is not charged; use
+    // TSC-based accounting when budgets need sub-tick precision.
+    pub fn charge_tick(&self, now: u64) {
+        let mut c = self.cpu.lock();
+        let period = now / CPU_PERIOD_TICKS;
+        if c.period != period {
+            c.period = period;
+            c.used = 0;
+        }
+        c.used += 1;
+        c.total += 1;
+    }
+
+    /// Ticks charged to this agent since it was created.
+    pub fn cpu_used_ticks(&self) -> u64 {
+        self.cpu.lock().total
+    }
+
+    /// A child agent holding only attenuated copies of the listed parent slots, with memory and
+    /// CPU budgets carved out of the parent's. The child inherits the human principal.
     // shortcut: carved budget is never returned to the parent, add on agent teardown.
     pub fn spawn_child(
         &self,
         grants: &[(usize, Rights)],
         mem_limit_pages: usize,
+        cpu_quota_ticks: u64,
     ) -> Result<Arc<Self>, AgentError> {
         let mut cspace = CSpace::new();
         {
@@ -93,12 +155,24 @@ impl Agent {
                 cspace.insert(cap)?;
             }
         }
-        self.charge_pages(mem_limit_pages)?;
+        self.cpu_carved_ticks
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |carved| {
+                carved
+                    .checked_add(cpu_quota_ticks)
+                    .filter(|&n| n <= self.cpu_quota_ticks)
+            })
+            .map_err(|_| AgentError::Budget)?;
+        if let Err(e) = self.charge_pages(mem_limit_pages) {
+            self.cpu_carved_ticks
+                .fetch_sub(cpu_quota_ticks, Ordering::AcqRel);
+            return Err(e);
+        }
         let c = &self.cred;
         Ok(Self::build(
             c.on_behalf_of,
             Some(c.agent_id),
             mem_limit_pages,
+            cpu_quota_ticks,
             cspace,
         ))
     }
@@ -123,7 +197,9 @@ mod test {
             )
         };
 
-        let child = parent.spawn_child(&[(send_slot, Rights::SEND)], 4).unwrap();
+        let child = parent
+            .spawn_child(&[(send_slot, Rights::SEND)], 4, 2)
+            .unwrap();
 
         let cred = child.credential();
         assert_eq!(cred.on_behalf_of, 1000);
@@ -140,8 +216,26 @@ mod test {
         let _ = other_slot;
 
         assert_eq!(parent.mem_used_pages(), 4);
-        assert_eq!(parent.spawn_child(&[], 7).err(), Some(AgentError::Budget));
+        assert_eq!(
+            parent.spawn_child(&[], 7, 0).err(),
+            Some(AgentError::Budget)
+        );
         assert_eq!(parent.mem_used_pages(), 4, "failed carve charges nothing");
+
+        // 2 of 10 CPU ticks are carved. A memory failure must hand the CPU carve back.
+        assert_eq!(
+            parent.spawn_child(&[], 0, 9).err(),
+            Some(AgentError::Budget)
+        );
+        assert_eq!(
+            parent.spawn_child(&[], 7, 1).err(),
+            Some(AgentError::Budget)
+        );
+        parent.spawn_child(&[], 0, 8).unwrap();
+        assert!(
+            !parent.has_cpu(0),
+            "all 10 ticks carved; nothing left for the parent"
+        );
     }
 
     #[ktest]
@@ -152,9 +246,9 @@ mod test {
             .lock()
             .insert(Cap::new(Object::Endpoint(Endpoint::new()), Rights::ALL))
             .unwrap();
-        let child = parent.spawn_child(&[(slot, Rights::SEND)], 1).unwrap();
+        let child = parent.spawn_child(&[(slot, Rights::SEND)], 1, 1).unwrap();
         assert_eq!(
-            child.spawn_child(&[(0, Rights::SEND)], 0).err(),
+            child.spawn_child(&[(0, Rights::SEND)], 0, 0).err(),
             Some(AgentError::Cap(CapError::Rights))
         );
     }
