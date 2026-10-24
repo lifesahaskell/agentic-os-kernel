@@ -8,7 +8,8 @@
 use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
-    IpcArgs, MAX_IPC_BYTES, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_SCHED_YIELD, USER_TOP, errno,
+    IpcArgs, MAX_IPC_BYTES, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV,
+    SYS_SCHED_YIELD, USER_TOP, errno,
 };
 use ostd::{mm::VmSpace, task::Task};
 
@@ -201,6 +202,17 @@ pub enum Syscall {
         ep: Handle,
         args: UserPtr<IpcArgs>,
     },
+    Recv {
+        ep: Handle,
+        args: UserPtr<IpcArgs>,
+    },
+    Reply {
+        args: UserPtr<IpcArgs>,
+    },
+    ReplyRecv {
+        ep: Handle,
+        args: UserPtr<IpcArgs>,
+    },
 }
 
 const FUTEX_WAIT: usize = 0;
@@ -242,6 +254,17 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
             }
         }
         SYS_CALL => Syscall::Call {
+            ep: Handle::new(a[0])?,
+            args: UserPtr::new(a[1])?,
+        },
+        SYS_RECV => Syscall::Recv {
+            ep: Handle::new(a[0])?,
+            args: UserPtr::new(a[1])?,
+        },
+        SYS_REPLY => Syscall::Reply {
+            args: UserPtr::new(a[0])?,
+        },
+        SYS_REPLY_RECV => Syscall::ReplyRecv {
             ep: Handle::new(a[0])?,
             args: UserPtr::new(a[1])?,
         },
@@ -290,6 +313,9 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
                 .map_err(Errno::from),
         ),
         Syscall::Call { ep, args } => ret(ipc::sys_call(t, space, ep, args).map(|()| 0)),
+        Syscall::Recv { ep, args } => ret(ipc::sys_recv_args(t, space, ep, args).map(|()| 0)),
+        Syscall::Reply { args } => ret(ipc::sys_reply(t, space, args).map(|()| 0)),
+        Syscall::ReplyRecv { ep, args } => ret(ipc::sys_reply_recv(t, space, ep, args).map(|()| 0)),
     }
 }
 
@@ -373,6 +399,26 @@ mod test {
             })
         );
         assert_eq!(
+            decode(SYS_RECV, [3, 0x1000, 0, 0, 0, 0]),
+            Ok(Syscall::Recv {
+                ep: Handle::new(3).unwrap(),
+                args: UserPtr::new(0x1000).unwrap(),
+            })
+        );
+        assert_eq!(
+            decode(SYS_REPLY, [0x1000, 0, 0, 0, 0, 0]),
+            Ok(Syscall::Reply {
+                args: UserPtr::new(0x1000).unwrap(),
+            })
+        );
+        assert_eq!(
+            decode(SYS_REPLY_RECV, [3, 0x1000, 0, 0, 0, 0]),
+            Ok(Syscall::ReplyRecv {
+                ep: Handle::new(3).unwrap(),
+                args: UserPtr::new(0x1000).unwrap(),
+            })
+        );
+        assert_eq!(
             decode(SYS_FUTEX, [0x1000, 4 | 128, 2, 5, 0x2000, 9]),
             Ok(Syscall::FutexRequeue {
                 addr: UserPtr::new(0x1000).unwrap(),
@@ -450,6 +496,14 @@ mod test {
             .insert(Cap::new(Object::Endpoint(Endpoint::new()), Rights::SEND))
             .unwrap();
         assert_eq!(slot, 0);
+        // Slot 1 can receive, on an endpoint nothing sends to: the receive paths block, so the
+        // pending interrupt below turns them into EINTR.
+        let recv_slot = agent
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Endpoint(Endpoint::new()), Rights::RECV))
+            .unwrap();
+        assert_eq!(recv_slot, 1);
         let t = Thread::new(agent);
         img.space.activate();
         t.set_space(img.space.clone());
@@ -484,11 +538,19 @@ mod test {
         }
 
         let mut rng = Rng(0x9E3779B97F4A7C15);
-        let numbers = [SYS_EXIT, SYS_SCHED_YIELD, SYS_FUTEX, SYS_CALL];
+        let numbers = [
+            SYS_EXIT,
+            SYS_SCHED_YIELD,
+            SYS_FUTEX,
+            SYS_CALL,
+            SYS_RECV,
+            SYS_REPLY,
+            SYS_REPLY_RECV,
+        ];
         let (mut enosys, mut efault, mut einval, mut ebadf, mut eintr) = (0, 0, 0, 0, 0);
         for i in 0..ITERATIONS {
             let nr = match rng.below(6) {
-                0..=3 => numbers[rng.below(4)],
+                0..=3 => numbers[rng.below(numbers.len())],
                 4 => rng.below(512),
                 _ => rng.next() as usize,
             };

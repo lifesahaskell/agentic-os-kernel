@@ -9,6 +9,9 @@ pub const SYS_SCHED_YIELD: usize = 24;
 pub const SYS_EXIT: usize = 60;
 pub const SYS_FUTEX: usize = 202;
 pub const SYS_CALL: usize = 0x100;
+pub const SYS_RECV: usize = 0x101;
+pub const SYS_REPLY: usize = 0x102;
+pub const SYS_REPLY_RECV: usize = 0x103;
 
 /// Linux errno values. A syscall returns `-errno` in `rax` on failure.
 pub mod errno {

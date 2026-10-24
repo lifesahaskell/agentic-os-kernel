@@ -1,8 +1,13 @@
-//! IPC endpoints. The kernel stamps the sender's credential on every message, and a blocked
-//! receive can be cancelled by `Thread::interrupt`.
+//! IPC endpoints. The kernel stamps the sender's credential, tid and tag on every message, and a
+//! blocked receive can be cancelled by `Thread::interrupt`. A ring-3 server answers a call
+//! through a reply handle the kernel parks in its own thread's `ReplyTable`.
 
-use alloc::{collections::VecDeque, sync::Arc};
-use core::{fmt, mem::offset_of};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use core::{
+    fmt,
+    mem::offset_of,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use abi::IpcArgs;
 use ostd::{
@@ -21,6 +26,9 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub sender: Credential,
+    /// The sending thread's id and creation-time tag, stamped by the kernel like `sender`.
+    pub tid: u64,
+    pub tag: u64,
     pub words: [u64; 4],
     /// Chosen by the sender and opaque to the kernel, unlike `sender`.
     pub label: u64,
@@ -61,6 +69,48 @@ impl Eq for ReplyWait {}
 impl fmt::Debug for ReplyWait {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ReplyWait")
+    }
+}
+
+/// Most calls a server thread may hold received-but-unanswered.
+pub const MAX_REPLIES: usize = 256;
+
+/// Source of reply-handle generations. Global, so a handle is valid in exactly one table, the
+/// one that issued it: another thread's table never holds the same generation.
+// shortcut: 32 bits wrap after 4e9 parked calls, and a handle that old could then alias a live
+// one; widen the handle before a server can run that long.
+static NEXT_REPLY_GEN: AtomicU32 = AtomicU32::new(1);
+
+/// The calls a thread has received and not yet answered. A handle is `generation << 32 | index`.
+#[derive(Default)]
+pub struct ReplyTable {
+    slots: Vec<Option<(u32, Arc<ReplyWait>)>>,
+}
+
+impl ReplyTable {
+    /// Parks `w` and returns its handle, or `None` when `MAX_REPLIES` are already parked.
+    fn insert(&mut self, w: Arc<ReplyWait>) -> Option<u64> {
+        let index = match self.slots.iter().position(Option::is_none) {
+            Some(i) => i,
+            None if self.slots.len() < MAX_REPLIES => {
+                self.slots.push(None);
+                self.slots.len() - 1
+            }
+            None => return None,
+        };
+        let generation = NEXT_REPLY_GEN.fetch_add(1, Ordering::Relaxed);
+        self.slots[index] = Some((generation, w));
+        Some((generation as u64) << 32 | index as u64)
+    }
+
+    /// Takes the call out: a handle answers once. Unknown and stale handles are `None`.
+    fn take(&mut self, handle: u64) -> Option<Arc<ReplyWait>> {
+        let slot = self.slots.get_mut((handle & 0xFFFF_FFFF) as usize)?;
+        if slot.as_ref()?.0 as u64 != handle >> 32 {
+            return None;
+        }
+        let (_, w) = slot.take()?;
+        Some(w)
     }
 }
 
@@ -131,6 +181,8 @@ impl Endpoint {
         }
         q.push_back(Message {
             sender: from.agent().credential(),
+            tid: from.tid(),
+            tag: from.tag(),
             words,
             label,
             reply,
@@ -142,6 +194,36 @@ impl Endpoint {
 
     pub fn recv(&self, me: &Thread) -> Result<Message, IpcError> {
         Ok(me.block_until(&self.wq, || self.queue.lock().pop_front(), None)?)
+    }
+
+    /// Like `recv`, for a server that answers later: a call's `ReplyWait` moves into `me`'s
+    /// reply table and the returned handle (0 for a plain `send`) answers it. `Full` when the
+    /// table has no room; the message then stays queued.
+    fn recv_parked(&self, me: &Thread) -> Result<(Message, u64), IpcError> {
+        me.block_until(
+            &self.wq,
+            || {
+                let mut q = self.queue.lock();
+                let handle = match &q.front()?.reply {
+                    Some(w) => match me.replies.lock().insert(w.clone()) {
+                        Some(h) => h,
+                        None => return Some(Err(IpcError::Full)),
+                    },
+                    None => 0,
+                };
+                let mut m = q.pop_front()?;
+                m.reply = None;
+                Some(Ok((m, handle)))
+            },
+            None,
+        )?
+    }
+
+    /// Undoes a `recv_parked` whose delivery to ring 3 failed, so the call is not lost.
+    fn unreceive(&self, me: &Thread, mut m: Message, handle: u64) {
+        m.reply = me.replies.lock().take(handle);
+        self.queue.lock().push_front(m);
+        self.wq.wake_one();
     }
 }
 
@@ -173,9 +255,40 @@ pub fn sys_recv(t: &Thread, slot: usize) -> Result<Message, IpcError> {
     endpoint(t, slot, Rights::RECV)?.recv(t)
 }
 
+fn read_args(space: &VmSpace, args: UserPtr<IpcArgs>) -> Result<IpcArgs, Errno> {
+    let mut raw = [0u8; size_of::<IpcArgs>()];
+    let slice = UserSlice::new(args.addr(), raw.len())?;
+    copy_from_user(space, &mut raw, slice)?;
+    let a = IpcArgs::from_bytes(&raw);
+    // Buffers and capability transfer are not implemented yet, so those fields must be zero.
+    if [a.send_buf, a.send_len, a.recv_buf, a.recv_len, a.ncaps]
+        .iter()
+        .any(|&x| x != 0)
+    {
+        return Err(Errno::EINVAL);
+    }
+    Ok(a)
+}
+
+/// Writes `bytes` at `offset` in the `IpcArgs` at `args`. Only the fields the call produces are
+/// written, so a concurrent change to the others by the caller's own threads is not undone.
+fn write_args(
+    t: &Thread,
+    space: &VmSpace,
+    args: UserPtr<IpcArgs>,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), Errno> {
+    let dst = UserSlice::new(args.addr() + offset, bytes.len())?;
+    copy_to_user(space, t.agent(), dst, bytes)
+}
+
+fn quads<const N: usize, const B: usize>(q: [u64; N]) -> [u8; B] {
+    core::array::from_fn(|i| q[i / 8].to_le_bytes()[i % 8])
+}
+
 /// `SYS_CALL`: sends `IpcArgs` (read from `args` in the caller's active `space`) to the endpoint
-/// in `ep` and writes the reply words back to `IpcArgs.words`. Buffers and capability transfer
-/// are not implemented yet, so those fields must be zero.
+/// in `ep` and writes the reply words back to `IpcArgs.words`.
 pub fn sys_call(
     t: &Thread,
     space: &VmSpace,
@@ -183,20 +296,71 @@ pub fn sys_call(
     args: UserPtr<IpcArgs>,
 ) -> Result<(), Errno> {
     let ep = endpoint(t, ep.index(), Rights::SEND)?;
-    let mut raw = [0u8; size_of::<IpcArgs>()];
-    let src = UserSlice::new(args.addr(), raw.len())?;
-    copy_from_user(space, &mut raw, src)?;
-    let a = IpcArgs::from_bytes(&raw);
-    if [a.send_buf, a.send_len, a.recv_buf, a.recv_len, a.ncaps]
-        .iter()
-        .any(|&x| x != 0)
-    {
-        return Err(Errno::EINVAL);
-    }
+    let a = read_args(space, args)?;
     let words = ep.call(t, a.label, a.words)?;
-    let raw: [u8; 32] = core::array::from_fn(|i| words[i / 8].to_le_bytes()[i % 8]);
-    let dst = UserSlice::new(args.addr() + offset_of!(IpcArgs, words), raw.len())?;
-    copy_to_user(space, t.agent(), dst, &raw)
+    write_args(
+        t,
+        space,
+        args,
+        offset_of!(IpcArgs, words),
+        &quads::<4, 32>(words),
+    )
+}
+
+/// Receives into the `IpcArgs` at `args`: `label`, `words`, `tid`, `tag` and `reply` are written;
+/// everything the sender could influence besides `label` and `words` is kernel-stamped.
+fn recv_into(
+    t: &Thread,
+    space: &VmSpace,
+    ep: &Endpoint,
+    args: UserPtr<IpcArgs>,
+) -> Result<(), Errno> {
+    let (m, handle) = ep.recv_parked(t)?;
+    let head = quads::<5, 40>([m.label, m.words[0], m.words[1], m.words[2], m.words[3]]);
+    let tail = quads::<3, 24>([m.tid, m.tag, handle]);
+    let delivered = write_args(t, space, args, offset_of!(IpcArgs, label), &head)
+        .and_then(|()| write_args(t, space, args, offset_of!(IpcArgs, tid), &tail));
+    if delivered.is_err() {
+        ep.unreceive(t, m, handle);
+    }
+    delivered
+}
+
+/// `SYS_RECV`: waits for a message on `ep` (needs RECV) and writes it into `args`.
+pub fn sys_recv_args(
+    t: &Thread,
+    space: &VmSpace,
+    ep: Handle,
+    args: UserPtr<IpcArgs>,
+) -> Result<(), Errno> {
+    let ep = endpoint(t, ep.index(), Rights::RECV)?;
+    read_args(space, args)?;
+    recv_into(t, space, &ep, args)
+}
+
+/// Answers the call parked under `handle` in `t`'s own table.
+fn answer(t: &Thread, a: &IpcArgs) -> Result<(), Errno> {
+    let w = t.replies.lock().take(a.reply).ok_or(Errno::EBADF)?;
+    w.reply(a.words);
+    Ok(())
+}
+
+/// `SYS_REPLY`: answers the call named by `args.reply` with `args.words`.
+pub fn sys_reply(t: &Thread, space: &VmSpace, args: UserPtr<IpcArgs>) -> Result<(), Errno> {
+    answer(t, &read_args(space, args)?)
+}
+
+/// `SYS_REPLY_RECV`: `sys_reply`, then `sys_recv_args` into the same block. The endpoint is
+/// resolved first and a failed reply returns before receiving.
+pub fn sys_reply_recv(
+    t: &Thread,
+    space: &VmSpace,
+    ep: Handle,
+    args: UserPtr<IpcArgs>,
+) -> Result<(), Errno> {
+    let ep = endpoint(t, ep.index(), Rights::RECV)?;
+    answer(t, &read_args(space, args)?)?;
+    recv_into(t, space, &ep, args)
 }
 
 #[cfg(ktest)]
@@ -207,7 +371,16 @@ mod test {
     };
 
     use super::*;
-    use crate::{agent::Agent, cap::Cap};
+    use crate::{
+        agent::Agent,
+        cap::Cap,
+        user::{
+            Exit, Image, load_image,
+            testkit::{join, spawn_image},
+            user_image,
+        },
+        vm::cow_clone,
+    };
 
     /// A server agent holding RECV and a client child agent holding SEND on one endpoint.
     fn pair() -> (Arc<Thread>, Arc<Thread>) {
@@ -299,5 +472,171 @@ mod test {
             Task::yield_now();
         }
         assert_eq!(result.lock().take().unwrap().unwrap().words[0], 7);
+    }
+
+    type Log = Arc<SpinLock<Vec<(u64, [u64; 4])>>>;
+
+    /// A kernel task that calls `ep` as `t` and logs (label, reply words) when it returns.
+    fn spawn_call(ep: &Arc<Endpoint>, t: &Arc<Thread>, label: u64, log: &Log) {
+        let (ep, t, log) = (ep.clone(), t.clone(), log.clone());
+        TaskOptions::new(move || {
+            let words = ep.call(&t, label, [label, 0, 0, 0]).unwrap();
+            log.lock().push((label, words));
+        })
+        .spawn()
+        .unwrap();
+    }
+
+    fn wait_blocked(t: &Thread) {
+        while !t.is_blocked() {
+            Task::yield_now();
+        }
+    }
+
+    fn wait_len(log: &Log, n: usize) {
+        while log.lock().len() < n {
+            Task::yield_now();
+        }
+    }
+
+    /// An agent holding `ep` in slot 0 with all rights.
+    fn agent_with(ep: &Arc<Endpoint>) -> Arc<Agent> {
+        let agent = Agent::new_root(42, 64);
+        let slot = agent
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Endpoint(ep.clone()), Rights::ALL))
+            .unwrap();
+        assert_eq!(slot, 0);
+        agent
+    }
+
+    #[ktest]
+    fn server_parks_a_request_and_replies_later() {
+        let ep = Endpoint::new();
+        let agent = agent_with(&ep);
+        let log: Log = Arc::new(SpinLock::new(Vec::new()));
+        let (c1, c2, c3) = (
+            Thread::new(agent.clone()),
+            Thread::new(agent.clone()),
+            Thread::new(agent.clone()),
+        );
+        // Queue order is 1 then 2; the server answers 2 first.
+        spawn_call(&ep, &c1, 1, &log);
+        wait_blocked(&c1);
+        spawn_call(&ep, &c2, 2, &log);
+        wait_blocked(&c2);
+
+        let img = load_image(user_image!("park_srv")).unwrap();
+        let srv = Thread::new(agent);
+        let exit = spawn_image(&srv, &img, 0);
+        wait_len(&log, 2);
+        assert_eq!(log.lock()[0], (2, [200, 0, 0, 0]));
+        assert_eq!(log.lock()[1], (1, [100, 0, 0, 0]));
+
+        // The same reply_recv that answered 1 now receives 3.
+        spawn_call(&ep, &c3, 3, &log);
+        assert_eq!(join(&exit), Exit::Code(0));
+        wait_len(&log, 3);
+        assert_eq!(log.lock()[2], (3, [300, 0, 0, 0]));
+    }
+
+    #[ktest]
+    fn siblings_are_distinguished_by_tid_and_tag() {
+        let ep = Endpoint::new();
+        let server_agent = agent_with(&ep);
+        let client = server_agent
+            .spawn_child(&[(0, Rights::SEND)], 16, 1)
+            .unwrap();
+        let (t1, t2) = (
+            Thread::new_tagged(client.clone(), 1),
+            Thread::new_tagged(client.clone(), 2),
+        );
+        let img = load_image(user_image!("sibling")).unwrap();
+        let clone_of = |img: &Image| Image {
+            space: Arc::new(cow_clone(&img.space, abi::IMAGE_BASE..abi::USER_STACK_TOP)),
+            entry: img.entry,
+            handler: img.handler,
+            text: img.text.clone(),
+        };
+        let seen: Arc<SpinLock<Vec<(Credential, u64, u64)>>> = Arc::new(SpinLock::new(Vec::new()));
+        let (server, seen2) = (Thread::new(server_agent), seen.clone());
+        TaskOptions::new(move || {
+            for _ in 0..2 {
+                let m = sys_recv(&server, 0).unwrap();
+                seen2.lock().push((m.sender.clone(), m.tid, m.tag));
+                m.reply.unwrap().reply([0; 4]);
+            }
+        })
+        .spawn()
+        .unwrap();
+
+        let (e1, e2) = (
+            spawn_image(&t1, &clone_of(&img), 0),
+            spawn_image(&t2, &clone_of(&img), 0),
+        );
+        assert_eq!(join(&e1), Exit::Code(0));
+        assert_eq!(join(&e2), Exit::Code(0));
+
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 2);
+        assert_ne!(t1.tid(), t2.tid());
+        for (sender, tid, tag) in seen.iter() {
+            assert_eq!(*sender, client.credential());
+            let (want_tid, want_tag) = if *tid == t1.tid() {
+                (t1.tid(), 1)
+            } else {
+                (t2.tid(), 2)
+            };
+            assert_eq!((*tid, *tag), (want_tid, want_tag));
+        }
+        assert_ne!(seen[0].1, seen[1].1);
+    }
+
+    #[ktest]
+    fn reply_handle_works_once_and_only_in_its_own_table() {
+        let ep = Endpoint::new();
+        let agent = agent_with(&ep);
+        let (s1, s2, c) = (
+            Thread::new(agent.clone()),
+            Thread::new(agent.clone()),
+            Thread::new(agent),
+        );
+        let log: Log = Arc::new(SpinLock::new(Vec::new()));
+        spawn_call(&ep, &c, 5, &log);
+        wait_blocked(&c);
+
+        let (m, handle) = ep.recv_parked(&s1).unwrap();
+        assert_eq!((m.label, m.reply.is_none()), (5, true));
+        let a = IpcArgs {
+            reply: handle,
+            words: [9, 0, 0, 0],
+            ..IpcArgs::default()
+        };
+        assert_eq!(answer(&s2, &a), Err(Errno::EBADF));
+        assert_eq!(answer(&s1, &a), Ok(()));
+        assert_eq!(answer(&s1, &a), Err(Errno::EBADF));
+        wait_len(&log, 1);
+        assert_eq!(log.lock()[0], (5, [9, 0, 0, 0]));
+    }
+
+    #[ktest]
+    fn failed_delivery_requeues_the_message() {
+        let ep = Endpoint::new();
+        let agent = agent_with(&ep);
+        let (s, c) = (Thread::new(agent.clone()), Thread::new(agent));
+        let log: Log = Arc::new(SpinLock::new(Vec::new()));
+        spawn_call(&ep, &c, 6, &log);
+        wait_blocked(&c);
+
+        // Not the active space, so the write-back fails after the message was taken.
+        let elsewhere = VmSpace::new();
+        let args = UserPtr::new(0x1000).unwrap();
+        assert!(recv_into(&s, &elsewhere, &ep, args).is_err());
+        let m = ep.recv(&s).unwrap();
+        assert_eq!(m.label, 6);
+        m.reply.unwrap().reply([1, 2, 3, 4]);
+        wait_len(&log, 1);
+        assert_eq!(log.lock()[0], (6, [1, 2, 3, 4]));
     }
 }

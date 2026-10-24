@@ -5,7 +5,7 @@
 //! the register rewrite can never race syscall entry.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ostd::{
     arch::cpu::context::FpuContext,
@@ -16,7 +16,7 @@ use ostd::{
     user::UserModeHooks,
 };
 
-use crate::{agent::Agent, cap::Cap};
+use crate::{agent::Agent, cap::Cap, ipc::ReplyTable};
 
 /// Why `Thread::block_until` gave up.
 #[derive(Debug, PartialEq, Eq)]
@@ -91,8 +91,17 @@ static FPU_OWNER: SpinLock<Option<SharedFpu>, LocalIrqDisabled> = SpinLock::new(
 pub(crate) static FPU_SWAP_DISABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// The next thread id. Never reused, so a tid names one thread for the life of the kernel.
+static NEXT_TID: AtomicU64 = AtomicU64::new(1);
+
 pub struct Thread {
     agent: Arc<Agent>,
+    /// Kernel-assigned and stamped on every message this thread sends (IPC-03).
+    tid: u64,
+    /// Chosen by whoever created the thread, fixed for its life; stamped like `tid`.
+    tag: u64,
+    /// Calls this thread has received and not yet answered, by reply handle.
+    pub(crate) replies: SpinLock<ReplyTable>,
     /// This thread's saved FPU/SSE state; live in the CPU only while `FPU_OWNER` points here.
     fpu: SharedFpu,
     // IRQ-safe: a timer callback may interrupt the thread.
@@ -105,8 +114,17 @@ pub struct Thread {
 
 impl Thread {
     pub fn new(agent: Arc<Agent>) -> Arc<Self> {
+        Self::new_tagged(agent, 0)
+    }
+
+    /// A thread whose messages carry `tag`. This is the kernel half of `thread_create` until
+    /// Phase 2 adds Thread capabilities.
+    pub fn new_tagged(agent: Arc<Agent>, tag: u64) -> Arc<Self> {
         Arc::new(Self {
             agent,
+            tid: NEXT_TID.fetch_add(1, Ordering::Relaxed),
+            tag,
+            replies: SpinLock::new(ReplyTable::default()),
             fpu: Arc::new(SpinLock::new(FpuContext::default())),
             state: SpinLock::new(State {
                 redirect: None,
@@ -121,6 +139,14 @@ impl Thread {
 
     pub fn agent(&self) -> &Arc<Agent> {
         &self.agent
+    }
+
+    pub fn tid(&self) -> u64 {
+        self.tid
+    }
+
+    pub fn tag(&self) -> u64 {
+        self.tag
     }
 
     pub fn set_space(&self, space: Arc<VmSpace>) {

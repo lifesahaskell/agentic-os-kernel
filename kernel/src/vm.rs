@@ -37,15 +37,17 @@ pub fn cow_clone(parent: &VmSpace, range: Range<Vaddr>) -> VmSpace {
         };
         assert_eq!(r.len(), PAGE_SIZE, "cow_clone: huge page at {va:#x}");
         let frame: UFrame = (*frame).clone();
+        // The source cursor cannot jump to `range.end`, so the last page ends the walk.
+        let last = va + PAGE_SIZE >= range.end;
         if prop.flags.contains(PageFlags::W) {
             prop.flags = (prop.flags - PageFlags::W) | COW;
             pc.protect_next(PAGE_SIZE, |f, _| *f = (*f - PageFlags::W) | COW);
-        } else {
+        } else if !last {
             pc.jump(va + PAGE_SIZE).unwrap();
         }
         cc.jump(va).unwrap();
         cc.map(frame, prop);
-        if pc.virt_addr() >= range.end {
+        if last || pc.virt_addr() >= range.end {
             break;
         }
     }
