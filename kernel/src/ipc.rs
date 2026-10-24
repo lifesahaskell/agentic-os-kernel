@@ -2,8 +2,13 @@
 //! receive can be cancelled by `Thread::interrupt`.
 
 use alloc::{collections::VecDeque, sync::Arc};
+use core::{fmt, mem::offset_of};
 
-use ostd::sync::{SpinLock, WaitQueue};
+use abi::{IpcArgs, errno};
+use ostd::{
+    mm::{FallibleVmRead, FallibleVmWrite, Vaddr, VmReader, VmSpace, VmWriter},
+    sync::{SpinLock, WaitQueue},
+};
 
 use crate::{
     agent::Credential,
@@ -11,10 +16,50 @@ use crate::{
     thread::{Interrupted, Thread},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub sender: Credential,
     pub words: [u64; 4],
+    /// Chosen by the sender and opaque to the kernel, unlike `sender`.
+    pub label: u64,
+    /// Present on a `call`: the server answers through it.
+    pub reply: Option<Arc<ReplyWait>>,
+}
+
+/// The rendezvous between a `call`er blocked for its answer and the server that replies.
+pub struct ReplyWait {
+    words: SpinLock<Option<[u64; 4]>>,
+    wq: WaitQueue,
+}
+
+impl ReplyWait {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            words: SpinLock::new(None),
+            wq: WaitQueue::new(),
+        })
+    }
+
+    /// Hands the answer to the caller and wakes it. A caller that gave up never sees it.
+    pub fn reply(&self, words: [u64; 4]) {
+        *self.words.lock() = Some(words);
+        self.wq.wake_all();
+    }
+}
+
+// Identity, not contents: two messages are equal only if they answer through the same wait.
+impl PartialEq for ReplyWait {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self, other)
+    }
+}
+
+impl Eq for ReplyWait {}
+
+impl fmt::Debug for ReplyWait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReplyWait")
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,6 +99,26 @@ impl Endpoint {
     }
 
     pub fn send(&self, from: &Thread, words: [u64; 4]) -> Result<(), IpcError> {
+        self.push(from, 0, words, None)
+    }
+
+    /// Queues a message and blocks until the server replies. The sender credential is taken
+    /// from `from`, never from the caller's arguments.
+    // shortcut: an interrupt abandons the message in the queue and the server's late reply goes
+    // nowhere; 01-06 replaces this with Cancel-then-wait.
+    pub fn call(&self, from: &Thread, label: u64, words: [u64; 4]) -> Result<[u64; 4], IpcError> {
+        let reply = ReplyWait::new();
+        self.push(from, label, words, Some(reply.clone()))?;
+        Ok(from.block_on(&reply.wq, || reply.words.lock().take())?)
+    }
+
+    fn push(
+        &self,
+        from: &Thread,
+        label: u64,
+        words: [u64; 4],
+        reply: Option<Arc<ReplyWait>>,
+    ) -> Result<(), IpcError> {
         let mut q = self.queue.lock();
         if q.len() >= Self::QUEUE_LEN {
             return Err(IpcError::Full);
@@ -61,6 +126,8 @@ impl Endpoint {
         q.push_back(Message {
             sender: from.agent().credential(),
             words,
+            label,
+            reply,
         });
         drop(q);
         self.wq.wake_one();
@@ -98,6 +165,78 @@ pub fn sys_send(t: &Thread, slot: usize, words: [u64; 4]) -> Result<(), IpcError
 
 pub fn sys_recv(t: &Thread, slot: usize) -> Result<Message, IpcError> {
     endpoint(t, slot, Rights::RECV)?.recv(t)
+}
+
+fn errno_of(e: &IpcError) -> isize {
+    match e {
+        IpcError::Cap(CapError::NoSlot | CapError::Revoked) => errno::EBADF,
+        IpcError::Cap(CapError::Rights) => errno::EPERM,
+        IpcError::Cap(CapError::Full) | IpcError::WrongType => errno::EINVAL,
+        IpcError::Full => errno::EAGAIN,
+        IpcError::Interrupted => errno::EINTR,
+    }
+}
+
+fn read_args(space: &VmSpace, at: Vaddr) -> Option<IpcArgs> {
+    let mut raw = [0u8; size_of::<IpcArgs>()];
+    let mut r = space.reader(at, raw.len()).ok()?;
+    if r.read_fallible(&mut VmWriter::from(&mut raw[..])).ok()? != raw.len() {
+        return None;
+    }
+    let mut q = raw
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c));
+    let mut next = || q.next().unwrap();
+    Some(IpcArgs {
+        label: next(),
+        words: [next(), next(), next(), next()],
+        send_buf: next(),
+        send_len: next(),
+        recv_buf: next(),
+        recv_len: next(),
+        caps: [next(), next(), next(), next()],
+        cap_rights: [next(), next(), next(), next()],
+        ncaps: next(),
+        tid: next(),
+        tag: next(),
+        reply: next(),
+    })
+}
+
+fn write_words(space: &VmSpace, args: Vaddr, words: [u64; 4]) -> Option<()> {
+    let raw: [u8; 32] = core::array::from_fn(|i| words[i / 8].to_le_bytes()[i % 8]);
+    let mut w = space
+        .writer(args.checked_add(offset_of!(IpcArgs, words))?, raw.len())
+        .ok()?;
+    (w.write_fallible(&mut VmReader::from(&raw[..])).ok()? == raw.len()).then_some(())
+}
+
+/// `SYS_CALL`: sends `IpcArgs` (read from `args` in the caller's active `space`) to the endpoint
+/// in `slot` and writes the reply words back to `IpcArgs.words`. Buffers and capability transfer
+/// are not implemented yet, so those fields must be zero.
+pub fn sys_call(t: &Thread, space: &VmSpace, slot: usize, args: Vaddr) -> isize {
+    let ep = match endpoint(t, slot, Rights::SEND) {
+        Ok(ep) => ep,
+        Err(e) => return -errno_of(&e),
+    };
+    let Some(a) = read_args(space, args) else {
+        return -errno::EFAULT;
+    };
+    if [a.send_buf, a.send_len, a.recv_buf, a.recv_len, a.ncaps]
+        .iter()
+        .any(|&x| x != 0)
+    {
+        return -errno::EINVAL;
+    }
+    match ep.call(t, a.label, a.words) {
+        Ok(words) => match write_words(space, args, words) {
+            Some(()) => 0,
+            None => -errno::EFAULT,
+        },
+        Err(e) => -errno_of(&e),
+    }
 }
 
 #[cfg(ktest)]

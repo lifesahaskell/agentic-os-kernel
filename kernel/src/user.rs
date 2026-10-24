@@ -4,7 +4,7 @@
 use core::ops::Range;
 
 use abi::{
-    IMAGE_BASE, IMAGE_HEADER_LEN, IMAGE_MAGIC, MAX_IMAGE_SIZE, SYS_EXIT, SYS_FUTEX,
+    IMAGE_BASE, IMAGE_HEADER_LEN, IMAGE_MAGIC, MAX_IMAGE_SIZE, SYS_CALL, SYS_EXIT, SYS_FUTEX,
     SYS_SCHED_YIELD, USER_STACK_PAGES, USER_STACK_TOP, errno::ENOSYS,
 };
 use alloc::sync::Arc;
@@ -20,7 +20,7 @@ use ostd::{
 
 use crate::{
     cap::{Object, Rights},
-    futex,
+    futex, ipc,
     thread::{ExcReply, Interrupted, Thread},
     vm::handle_cow_fault,
 };
@@ -321,6 +321,9 @@ fn run_ctx(thread: &Thread, space: &Arc<VmSpace>, ctx: UserContext) -> Exit {
                     ctx.set_rax(0);
                 }
                 SYS_FUTEX => ctx.set_rax(sys_futex(thread, space, ctx) as usize),
+                SYS_CALL => {
+                    ctx.set_rax(ipc::sys_call(thread, space, ctx.rdi(), ctx.rsi()) as usize)
+                }
                 _ => ctx.set_rax(-ENOSYS as usize),
             },
             ReturnReason::UserException => match ctx.take_exception() {
@@ -427,7 +430,7 @@ mod test {
     use crate::{
         agent::Agent,
         cap::Cap,
-        ipc::{Endpoint, sys_recv, sys_set_exception_handler},
+        ipc::{Endpoint, Message, sys_recv, sys_set_exception_handler},
         user::testkit::{join, spawn_image, spawn_user, wait_blocked},
         vm::cow_clone,
     };
@@ -786,9 +789,28 @@ mod test {
 
     #[ktest]
     fn tracer_runs_rust_ring3_image() {
+        let (server, client) = handler_pair();
         let img = load_image(user_image!("tracer")).unwrap();
-        let t = Thread::new(Agent::new_root(1, 4));
-        assert_eq!(join(&spawn_image(&t, &img, 0)), Exit::Code(0));
+        // The kernel-side server answers one call: reply[0] = words[0] + 1, reply[1] = label.
+        let seen: Arc<SpinLock<Option<Message>>> = Arc::new(SpinLock::new(None));
+        let seen2 = seen.clone();
+        TaskOptions::new(move || {
+            let m = sys_recv(&server, 0).unwrap();
+            m.reply
+                .as_ref()
+                .unwrap()
+                .reply([m.words[0] + 1, m.label, 0, 0]);
+            *seen2.lock() = Some(m);
+        })
+        .spawn()
+        .unwrap();
+
+        // The client's cspace is {0: SEND on the endpoint}; the tracer calls slot 0 and probes 63.
+        let exit = spawn_image(&client, &img, 0);
+        assert_eq!(join(&exit), Exit::Code(0));
+        let m = seen.lock().take().expect("the server saw the call");
+        assert_eq!(m.sender, client.agent().credential());
+        assert_eq!((m.label, m.words[0]), (7, 41));
     }
 
     /// A header with the given quads, padded to `IMAGE_HEADER_LEN`.

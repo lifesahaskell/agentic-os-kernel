@@ -7,7 +7,7 @@
 pub mod raw;
 pub mod rt;
 
-use abi::{SYS_EXIT, SYS_SCHED_YIELD};
+use abi::{IpcArgs, SYS_CALL, SYS_EXIT, SYS_SCHED_YIELD};
 
 pub fn exit(code: u64) -> ! {
     raw::syscall6(SYS_EXIT, [code as usize, 0, 0, 0, 0, 0]);
@@ -16,6 +16,16 @@ pub fn exit(code: u64) -> ! {
 
 pub fn sched_yield() {
     raw::syscall6(SYS_SCHED_YIELD, [0; 6]);
+}
+
+/// Sends `args` to the endpoint in slot `ep` and waits for the reply, which overwrites
+/// `args.words`. `Err` carries the positive errno.
+pub fn call(ep: u64, args: &mut IpcArgs) -> Result<(), isize> {
+    let r = raw::syscall6(
+        SYS_CALL,
+        [ep as usize, args as *mut IpcArgs as usize, 0, 0, 0, 0],
+    );
+    if r < 0 { Err(-r) } else { Ok(()) }
 }
 
 #[panic_handler]
