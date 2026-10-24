@@ -1,0 +1,36 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Enable KVM when the runner has it
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+
+      - name: Build the dev image
+        run: docker build -t agentic-os-kernel-dev:0.19.0 kernel
+
+      - name: Run scripts/check.sh
+        run: |
+          if [ -w /dev/kvm ]; then
+            sh scripts/check.sh
+            echo "check: full mode, every gate ran" >> "$GITHUB_STEP_SUMMARY"
+          else
+            sh scripts/check.sh --no-kvm
+            echo "check: --no-kvm mode; LOCAL-ONLY gates not run here: cargo osdk test, cargo osdk run boot checks" >> "$GITHUB_STEP_SUMMARY"
+          fi

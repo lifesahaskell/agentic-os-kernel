@@ -11,7 +11,9 @@ use abi::{IpcArgs, SYS_CALL, SYS_EXIT, SYS_SCHED_YIELD};
 
 pub fn exit(code: u64) -> ! {
     raw::syscall6(SYS_EXIT, [code as usize, 0, 0, 0, 0, 0]);
-    loop {}
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 pub fn sched_yield() {
