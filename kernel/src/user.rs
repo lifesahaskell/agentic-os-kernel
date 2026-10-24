@@ -205,19 +205,22 @@ pub fn run(thread: &Thread, space: &Arc<VmSpace>, entry: Vaddr) -> Exit {
             },
             ReturnReason::UserException => match ctx.take_exception() {
                 Some(exc) => {
-                    if let CpuException::PageFault(pf) = exc {
-                        let write = pf.error_code.contains(PageFaultErrorCode::WRITE);
-                        match write.then(|| handle_cow_fault(space, thread.agent(), pf.addr)) {
-                            Some(Ok(true)) => {}
-                            Some(Err(_)) => return Exit::Budget,
-                            _ => {
-                                if let Some(exit) = deliver(thread, exc, ctx.rip()) {
-                                    return exit;
-                                }
+                    let cow = match exc {
+                        CpuException::PageFault(pf)
+                            if pf.error_code.contains(PageFaultErrorCode::WRITE) =>
+                        {
+                            Some(handle_cow_fault(space, thread.agent(), pf.addr))
+                        }
+                        _ => None,
+                    };
+                    match cow {
+                        Some(Ok(true)) => {}
+                        Some(Err(_)) => return Exit::Budget,
+                        _ => {
+                            if let Some(exit) = deliver(thread, exc, ctx.rip()) {
+                                return exit;
                             }
                         }
-                    } else if let Some(exit) = deliver(thread, exc, ctx.rip()) {
-                        return exit;
                     }
                 }
                 None => panic!("user exception without exception info"),
@@ -298,7 +301,7 @@ mod test {
 
     /// Code page RX at CODE; one data page at DATA holding 0x11.
     fn new_space(data_flags: PageFlags) -> Arc<VmSpace> {
-        space_over(&data_frame(0x11), data_flags)
+        space_over(Some((&data_frame(0x11), data_flags)))
     }
 
     fn data_byte(space: &Arc<VmSpace>) -> u8 {
@@ -380,8 +383,9 @@ mod test {
         assert!(alarm.lock().is_none());
     }
 
-    /// A new space with the code page RX at CODE and `data` (shared, not copied) at DATA.
-    fn space_over(data: &UFrame, data_flags: PageFlags) -> Arc<VmSpace> {
+    /// A new space with the code page RX at CODE and `data` (shared, not copied) at DATA, or
+    /// DATA unmapped.
+    fn space_over(data: Option<(&UFrame, PageFlags)>) -> Arc<VmSpace> {
         let code = FrameAllocOptions::new().alloc_frame().unwrap();
         code.write_bytes(0, &PROGRAM).unwrap();
         let space = VmSpace::new();
@@ -391,11 +395,13 @@ mod test {
             code.into(),
             PageProperty::new_user(PageFlags::RX, CachePolicy::Writeback),
         );
-        c.jump(DATA).unwrap();
-        c.map(
-            data.clone(),
-            PageProperty::new_user(data_flags, CachePolicy::Writeback),
-        );
+        if let Some((frame, flags)) = data {
+            c.jump(DATA).unwrap();
+            c.map(
+                frame.clone(),
+                PageProperty::new_user(flags, CachePolicy::Writeback),
+            );
+        }
         drop(c);
         Arc::new(space)
     }
@@ -405,21 +411,6 @@ mod test {
         let f = FrameAllocOptions::new().alloc_frame().unwrap();
         f.write_bytes(0, &[first]).unwrap();
         f.into()
-    }
-
-    /// Code page only: DATA is unmapped.
-    fn code_only_space() -> Arc<VmSpace> {
-        let code = FrameAllocOptions::new().alloc_frame().unwrap();
-        code.write_bytes(0, &PROGRAM).unwrap();
-        let space = VmSpace::new();
-        let guard = disable_preempt();
-        let mut c = space.cursor_mut(&guard, &(CODE..CODE + PAGE_SIZE)).unwrap();
-        c.map(
-            code.into(),
-            PageProperty::new_user(PageFlags::RX, CachePolicy::Writeback),
-        );
-        drop(c);
-        Arc::new(space)
     }
 
     type ExitSlot = Arc<SpinLock<Option<Exit>>>;
@@ -486,7 +477,7 @@ mod test {
     #[ktest]
     fn pager_maps_the_page_and_resumes() {
         let (server, client) = handler_pair();
-        let space = code_only_space();
+        let space = space_over(None);
         let exit = spawn_user(&client, &space, COW_WRITER);
 
         let m = sys_recv(&server, 0).unwrap();
@@ -509,7 +500,7 @@ mod test {
     #[ktest]
     fn kill_reply_makes_the_fault_fatal() {
         let (server, client) = handler_pair();
-        let space = code_only_space();
+        let space = space_over(None);
         let exit = spawn_user(&client, &space, COW_WRITER);
         sys_recv(&server, 0).unwrap();
         client.reply_exception(ExcReply::Kill);
@@ -518,7 +509,7 @@ mod test {
 
     #[ktest]
     fn revoked_or_missing_handler_is_fatal() {
-        let space = code_only_space();
+        let space = space_over(None);
 
         let none = Thread::new(Agent::new_root(1, 0));
         assert_eq!(run(&none, &space, UD2), Exit::Exception(6));
@@ -544,8 +535,8 @@ mod test {
     fn futex_wakes_across_spaces_sharing_a_frame() {
         let data = data_frame(0x11);
         let (s1, s2) = (
-            space_over(&data, PageFlags::RW),
-            space_over(&data, PageFlags::RW),
+            space_over(Some((&data, PageFlags::RW))),
+            space_over(Some((&data, PageFlags::RW))),
         );
         let (waiter, waker) = (
             Thread::new(Agent::new_root(1, 0)),
@@ -562,7 +553,7 @@ mod test {
 
     #[ktest]
     fn futex_wait_with_stale_value_is_eagain() {
-        let space = space_over(&data_frame(1), PageFlags::RW);
+        let space = space_over(Some((&data_frame(1), PageFlags::RW)));
         let t = Thread::new(Agent::new_root(1, 0));
         assert_eq!(run(&t, &space, FUTEX_WAITER), Exit::Code(-11isize as usize));
     }
@@ -590,7 +581,7 @@ mod test {
 
     #[ktest]
     fn interrupt_aborts_futex_wait() {
-        let space = space_over(&data_frame(0x11), PageFlags::RW);
+        let space = space_over(Some((&data_frame(0x11), PageFlags::RW)));
         let t = Thread::new(Agent::new_root(1, 0));
         let exit = spawn_user(&t, &space, FUTEX_WAITER);
         wait_blocked(&t, &exit);
