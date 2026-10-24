@@ -70,16 +70,14 @@ impl IpcArgs {
             self.reply,
         ];
         let mut out = [0u8; 168];
-        for (chunk, v) in out.chunks_exact_mut(8).zip(q) {
-            chunk.copy_from_slice(&v.to_le_bytes());
+        for (chunk, v) in out.as_chunks_mut::<8>().0.iter_mut().zip(q) {
+            *chunk = v.to_le_bytes();
         }
         out
     }
 
     pub fn from_bytes(b: &[u8; 168]) -> Self {
-        let mut q = b
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()));
+        let mut q = b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c));
         let mut next = || q.next().unwrap();
         Self {
             label: next(),
