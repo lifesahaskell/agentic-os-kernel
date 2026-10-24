@@ -298,25 +298,7 @@ mod test {
 
     /// Code page RX at CODE; one data page at DATA holding 0x11.
     fn new_space(data_flags: PageFlags) -> Arc<VmSpace> {
-        let code = FrameAllocOptions::new().alloc_frame().unwrap();
-        code.write_bytes(0, &PROGRAM).unwrap();
-        let data = FrameAllocOptions::new().alloc_frame().unwrap();
-        data.write_bytes(0, &[0x11u8]).unwrap();
-
-        let space = VmSpace::new();
-        let guard = disable_preempt();
-        let mut c = space.cursor_mut(&guard, &(CODE..DATA + PAGE_SIZE)).unwrap();
-        c.map(
-            code.into(),
-            PageProperty::new_user(PageFlags::RX, CachePolicy::Writeback),
-        );
-        c.jump(DATA).unwrap();
-        c.map(
-            data.into(),
-            PageProperty::new_user(data_flags, CachePolicy::Writeback),
-        );
-        drop(c);
-        Arc::new(space)
+        space_over(&data_frame(0x11), data_flags)
     }
 
     fn data_byte(space: &Arc<VmSpace>) -> u8 {
@@ -633,9 +615,6 @@ mod test {
             TaskOptions::new(move || *r.lock() = Some(futex::wait(&t, &space, DATA, 0x11)))
                 .spawn()
                 .unwrap();
-            while !waiters.iter().any(|w| w.is_blocked()) {
-                Task::yield_now();
-            }
         }
         while !waiters.iter().all(|w| w.is_blocked()) {
             Task::yield_now();
@@ -652,6 +631,22 @@ mod test {
                 Task::yield_now();
             }
             assert_eq!(r.lock().take(), Some(Ok(())));
+        }
+    }
+
+    #[ktest]
+    fn futex_on_a_kernel_address_is_efault_not_a_panic() {
+        let space = new_space(PageFlags::RW);
+        let t = Thread::new(Agent::new_root(1, 0));
+        for va in [usize::MAX & !3, 0xffff_8000_0000_0000] {
+            assert_eq!(
+                futex::wait(&t, &space, va, 0),
+                Err(futex::FutexError::Fault)
+            );
+            assert_eq!(
+                futex::wake(&t, &space, va, 1),
+                Err(futex::FutexError::Fault)
+            );
         }
     }
 }

@@ -10,7 +10,10 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ostd::{
-    mm::{HasPaddr, PAGE_SIZE, UFrame, Vaddr, VmIo, VmSpace, vm_space::VmQueriedItem},
+    mm::{
+        HasPaddr, PAGE_SIZE, UFrame, Vaddr, VmIo, VmSpace, is_in_user_space,
+        vm_space::VmQueriedItem,
+    },
     sync::{SpinLock, WaitQueue},
     task::disable_preempt,
 };
@@ -72,6 +75,10 @@ static TABLE: SpinLock<BTreeMap<usize, Bucket>> = SpinLock::new(BTreeMap::new())
 fn lookup(space: &VmSpace, t: &Thread, va: Vaddr) -> Result<(UFrame, usize), FutexError> {
     if !va.is_multiple_of(4) {
         return Err(FutexError::Inval);
+    }
+    // The address is user-supplied; the cursors below unwrap on a range outside user space.
+    if !is_in_user_space(va, 4) {
+        return Err(FutexError::Fault);
     }
     handle_cow_fault(space, t.agent(), va).map_err(|_| FutexError::Budget)?;
     let page = va & !(PAGE_SIZE - 1);
