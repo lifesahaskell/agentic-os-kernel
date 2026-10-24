@@ -27,7 +27,7 @@ if [ "$kvm" = 1 ]; then
   # OSDK reuses the ktest bundle for run unless target/osdk is cleared first.
   ./osdk.sh sh -c 'rm -rf target/osdk && ../userland/build.sh && cargo osdk run' >"$log" 2>&1 || true
   cat "$log"
-  for want in "aok: cpu budget check passed"; do
+  for want in "aok: fpu preemption check passed" "aok: cpu budget check passed"; do
     grep -q "$want" "$log" || { echo "check: boot output lacks '$want'" >&2; exit 1; }
   done
   if grep -q FAILED "$log"; then echo "check: boot output contains FAILED" >&2; exit 1; fi

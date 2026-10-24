@@ -7,6 +7,8 @@
 use alloc::sync::Arc;
 
 use ostd::{
+    arch::cpu::context::FpuContext,
+    irq::DisabledLocalIrqGuard,
     mm::{Vaddr, VmSpace},
     sync::{LocalIrqDisabled, SpinLock, WaitQueue, Waiter, Waker},
     user::UserModeHooks,
@@ -38,8 +40,21 @@ struct State {
     exc_reply: Option<ExcReply>,
 }
 
+type SharedFpu = Arc<SpinLock<FpuContext, LocalIrqDisabled>>;
+
+/// The thread whose xmm/x87 state is live in the CPU. Swapped lazily in `pre_user_run`.
+// shortcut: one global owner because the kernel runs `-smp 1`; SMP needs a per-CPU owner.
+static FPU_OWNER: SpinLock<Option<SharedFpu>, LocalIrqDisabled> = SpinLock::new(None);
+
+/// Ktest-only switch that turns the swap off, so a test can prove it would see a leak.
+#[cfg(ktest)]
+pub(crate) static FPU_SWAP_DISABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub struct Thread {
     agent: Arc<Agent>,
+    /// This thread's saved FPU/SSE state; live in the CPU only while `FPU_OWNER` points here.
+    fpu: SharedFpu,
     // IRQ-safe: a timer callback may interrupt the thread.
     state: SpinLock<State, LocalIrqDisabled>,
     /// Where this thread's user exceptions are sent. Kept as the capability, not the endpoint,
@@ -52,6 +67,7 @@ impl Thread {
     pub fn new(agent: Arc<Agent>) -> Arc<Self> {
         Arc::new(Self {
             agent,
+            fpu: Arc::new(SpinLock::new(FpuContext::default())),
             state: SpinLock::new(State {
                 redirect: None,
                 blocked: None,
@@ -149,5 +165,106 @@ impl Thread {
 impl UserModeHooks for Thread {
     fn has_kernel_event(&self) -> bool {
         self.state.lock().redirect.is_some()
+    }
+
+    /// Hands the CPU's FPU/SSE registers to this thread: if another thread owns them, save its
+    /// state and load ours. Kernel code is soft-float, so nothing else touches them in between.
+    fn pre_user_run(&self, _guard: &DisabledLocalIrqGuard) {
+        #[cfg(ktest)]
+        if FPU_SWAP_DISABLED.load(core::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let mut owner = FPU_OWNER.lock();
+        if owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, &self.fpu)) {
+            return;
+        }
+        if let Some(old) = owner.as_ref() {
+            old.lock().save();
+        }
+        self.fpu.lock().load();
+        *owner = Some(self.fpu.clone());
+    }
+}
+
+#[cfg(ktest)]
+mod test {
+    use core::sync::atomic::Ordering;
+
+    use ostd::{prelude::*, task::Task};
+
+    use super::*;
+    use crate::{
+        agent::Agent,
+        user::{
+            Exit, load_image,
+            testkit::{ExitSlot, join, spawn_image},
+            user_image,
+        },
+    };
+
+    /// `mode | seed << 8` for `userland/tests/src/bin/fpu.rs`.
+    fn arg(mode: u64, seed: u64) -> u64 {
+        mode | seed << 8
+    }
+
+    /// Each thread gets its own image: a shared one would share the user stack.
+    fn spawn_fpu(mode: u64, seed: u64) -> (Arc<Thread>, ExitSlot, Vaddr) {
+        let img = load_image(user_image!("fpu")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 0));
+        let exit = spawn_image(&t, &img, arg(mode, seed));
+        (t, exit, img.handler)
+    }
+
+    /// Exits of two yield-mode threads with different xmm patterns, run to completion.
+    fn two_yielders() -> [Exit; 2] {
+        let a = spawn_fpu(1, 1);
+        let b = spawn_fpu(1, 2);
+        [join(&a.1), join(&b.1)]
+    }
+
+    #[ktest]
+    fn fpu_context_default_mxcsr_is_0x1f80() {
+        let ctx = FpuContext::default();
+        let b = ctx.as_bytes();
+        assert_eq!(u16::from_le_bytes([b[0], b[1]]), 0x037F, "FCW");
+        assert_eq!(
+            u32::from_le_bytes(b[24..28].try_into().unwrap()),
+            0x1F80,
+            "MXCSR"
+        );
+    }
+
+    #[ktest]
+    fn xmm_survives_yield_between_two_threads() {
+        assert_eq!(two_yielders(), [Exit::Code(0), Exit::Code(0)]);
+    }
+
+    #[ktest]
+    fn xmm_swap_disabled_is_detected() {
+        struct Reenable;
+        impl Drop for Reenable {
+            fn drop(&mut self) {
+                FPU_SWAP_DISABLED.store(false, Ordering::Relaxed);
+            }
+        }
+        FPU_SWAP_DISABLED.store(true, Ordering::Relaxed);
+        let _guard = Reenable;
+        let exits = two_yielders();
+        assert!(
+            exits.iter().any(|e| *e != Exit::Code(0)),
+            "without the swap the two threads must corrupt each other: {exits:?}"
+        );
+    }
+
+    #[ktest]
+    fn xmm_survives_redirect() {
+        let (t3, e3, handler) = spawn_fpu(3, 3);
+        let (_t1, e1, _) = spawn_fpu(1, 4);
+        for _ in 0..50 {
+            Task::yield_now();
+        }
+        t3.interrupt(handler);
+        assert_eq!(join(&e3), Exit::Code(0));
+        assert_eq!(join(&e1), Exit::Code(0));
     }
 }
