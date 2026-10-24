@@ -9,6 +9,9 @@ pub const SYS_SCHED_YIELD: usize = 24;
 pub const SYS_EXIT: usize = 60;
 pub const SYS_FUTEX: usize = 202;
 pub const SYS_CALL: usize = 0x100;
+pub const SYS_RECV: usize = 0x101;
+pub const SYS_REPLY: usize = 0x102;
+pub const SYS_REPLY_RECV: usize = 0x103;
 
 /// Linux errno values. A syscall returns `-errno` in `rax` on failure.
 pub mod errno {
@@ -20,6 +23,8 @@ pub mod errno {
     pub const EFAULT: isize = 14;
     pub const EINVAL: isize = 22;
     pub const ENOSYS: isize = 38;
+    pub const EMSGSIZE: isize = 90;
+    pub const ETIMEDOUT: isize = 110;
 }
 
 /// The one argument block for multi-value IPC calls. The kernel reads it from the pointer in
@@ -74,6 +79,20 @@ impl IpcArgs {
             *chunk = v.to_le_bytes();
         }
         out
+    }
+
+    /// Points `send_buf` and `send_len` at `buf`. The kernel copies the bytes at call time.
+    pub fn with_send(mut self, buf: &[u8]) -> Self {
+        self.send_buf = buf.as_ptr() as u64;
+        self.send_len = buf.len() as u64;
+        self
+    }
+
+    /// Points `recv_buf` and `recv_len` at `buf`. The kernel writes at most `buf.len()` bytes.
+    pub fn with_recv(mut self, buf: &mut [u8]) -> Self {
+        self.recv_buf = buf.as_mut_ptr() as u64;
+        self.recv_len = buf.len() as u64;
+        self
     }
 
     pub fn from_bytes(b: &[u8; 168]) -> Self {

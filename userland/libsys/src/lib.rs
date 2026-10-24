@@ -8,7 +8,7 @@ pub mod fpu;
 pub mod raw;
 pub mod rt;
 
-use abi::{IpcArgs, SYS_CALL, SYS_EXIT, SYS_SCHED_YIELD};
+use abi::{IpcArgs, SYS_CALL, SYS_EXIT, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD};
 
 pub fn exit(code: u64) -> ! {
     raw::syscall6(SYS_EXIT, [code as usize, 0, 0, 0, 0, 0]);
@@ -26,6 +26,31 @@ pub fn sched_yield() {
 pub fn call(ep: u64, args: &mut IpcArgs) -> Result<(), isize> {
     let r = raw::syscall6(
         SYS_CALL,
+        [ep as usize, args as *mut IpcArgs as usize, 0, 0, 0, 0],
+    );
+    if r < 0 { Err(-r) } else { Ok(()) }
+}
+
+/// Waits for a message on the endpoint in slot `ep`. On success `args` holds its `label`,
+/// `words`, `tid` and `tag`, and `reply` holds the handle to answer a `call` (0 for a `send`).
+pub fn recv(ep: u64, args: &mut IpcArgs) -> Result<(), isize> {
+    let r = raw::syscall6(
+        SYS_RECV,
+        [ep as usize, args as *mut IpcArgs as usize, 0, 0, 0, 0],
+    );
+    if r < 0 { Err(-r) } else { Ok(()) }
+}
+
+/// Answers the call whose handle is `args.reply` with `args.words`. A handle works once.
+pub fn reply(args: &mut IpcArgs) -> Result<(), isize> {
+    let r = raw::syscall6(SYS_REPLY, [args as *mut IpcArgs as usize, 0, 0, 0, 0, 0]);
+    if r < 0 { Err(-r) } else { Ok(()) }
+}
+
+/// `reply(args)`, then `recv(ep, args)`. A failed reply returns without receiving.
+pub fn reply_recv(ep: u64, args: &mut IpcArgs) -> Result<(), isize> {
+    let r = raw::syscall6(
+        SYS_REPLY_RECV,
         [ep as usize, args as *mut IpcArgs as usize, 0, 0, 0, 0],
     );
     if r < 0 { Err(-r) } else { Ok(()) }
