@@ -5,7 +5,7 @@
 
 Scope: milestone B3 only. B4 and B5 are in v2. Sources: `.planning/PROJECT.md`, `.planning/research/SUMMARY.md`
 (and the four files it summarizes), `docs/architecture/scoping.md`, `option-b-microkernel.md`,
-`b2-spike-report.md`. Kernel gap IDs (K1-K12) refer to `.planning/research/ARCHITECTURE.md`.
+`b2-spike-report.md`.
 
 Every requirement is testable by a ktest, a host unit test, a QEMU integration run, or a
 recorded measurement. "Test" below names what would show it worked.
@@ -18,12 +18,12 @@ recorded measurement. "Test" below names what would show it worked.
 - [ ] **KERN-02**: A ring-3 syscall ABI exists (`syscall.rs`) with a typed decode layer. Test: a fuzz-style ktest feeds malformed numbers, pointers and lengths and gets errno returns, never a kernel panic.
 - [ ] **KERN-03**: User code (servers, tests, bootstrap) builds as Rust `no_std` for a custom `x86_64-aok-user.json` target inside the Docker image and loads from a flat bootstrap image. Test: a Rust ring-3 test crate replaces the hand-assembled B2 test programs.
 - [ ] **KERN-04**: `Object::Space` and `Object::Thread` capability types exist, with `thread_create(space, ctx, tag)` gated by the Space capability. Test: a holder can create and signal a thread in another space; a non-holder cannot.
-- [ ] **KERN-05**: CSpace grows past the 64-slot B2 limit (K1). Test: install and derive more than 64 capabilities.
-- [ ] **KERN-06**: Every kernel write into user memory goes through one `copy_to_user` that breaks CoW and retries (K5). Test: the first `read` into a buffer after `fork` succeeds (written before procmgr exists).
-- [ ] **KERN-07**: An idle task halts the CPU when nothing is runnable (K4). Test: the scheduler runs with all agents blocked and the CPU halts instead of spinning.
-- [ ] **KERN-08**: Destroying a process returns its carved budgets and capabilities to the parent (`charge_pages` gets an inverse) and wakes its futex waiters (K6). Test: a 10,000x fork+exit loop leaves page and capability counts flat.
-- [ ] **KERN-09**: `futex` wait and IPC `recv` accept timeouts, and a timer can deliver a message to an endpoint (K10). Test: timed waits expire within a stated tolerance.
-- [ ] **KERN-10**: Thread-exit and exception notifications go to a process endpoint and name the faulting `tid` and `tag` (K7). Test: procmgr can tell which of two forked siblings faulted.
+- [ ] **KERN-05**: CSpace grows past the 64-slot B2 limit. Test: install and derive more than 64 capabilities.
+- [ ] **KERN-06**: Every kernel write into user memory goes through one `copy_to_user` that breaks CoW and retries. Test: the first `read` into a buffer after `fork` succeeds (written before procmgr exists).
+- [ ] **KERN-07**: An idle task halts the CPU when nothing is runnable. Test: the scheduler runs with all agents blocked and the CPU halts instead of spinning.
+- [ ] **KERN-08**: Destroying a process returns its carved budgets and capabilities to the parent (`charge_pages` gets an inverse) and wakes its futex waiters. Test: a 10,000x fork+exit loop leaves page and capability counts flat.
+- [ ] **KERN-09**: `futex` wait and IPC `recv` accept timeouts, and a timer can deliver a message to an endpoint. Test: timed waits expire within a stated tolerance.
+- [ ] **KERN-10**: Thread-exit and exception notifications go to a process endpoint and name the faulting `tid` and `tag`. Test: procmgr can tell which of two forked siblings faulted.
 - [ ] **KERN-11**: Signal redirect saves the full user context on a kernel-held stack and `sigreturn` restores it, with no kernel write to the user stack. Test: all general registers and FPU state survive a redirect and return.
 - [ ] **KERN-12**: One shared `block_until(condition, deadline)` helper implements every blocking wait. Hand-rolled wait loops are absent. Test: a fail-point ktest forces the wake-versus-interrupt interleaving, plus a 1000x loop in CI.
 
@@ -109,7 +109,7 @@ recorded measurement. "Test" below names what would show it worked.
 ### Performance (PERF)
 
 - [ ] **PERF-01**: fork+exec, `posix_spawn`, signal round trip, pipe throughput and latency, and null `read`/`write` are measured against a Linux guest in the same QEMU/KVM configuration, with rdtsc timing, N, median and p99.
-- [ ] **PERF-02**: Before the first fork+exec run, a "layer is wrong" threshold is set from the Phase 2 and Phase 5 primitive timings (IPC round trip, `cow_clone`), together with the predicted fork+exec sum. The prediction and the measurement are both published.
+- [ ] **PERF-02**: Before the first fork+exec run, a "layer is wrong" threshold is set from the IPC round-trip (Phase 1) and `cow_clone` (Phase 4) primitive timings, together with the predicted fork+exec sum. The prediction and the measurement are both published.
 - [ ] **PERF-03**: Results and methodology are written up in `docs/architecture/` with the commit, QEMU flags and host CPU recorded.
 
 ### Agentic properties (AGNT)
@@ -172,16 +172,88 @@ recorded measurement. "Test" below names what would show it worked.
 
 ## Traceability
 
-Populated by the roadmapper. Each v1 requirement maps to exactly one phase.
+Each v1 requirement maps to exactly one phase. Rule: the phase that builds its primary component.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
+| KERN-01 | Phase 1 | Pending |
+| KERN-02 | Phase 1 | Pending |
+| KERN-03 | Phase 1 | Pending |
+| KERN-04 | Phase 2 | Pending |
+| KERN-05 | Phase 1 | Pending |
+| KERN-06 | Phase 1 | Pending |
+| KERN-07 | Phase 2 | Pending |
+| KERN-08 | Phase 2 | Pending |
+| KERN-09 | Phase 2 | Pending |
+| KERN-10 | Phase 2 | Pending |
+| KERN-11 | Phase 2 | Pending |
+| KERN-12 | Phase 1 | Pending |
+| IPC-01 | Phase 1 | Pending |
+| IPC-02 | Phase 1 | Pending |
+| IPC-03 | Phase 1 | Pending |
+| IPC-04 | Phase 1 | Pending |
+| IPC-05 | Phase 1 | Pending |
+| IPC-06 | Phase 1 | Pending |
+| SRV-01 | Phase 3 | Pending |
+| SRV-02 | Phase 3 | Pending |
+| SRV-03 | Phase 3 | Pending |
+| SRV-04 | Phase 3 | Pending |
+| PROC-01 | Phase 4 | Pending |
+| PROC-02 | Phase 4 | Pending |
+| PROC-03 | Phase 4 | Pending |
+| PROC-04 | Phase 4 | Pending |
+| PROC-05 | Phase 4 | Pending |
+| PROC-06 | Phase 4 | Pending |
+| PROC-07 | Phase 4 | Pending |
+| EXEC-01 | Phase 4 | Pending |
+| EXEC-02 | Phase 4 | Pending |
+| EXEC-03 | Phase 4 | Pending |
+| VFS-01 | Phase 3 | Pending |
+| VFS-02 | Phase 3 | Pending |
+| VFS-03 | Phase 3 | Pending |
+| VFS-04 | Phase 3 | Pending |
+| VFS-05 | Phase 3 | Pending |
+| VFS-06 | Phase 3 | Pending |
+| VFS-07 | Phase 5 | Pending |
+| VFS-08 | Phase 5 | Pending |
+| SIG-01 | Phase 5 | Pending |
+| SIG-02 | Phase 5 | Pending |
+| SIG-03 | Phase 5 | Pending |
+| SIG-04 | Phase 5 | Pending |
+| SIG-05 | Phase 5 | Pending |
+| TTY-01 | Phase 5 | Pending |
+| TTY-02 | Phase 5 | Pending |
+| TTY-03 | Phase 5 | Pending |
+| LIBC-01 | Phase 4 | Pending |
+| LIBC-02 | Phase 6 | Pending |
+| LIBC-03 | Phase 6 | Pending |
+| LIBC-04 | Phase 6 | Pending |
+| LIBC-05 | Phase 6 | Pending |
+| SHELL-01 | Phase 6 | Pending |
+| SHELL-02 | Phase 6 | Pending |
+| SHELL-03 | Phase 6 | Pending |
+| SHELL-04 | Phase 6 | Pending |
+| TEST-01 | Phase 4 | Pending |
+| TEST-02 | Phase 6 | Pending |
+| TEST-03 | Phase 6 | Pending |
+| TEST-04 | Phase 6 | Pending |
+| TEST-05 | Phase 6 | Pending |
+| TEST-06 | Phase 1 | Pending |
+| TEST-07 | Phase 3 | Pending |
+| PERF-01 | Phase 6 | Pending |
+| PERF-02 | Phase 4 | Pending |
+| PERF-03 | Phase 6 | Pending |
+| AGNT-01 | Phase 6 | Pending |
+| AGNT-02 | Phase 2 | Pending |
+| AGNT-03 | Phase 3 | Pending |
+| AGNT-04 | Phase 6 | Pending |
+| AGNT-05 | Phase 2 | Pending |
 
 **Coverage:**
 - v1 requirements: 72 total
-- Mapped to phases: 0
-- Unmapped: 72
+- Mapped to phases: 72
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-10-24*
-*Last updated: 2026-10-24 after initial definition*
+*Last updated: 2026-10-24 after roadmap creation*
