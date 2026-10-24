@@ -1,6 +1,13 @@
 ---
-gsd_state_version: '1.0'
+gsd_state_version: "1.0"
+current_phase: 1
+current_phase_name: Userland, syscall ABI and IPC v2
 status: planning
+stopped_at: context exhaustion at 76% (2026-10-24)
+last_updated: "2026-10-24T15:05:17.720Z"
+last_activity: 2026-10-24
+last_activity_desc: Roadmap created (6 phases, 72/72 requirements mapped); SAFE-01 added 2026-10-24 (73/73)
+state_head: 25fb89b0c1fa099bf06be8a044515e089d17789b
 progress:
   total_phases: 6
   completed_phases: 0
@@ -23,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-23)
 Phase: 1 of 6 (Userland, syscall ABI and IPC v2)
 Plan: 0 of 0 in current phase
 Status: Ready to plan
-Last activity: 2026-10-24 - Roadmap created (6 phases, 72/72 requirements mapped)
+Last activity: 2026-10-24 - Roadmap created (6 phases, 72/72 requirements mapped); SAFE-01 added 2026-10-24 (73/73)
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -63,7 +70,7 @@ None yet.
 
 ### Blockers/Concerns
 
-- [Phase 1]: User-mode FPU/SSE under OSTD 0.19.0 is the highest-risk unknown. Failure stops B3 and triggers the ADR 0002 Redox re-score.
+- [Phase 1]: User-mode FPU/SSE under OSTD 0.19.0 is the highest-risk unknown. Order: safe route, then contained `unsafe` (ledgered, SAFE-01), then Redox re-score only if both fail or an OSTD patch is needed.
 - [Phase 1]: OSTD 0.19.0 docs.rs build failed; read the source for `boot_info()`, initramfs and serial RX.
 - [Phase 3]: Open decisions need Corey's sign-off: read-only grant errno (`EROFS` vs `EACCES`) and cross-domain `kill` errno (`ESRCH` vs `EPERM`). One ADR amending option-b.
 - [Phase 4]: musl is the default libc on source-level evidence only; nothing was built. The Phase 4 spike confirms or overturns it.
@@ -80,6 +87,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-24
-Stopped at: Roadmap and state initialized; ready for `/gsd-plan-phase 1`
+Last session: 2026-10-24T15:05:17.709Z
+Stopped at: context exhaustion at 76% (2026-10-24)
 Resume file: None

@@ -9,7 +9,7 @@ servers follow in dependency order: vfs with per-domain namespaces built in from
 version (Phase 3), exec and procmgr (Phase 4), signals, sessions and tty (Phase 5). Phase 6 ports
 musl, runs BusyBox `ash`, wires the os-test gate and publishes timings against Linux.
 
-**Structure.** 72 requirements in 6 phases (config: coarse). The research proposed 8.
+**Structure.** 73 requirements in 6 phases (config: coarse). The research proposed 8.
 - Research phases 1 and 2 merge into Phase 1. The syscall ABI phase alone holds 3 requirements
   and IPC v2 cannot start without it. The FPU/SSE stop/go gate is its first criterion, so the
   merge costs no decision point.
@@ -49,10 +49,10 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Goal:** As a server author, I want a Rust ring-3 toolchain, a fuzz-safe syscall ABI and call/reply IPC, so that servers can run and the IPC cost is known.
 **Mode:** mvp
 **Depends on:** Nothing (first phase; builds on the validated B2 kernel)
-**Requirements:** KERN-01, KERN-02, KERN-03, KERN-05, KERN-06, KERN-12, IPC-01, IPC-02, IPC-03, IPC-04, IPC-05, IPC-06, TEST-06
+**Requirements:** KERN-01, SAFE-01, KERN-02, KERN-03, KERN-05, KERN-06, KERN-12, IPC-01, IPC-02, IPC-03, IPC-04, IPC-05, IPC-06, TEST-06
 **Success Criteria** (what must be TRUE):
   1. A Rust `no_std` ring-3 test crate, built for `x86_64-aok-user.json` inside the Docker image and loaded from the flat bootstrap image, replaces the hand-assembled B2 test programs. The B2 ktests and the boot-time budget check stay green, and `cargo clippy` and `cargo fmt --check` pass in CI.
-  2. A ring-3 program keeps an XMM value across a yield. If OSTD cannot do this without patches or `unsafe`, the milestone stops and the ADR 0002 Redox re-score is triggered; either outcome is recorded.
+  2. A ring-3 program keeps an XMM value across a yield. Order of attempts: a safe OSTD route, then a contained `unsafe` block recorded in `docs/architecture/unsafe-ledger.md` (SAFE-01). Only if both fail, or the fix needs an OSTD patch, the milestone stops and the ADR 0002 Redox re-score is triggered. The route taken is recorded.
   3. A fuzz-style ktest feeds malformed syscall numbers, pointers and lengths and gets errno returns, never a kernel panic.
   4. A server parks a request and replies later. Interrupting a blocked `call` sends Cancel and the caller stays blocked until the reply, so an interrupted `read` loses no data. A fail-point ktest forces the wake-versus-interrupt interleaving through the shared `block_until`, and a 1000x loop passes.
   5. A server tells two forked siblings apart by the kernel-stamped `tid` and `tag`. A multi-page cross-space copy matches byte for byte, including the first write into a CoW page after clone. A capability sent in a message cannot exceed its attenuated rights. More than 64 capabilities install and derive. The null-IPC round trip is recorded with N, median and p99.

@@ -14,7 +14,7 @@ recorded measurement. "Test" below names what would show it worked.
 
 ### Kernel enablers (KERN)
 
-- [ ] **KERN-01**: User-mode FPU/SSE state is enabled under OSTD 0.19.0 and saved and restored per thread across context switches and signal delivery. If OSTD cannot do this without patches or `unsafe`, B3 stops and the Redox-fork re-score in ADR 0002 is triggered. Test: a ring-3 program keeps an XMM value across a yield and a signal redirect.
+- [ ] **KERN-01**: User-mode FPU/SSE state is enabled under OSTD 0.19.0 and saved and restored per thread across context switches and signal delivery. Try a safe OSTD route first, then a contained `unsafe` block (see SAFE-01). Only if neither works, or the fix needs an OSTD patch, B3 stops and the Redox-fork re-score in ADR 0002 is triggered. Test: a ring-3 program keeps an XMM value across a yield and a signal redirect.
 - [ ] **KERN-02**: A ring-3 syscall ABI exists (`syscall.rs`) with a typed decode layer. Test: a fuzz-style ktest feeds malformed numbers, pointers and lengths and gets errno returns, never a kernel panic.
 - [ ] **KERN-03**: User code (servers, tests, bootstrap) builds as Rust `no_std` for a custom `x86_64-aok-user.json` target inside the Docker image and loads from a flat bootstrap image. Test: a Rust ring-3 test crate replaces the hand-assembled B2 test programs.
 - [ ] **KERN-04**: `Object::Space` and `Object::Thread` capability types exist, with `thread_create(space, ctx, tag)` gated by the Space capability. Test: a holder can create and signal a thread in another space; a non-holder cannot.
@@ -25,6 +25,7 @@ recorded measurement. "Test" below names what would show it worked.
 - [ ] **KERN-09**: `futex` wait and IPC `recv` accept timeouts, and a timer can deliver a message to an endpoint. Test: timed waits expire within a stated tolerance.
 - [ ] **KERN-10**: Thread-exit and exception notifications go to a process endpoint and name the faulting `tid` and `tag`. Test: procmgr can tell which of two forked siblings faulted.
 - [ ] **KERN-11**: Signal redirect saves the full user context on a kernel-held stack and `sigreturn` restores it, with no kernel write to the user stack. Test: all general registers and FPU state survive a redirect and return.
+- [ ] **SAFE-01**: `unsafe` is allowed only where no safe workaround exists, and stays contained. The crate keeps `#![deny(unsafe_code)]`; each exception is a small named module with `#[allow(unsafe_code)]`, every block carries a `// SAFETY:` comment, and every block is listed in `docs/architecture/unsafe-ledger.md` (location, why no safe route, invariant relied on, how to retire it). Test: a CI grep fails if `unsafe` appears outside a ledger-listed module or a ledger entry has no matching block.
 - [ ] **KERN-12**: One shared `block_until(condition, deadline)` helper implements every blocking wait. Hand-rolled wait loops are absent. Test: a fail-point ktest forces the wake-versus-interrupt interleaving, plus a 1000x loop in CI.
 
 ### IPC (IPC)
@@ -144,6 +145,7 @@ recorded measurement. "Test" below names what would show it worked.
 - **LIBC2-01**: pthread polish beyond what BusyBox and the suites need
 - **KERN2-01**: SMP, after `cow_clone` TLB shootdown and the interrupt race are fixed
 - **KERN2-02**: Dynamic linking (`ld.so`)
+- **SAFE2-01**: System hardening pass: audit every unsafe-ledger entry, retire what a safe API now covers, and add a test or proof sketch for each invariant that remains
 
 ## Out of Scope
 
@@ -177,6 +179,7 @@ Each v1 requirement maps to exactly one phase. Rule: the phase that builds its p
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | KERN-01 | Phase 1 | Pending |
+| SAFE-01 | Phase 1 | Pending |
 | KERN-02 | Phase 1 | Pending |
 | KERN-03 | Phase 1 | Pending |
 | KERN-04 | Phase 2 | Pending |
@@ -250,10 +253,10 @@ Each v1 requirement maps to exactly one phase. Rule: the phase that builds its p
 | AGNT-05 | Phase 2 | Pending |
 
 **Coverage:**
-- v1 requirements: 72 total
-- Mapped to phases: 72
+- v1 requirements: 73 total
+- Mapped to phases: 73
 - Unmapped: 0
 
 ---
 *Requirements defined: 2026-10-24*
-*Last updated: 2026-10-24 after roadmap creation*
+*Last updated: 2026-10-24 after relaxing the unsafe constraint (added SAFE-01)*

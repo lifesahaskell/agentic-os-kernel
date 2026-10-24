@@ -20,7 +20,7 @@ POSIX programs still run.
 
 - **Team and schedule**: one person plus agents, no deadline — research artifact, not a product (answers scoping section 9 questions 1 and 5; revisit if either changes)
 - **Tech stack**: Rust on Asterinas OSTD 0.19.0, x86-64 only for v1 — the spike validated this base
-- **Safety**: `#![deny(unsafe_code)]` in the kernel crate and no OSTD patches — needing either is the recorded signal to re-score the Redox fork in ADR 0002
+- **Safety**: `#![deny(unsafe_code)]` stays crate-wide. `unsafe` is allowed only where no safe workaround exists, confined to small named modules, each block ledgered in `docs/architecture/unsafe-ledger.md` and revisited in a later hardening pass (decided 2026-10-24). Needing an OSTD patch, or an `unsafe` need that cannot be contained, is the recorded signal to re-score the Redox fork in ADR 0002
 - **Build/test**: Docker image `agentic-os-kernel-dev:0.19.0` and `kernel/osdk.sh`; KVM host required
 - **Compatibility**: agent features are additive; they never change the semantics of existing POSIX interfaces, and denials map to standard errno values
 - **Docs**: wiki claims cite PDF pages; design reasoning not stated by a source is marked *(interpretation)*; `raw/` is gitignored and never edited

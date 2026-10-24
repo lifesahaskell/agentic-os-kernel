@@ -91,7 +91,7 @@ turns them into numbered requirements.
 
 - **Team and schedule**: one person plus agents, no deadline — research artifact, not a product (answers scoping section 9 questions 1 and 5; revisit if either changes)
 - **Tech stack**: Rust on Asterinas OSTD 0.19.0, x86-64 only for v1 — the spike validated this base
-- **Safety**: `#![deny(unsafe_code)]` in the kernel crate and no OSTD patches — needing either is the recorded signal to re-score the Redox fork in ADR 0002
+- **Safety**: `#![deny(unsafe_code)]` stays crate-wide. `unsafe` is allowed only where no safe workaround exists, confined to small named modules, each block ledgered in `docs/architecture/unsafe-ledger.md` and revisited in a later hardening pass (decided 2026-10-24). Needing an OSTD patch, or an `unsafe` need that cannot be contained, is the recorded signal to re-score the Redox fork in ADR 0002
 - **Build/test**: Docker image `agentic-os-kernel-dev:0.19.0` and `kernel/osdk.sh`; KVM host required
 - **Compatibility**: agent features are additive; they never change the semantics of existing POSIX interfaces, and denials map to standard errno values
 - **Docs**: wiki claims cite PDF pages; design reasoning not stated by a source is marked *(interpretation)*; `raw/` is gitignored and never edited
@@ -106,6 +106,7 @@ turns them into numbered requirements.
 | Per-grant forwarders for revocation | Matches per-delegation revocation; EROS/Coyotos precedent | ✓ Good (B2 tests) |
 | uid/gid is a server-side attribute, never kernel authority | Namespace answers "can you name it"; mode bits answer "may you" | — Pending |
 | This GSD roadmap covers B3 only | B4 and B5 depend on B3 outcomes (layer cost, libc choice, adherence tier) | — Pending |
+| Contained `unsafe` is acceptable; Redox re-score only after safe and contained-unsafe routes fail (2026-10-24) | Avoid abandoning the OSTD base over one low-level need such as FPU state; the cost is paid in a ledger and a hardening pass | — Pending |
 | Solo, no deadline recorded as an explicit constraint | Scoping section 9 left schedule open; roadmap needs a stated assumption | — Pending |
 
 ## Evolution
@@ -126,4 +127,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-10-23 after initialization*
+*Last updated: 2026-10-24 after relaxing the unsafe constraint*
