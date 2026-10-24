@@ -16,6 +16,7 @@ pub mod errno {
     pub const EINTR: isize = 4;
     pub const EBADF: isize = 9;
     pub const EAGAIN: isize = 11;
+    pub const ENOMEM: isize = 12;
     pub const EFAULT: isize = 14;
     pub const EINVAL: isize = 22;
     pub const ENOSYS: isize = 38;
@@ -41,6 +42,64 @@ pub struct IpcArgs {
 }
 
 const _: () = assert!(core::mem::size_of::<IpcArgs>() == 168);
+
+impl IpcArgs {
+    /// The wire form: 21 little-endian u64 in field order, which is the `repr(C)` layout.
+    pub fn to_bytes(&self) -> [u8; 168] {
+        let q = [
+            self.label,
+            self.words[0],
+            self.words[1],
+            self.words[2],
+            self.words[3],
+            self.send_buf,
+            self.send_len,
+            self.recv_buf,
+            self.recv_len,
+            self.caps[0],
+            self.caps[1],
+            self.caps[2],
+            self.caps[3],
+            self.cap_rights[0],
+            self.cap_rights[1],
+            self.cap_rights[2],
+            self.cap_rights[3],
+            self.ncaps,
+            self.tid,
+            self.tag,
+            self.reply,
+        ];
+        let mut out = [0u8; 168];
+        for (chunk, v) in out.as_chunks_mut::<8>().0.iter_mut().zip(q) {
+            *chunk = v.to_le_bytes();
+        }
+        out
+    }
+
+    pub fn from_bytes(b: &[u8; 168]) -> Self {
+        let mut q = b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c));
+        let mut next = || q.next().unwrap();
+        Self {
+            label: next(),
+            words: [next(), next(), next(), next()],
+            send_buf: next(),
+            send_len: next(),
+            recv_buf: next(),
+            recv_len: next(),
+            caps: [next(), next(), next(), next()],
+            cap_rights: [next(), next(), next(), next()],
+            ncaps: next(),
+            tid: next(),
+            tag: next(),
+            reply: next(),
+        }
+    }
+}
+
+/// First address above user space on x86-64 (47-bit canonical lower half).
+pub const USER_TOP: usize = 0x0000_8000_0000_0000;
+/// Largest byte count the kernel copies for one syscall buffer.
+pub const MAX_IPC_BYTES: usize = 64 * 1024;
 
 /// Flat image: `userland/link.ld` puts five little-endian u64 at `IMAGE_BASE`: magic, entry,
 /// handler, `rx_end`, `mem_end`. Pages below `rx_end` map RX, pages up to `mem_end` map RW and
