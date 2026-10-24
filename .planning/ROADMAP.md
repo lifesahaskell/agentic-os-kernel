@@ -60,7 +60,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Research:** research-phase AND spike. Read the OSTD 0.19.0 source (docs.rs failed for 0.19.0): user-mode FPU/SSE enablement and per-thread save (highest-risk unknown; a musl binary cannot run without it), OSDK initramfs key and `boot_info()` contents, serial RX, custom target flags, LLVM 21 in the image. Spike: frame-level cross-space copy and CoW-break order (inferred, never run), the cancel-then-wait protocol (no tested precedent here), whether `VmSpace::activate` keeps TLB entries.
 **Decisions due:** `libaok` sits on `posix-client`; Linux syscall numbers stop at `libaok` and server protocols are POSIX-operation granular. Per-thread `tid`/`tag` is the process identity, badged endpoints only for server-to-server delegation. Cancel semantics replace the older "interrupt aborts blocked IPC" wording; abort-at-once stays for a blocked `recv`. One custom user target JSON for all user code.
-**Plans:** 5/7 plans executed
+**Plans:** 6/7 plans executed
 
 Plans:
 **Wave 1**
@@ -77,7 +77,7 @@ Plans:
 - [x] 01-05-PLAN.md — block_until with fail-points, reply handles and reply_recv, tid/tag stamping, bulk copy (W4)
 
 **Wave 5** *(blocked on Wave 4 completion)*
-- [ ] 01-06-PLAN.md — Cancel-then-wait and capability transfer with attenuation (W5)
+- [x] 01-06-PLAN.md — Cancel-then-wait and capability transfer with attenuation (W5)
 
 **Wave 6** *(blocked on Wave 5 completion)*
 - [ ] 01-07-PLAN.md — Port B2 byte programs to Rust bins, null-IPC measurement, full gate green (W6)
@@ -174,7 +174,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6.
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Userland, syscall ABI and IPC v2 | 5/7 | In Progress | - |
+| 1. Userland, syscall ABI and IPC v2 | 6/7 | In Progress | - |
 | 2. Process objects, teardown and timers | 0/0 | Not started | - |
 | 3. Bootstrap, server runtime and vfs | 0/0 | Not started | - |
 | 4. exec and procmgr | 0/0 | Not started | - |
