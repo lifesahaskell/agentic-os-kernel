@@ -23,4 +23,28 @@ in a small named module, is the trigger to re-score the Redox fork.
 
 ## FPU/SSE route (KERN-01)
 
-Not yet decided (01-02 Task 2).
+Route: safe. No kernel `unsafe`; the Kernel table stays empty. Decided in 01-02 (D-01 spike
+passed, so the D-02 module `kernel/src/fpu.rs` was not created and D-04 did not fire).
+
+Mechanism: each `Thread` owns an `ostd::arch::cpu::context::FpuContext` (default MXCSR 0x1F80
+and FCW 0x037F, no explicit initialisation needed). `FPU_OWNER` in `kernel/src/thread.rs` names
+the thread whose state is live in the CPU. `UserModeHooks::pre_user_run` saves the previous owner
+and loads the incoming thread when they differ. OSTD's `save`/`load` hold the `xsave`/`xrstor`
+`unsafe`; the kernel is soft-float, so nothing else touches the registers between swaps.
+
+Evidence (ktests in QEMU under KVM, plus the boot check):
+
+- `fpu_context_default_mxcsr_is_0x1f80`: the default context has the sane MXCSR and FCW.
+- `xmm_survives_yield_between_two_threads`: two ring-3 threads hold different 16-register xmm
+  patterns across 200 yields each and both exit 0.
+- `xmm_swap_disabled_is_detected`: negative control. With the swap off by the ktest-only
+  `FPU_SWAP_DISABLED` switch, the same test reports corruption, so the positive test can fail.
+- `xmm_survives_redirect`: the signal-style redirect handler stub captures xmm0-xmm15 before any
+  Rust code runs and they equal the interrupted pattern (KERN-01).
+- Boot: `aok: fpu preemption check passed`. Two non-yielding spinners with different patterns,
+  interleaved only by the timer (ticks [26, 26] in the recorded run), are redirected and both
+  find their own pattern.
+
+Limits: single CPU (`-smp 1`), so SMP needs a per-CPU owner. SSE only; AVX and x87 are not
+stressed (D-03). The negative control covers the yield path; the timer-preemption check has no
+swap-off counterpart because the BudgetScheduler cannot be injected in a ktest.
