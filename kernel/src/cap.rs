@@ -24,6 +24,13 @@ impl Rights {
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
+    /// The rights named in the low bits of `bits`; undefined bits are dropped.
+    pub const fn from_bits(bits: u64) -> Self {
+        Self((bits & Self::ALL.0 as u64) as u32)
+    }
+    pub const fn bits(self) -> u64 {
+        self.0 as u64
+    }
     const fn mask(self, m: Self) -> Self {
         Self(self.0 & m.0)
     }
@@ -75,6 +82,12 @@ impl Target {
 pub struct Cap {
     target: Target,
     rights: Rights,
+}
+
+impl core::fmt::Debug for Cap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Cap({:?})", self.rights)
+    }
 }
 
 impl Cap {
@@ -163,6 +176,20 @@ impl CSpace {
             .get(slot)
             .and_then(Option::as_ref)
             .ok_or(CapError::NoSlot)
+    }
+
+    /// Installs every capability in `caps` or none: `Full` unless all of them fit. Returns the
+    /// slots in order.
+    pub fn insert_all(&mut self, caps: &[Cap]) -> Result<Vec<usize>, CapError> {
+        if caps.len() > self.room() {
+            return Err(CapError::Full);
+        }
+        caps.iter().map(|c| self.insert(c.clone())).collect()
+    }
+
+    /// Slots a further `insert` can still use.
+    pub fn room(&self) -> usize {
+        self.free.len() + (Self::MAX_SLOTS - self.slots.len())
     }
 
     pub fn remove(&mut self, slot: usize) -> Result<Cap, CapError> {

@@ -14,21 +14,21 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use abi::{IpcArgs, LABEL_CANCEL};
+use abi::{IpcArgs, LABEL_CANCEL, MAX_IPC_CAPS};
 use ostd::{
     mm::VmSpace,
     sync::{SpinLock, WaitQueue},
 };
 
 use crate::{
-    agent::Credential,
-    cap::{CapError, Object, Rights},
+    agent::{Agent, Credential},
+    cap::{Cap, CapError, Object, Rights},
     syscall::{Errno, Handle, UserPtr, UserSlice},
     thread::{BlockError, Thread},
     vm::{copy_from_user, copy_to_user},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Message {
     pub sender: Credential,
     /// The sending thread's id and creation-time tag, stamped by the kernel like `sender`.
@@ -39,6 +39,9 @@ pub struct Message {
     pub data: Vec<u8>,
     /// Chosen by the sender and opaque to the kernel, unlike `sender`.
     pub label: u64,
+    /// Attenuated copies taken from the sender's capability space at send time; the receiver
+    /// installs them in its own.
+    pub caps: Vec<Cap>,
     /// Present on a `call`: the server answers through it.
     pub reply: Option<Arc<ReplyWait>>,
 }
@@ -51,9 +54,17 @@ enum ReplyState {
     /// A server holds it. `server` and its reply handle are known when it was received into a
     /// reply table (`recv_parked`), `None` when a kernel task took the message directly.
     Received(Option<(Weak<Thread>, u64)>),
-    Replied(([u64; 4], Vec<u8>)),
+    Replied(Answer),
     /// The caller has the answer.
     Done,
+}
+
+/// A reply: words, bytes, and the capabilities already installed in the caller's space (slot and
+/// rights).
+pub struct Answer {
+    pub words: [u64; 4],
+    pub data: Vec<u8>,
+    pub caps: Vec<(usize, Rights)>,
 }
 
 /// The rendezvous between a `call`er blocked for its answer and the server that replies.
@@ -79,14 +90,23 @@ impl ReplyWait {
     }
 
     pub fn reply_with(&self, words: [u64; 4], data: Vec<u8>) {
-        if self.caller.strong_count() == 0 {
-            return;
-        }
-        *self.state.lock() = ReplyState::Replied((words, data));
-        self.wq.wake_all();
+        // Nothing to install, so the one failure (no room) cannot happen.
+        let _ = self.deliver(words, data, &[]);
     }
 
-    fn take_answer(&self) -> Option<([u64; 4], Vec<u8>)> {
+    /// `reply_with` plus `caps`, installed in the caller's agent: all of them or none (`NoRoom`,
+    /// nothing delivered, the caller keeps waiting). A caller that no longer exists gets nothing.
+    fn deliver(&self, words: [u64; 4], data: Vec<u8>, caps: &[Cap]) -> Result<(), IpcError> {
+        let Some(caller) = self.caller.upgrade() else {
+            return Ok(());
+        };
+        let caps = install_caps(caller.agent(), caps)?;
+        *self.state.lock() = ReplyState::Replied(Answer { words, data, caps });
+        self.wq.wake_all();
+        Ok(())
+    }
+
+    fn take_answer(&self) -> Option<Answer> {
         let mut s = self.state.lock();
         match core::mem::replace(&mut *s, ReplyState::Done) {
             ReplyState::Replied(a) => Some(a),
@@ -144,10 +164,11 @@ impl ReplyTable {
         Some((generation as u64) << 32 | index as u64)
     }
 
-    fn has(&self, handle: u64) -> bool {
-        let slot = self.slots.get((handle & 0xFFFF_FFFF) as usize);
-        slot.and_then(Option::as_ref)
-            .is_some_and(|(g, _)| *g as u64 == handle >> 32)
+    /// The call named by `handle`, left in place. Unknown and stale handles are `None`.
+    fn peek(&self, handle: u64) -> Option<&Arc<ReplyWait>> {
+        let slot = self.slots.get((handle & 0xFFFF_FFFF) as usize)?;
+        let (g, w) = slot.as_ref()?;
+        (*g as u64 == handle >> 32).then_some(w)
     }
 
     /// Takes the call out: a handle answers once. Unknown and stale handles are `None`.
@@ -170,6 +191,8 @@ pub enum IpcError {
     TimedOut,
     /// A label only the kernel may send.
     Invalid,
+    /// The receiver's capability space cannot hold the capabilities the message carries.
+    NoRoom,
 }
 
 impl From<CapError> for IpcError {
@@ -204,7 +227,7 @@ impl Endpoint {
     }
 
     pub fn send(&self, from: &Thread, words: [u64; 4]) -> Result<(), IpcError> {
-        self.push(from, 0, words, Vec::new(), None)
+        self.push(from, 0, words, Vec::new(), Vec::new(), None)
     }
 
     /// Queues a message and blocks until the server replies. The sender credential is taken
@@ -223,8 +246,22 @@ impl Endpoint {
         words: [u64; 4],
         data: Vec<u8>,
     ) -> Result<([u64; 4], Vec<u8>), IpcError> {
+        let a = self.call_caps(from, label, words, data, Vec::new())?;
+        Ok((a.words, a.data))
+    }
+
+    /// `call_bulk` that also carries `caps` (already derived from the caller's space) and
+    /// returns the reply with the capabilities it installed in the caller's space.
+    pub fn call_caps(
+        &self,
+        from: &Thread,
+        label: u64,
+        words: [u64; 4],
+        data: Vec<u8>,
+        caps: Vec<Cap>,
+    ) -> Result<Answer, IpcError> {
         let reply = ReplyWait::new(from.downgrade());
-        self.push(from, label, words, data, Some(reply.clone()))?;
+        self.push(from, label, words, data, caps, Some(reply.clone()))?;
         match from.block_until(&reply.wq, || reply.take_answer(), None) {
             Ok(answer) => Ok(answer),
             Err(e) => self.abandon(from, &reply, e),
@@ -237,7 +274,7 @@ impl Endpoint {
         from: &Thread,
         reply: &Arc<ReplyWait>,
         why: BlockError,
-    ) -> Result<([u64; 4], Vec<u8>), IpcError> {
+    ) -> Result<Answer, IpcError> {
         // The queue lock orders this against a receive: `Queued` flips to `Received` only while
         // a receiver holds it, so under it the message is either still queued or already taken.
         let mut q = self.queue.lock();
@@ -264,6 +301,7 @@ impl Endpoint {
         label: u64,
         words: [u64; 4],
         data: Vec<u8>,
+        caps: Vec<Cap>,
         reply: Option<Arc<ReplyWait>>,
     ) -> Result<(), IpcError> {
         if label == LABEL_CANCEL {
@@ -280,6 +318,7 @@ impl Endpoint {
             words,
             data,
             label,
+            caps,
             reply,
         });
         drop(q);
@@ -357,7 +396,7 @@ impl Endpoint {
 fn next_cancel(me: &Thread) -> Option<u64> {
     loop {
         let handle = me.cancels.lock().pop_front()?;
-        if me.replies.lock().has(handle) {
+        if me.replies.lock().peek(handle).is_some() {
             return Some(handle);
         }
     }
@@ -371,6 +410,7 @@ fn cancel_message(me: &Thread) -> Message {
         words: [0; 4],
         data: Vec::new(),
         label: LABEL_CANCEL,
+        caps: Vec::new(),
         reply: None,
     }
 }
@@ -403,13 +443,59 @@ pub fn sys_recv(t: &Thread, slot: usize) -> Result<Message, IpcError> {
     endpoint(t, slot, Rights::RECV)?.recv(t)
 }
 
+/// The `(slot, rights mask)` pairs a call or reply names; `read_args` bounded `ncaps`.
+fn arg_caps(a: &IpcArgs) -> Vec<(usize, Rights)> {
+    (0..a.ncaps as usize)
+        .map(|i| (a.caps[i] as usize, Rights::from_bits(a.cap_rights[i])))
+        .collect()
+}
+
+/// Attenuated copies of the capabilities in `t`'s space, taken in the sender's own context. A
+/// missing slot is `NoSlot`, a source without GRANT is `Rights`; nothing is taken then.
+fn derive_caps(t: &Thread, list: &[(usize, Rights)]) -> Result<Vec<Cap>, CapError> {
+    let cs = t.agent().cspace.lock();
+    list.iter().map(|&(s, m)| cs.get(s)?.derive(m)).collect()
+}
+
+/// Installs `caps` in `agent`'s space, all or none (`NoRoom`); returns slot and rights of each.
+fn install_caps(agent: &Agent, caps: &[Cap]) -> Result<Vec<(usize, Rights)>, IpcError> {
+    let slots = agent
+        .cspace
+        .lock()
+        .insert_all(caps)
+        .map_err(|_| IpcError::NoRoom)?;
+    Ok(slots
+        .into_iter()
+        .zip(caps)
+        .map(|(s, c)| (s, c.rights()))
+        .collect())
+}
+
+/// Takes back what `install_caps` put in, when the delivery that followed failed.
+fn uninstall(agent: &Agent, installed: &[(usize, Rights)]) {
+    let mut cs = agent.cspace.lock();
+    for &(slot, _) in installed {
+        let _ = cs.remove(slot);
+    }
+}
+
+/// `caps`, `cap_rights`, `ncaps` as the 9 quads they occupy in `IpcArgs`.
+fn caps_quads(installed: &[(usize, Rights)]) -> [u64; 9] {
+    let mut q = [0u64; 9];
+    for (i, &(s, r)) in installed.iter().enumerate() {
+        q[i] = s as u64;
+        q[4 + i] = r.bits();
+    }
+    q[8] = installed.len() as u64;
+    q
+}
+
 fn read_args(space: &VmSpace, args: UserPtr<IpcArgs>) -> Result<IpcArgs, Errno> {
     let mut raw = [0u8; size_of::<IpcArgs>()];
     let slice = UserSlice::new(args.addr(), raw.len())?;
     copy_from_user(space, &mut raw, slice)?;
     let a = IpcArgs::from_bytes(&raw);
-    // Capability transfer is not implemented yet (01-06), so `ncaps` must be zero.
-    if a.ncaps != 0 {
+    if a.ncaps > MAX_IPC_CAPS as u64 {
         return Err(Errno::EINVAL);
     }
     Ok(a)
@@ -454,6 +540,9 @@ fn write_args(
     copy_to_user(space, t.agent(), dst, bytes)
 }
 
+// `recv_into` writes `caps..=reply` as one block of 12 quads.
+const _: () = assert!(offset_of!(IpcArgs, reply) == offset_of!(IpcArgs, caps) + 11 * 8);
+
 fn quads<const N: usize, const B: usize>(q: [u64; N]) -> [u8; B] {
     core::array::from_fn(|i| q[i / 8].to_le_bytes()[i % 8])
 }
@@ -480,16 +569,22 @@ pub fn sys_call(
         user_slice(a.recv_buf, a.recv_len)?,
     );
     let data = read_bytes(space, send)?;
-    let (words, reply) = ep.call_bulk(t, a.label, a.words, data)?;
-    write_bytes(t, space, recv, &reply)?;
-    write_args(
-        t,
-        space,
-        args,
-        offset_of!(IpcArgs, words),
-        &quads::<4, 32>(words),
-    )?;
-    write_len(t, space, args, reply.len())
+    let caps = derive_caps(t, &arg_caps(&a))?;
+    let r = ep.call_caps(t, a.label, a.words, data, caps)?;
+    let delivered = write_bytes(t, space, recv, &r.data)
+        .and_then(|()| {
+            let at = offset_of!(IpcArgs, words);
+            write_args(t, space, args, at, &quads::<4, 32>(r.words))
+        })
+        .and_then(|()| {
+            let at = offset_of!(IpcArgs, caps);
+            write_args(t, space, args, at, &quads::<9, 72>(caps_quads(&r.caps)))
+        })
+        .and_then(|()| write_len(t, space, args, r.data.len()));
+    if delivered.is_err() {
+        uninstall(t.agent(), &r.caps);
+    }
+    delivered
 }
 
 /// Receives into the `IpcArgs` at `args`: `label`, `words`, `tid`, `tag` and `reply` are written,
@@ -504,13 +599,27 @@ fn recv_into(
     recv: UserSlice,
 ) -> Result<(), Errno> {
     let (m, handle) = ep.recv_parked(t)?;
+    // Install first: if the space has no room the message goes back and the receiver sees EMFILE.
+    let installed = match install_caps(t.agent(), &m.caps) {
+        Ok(i) => i,
+        Err(e) => {
+            ep.unreceive(t, m, handle);
+            return Err(e.into());
+        }
+    };
     let head = quads::<5, 40>([m.label, m.words[0], m.words[1], m.words[2], m.words[3]]);
-    let tail = quads::<3, 24>([m.tid, m.tag, handle]);
+    let mut tail = [0u64; 12];
+    tail[..9].copy_from_slice(&caps_quads(&installed));
+    tail[9..].copy_from_slice(&[m.tid, m.tag, handle]);
     let delivered = write_bytes(t, space, recv, &m.data)
         .and_then(|()| write_args(t, space, args, offset_of!(IpcArgs, label), &head))
-        .and_then(|()| write_args(t, space, args, offset_of!(IpcArgs, tid), &tail))
+        .and_then(|()| {
+            let at = offset_of!(IpcArgs, caps);
+            write_args(t, space, args, at, &quads::<12, 96>(tail))
+        })
         .and_then(|()| write_len(t, space, args, m.data.len()));
     if delivered.is_err() {
+        uninstall(t.agent(), &installed);
         ep.unreceive(t, m, handle);
     }
     delivered
@@ -528,12 +637,21 @@ pub fn sys_recv_args(
     recv_into(t, space, &ep, args, user_slice(a.recv_buf, a.recv_len)?)
 }
 
-/// Answers the call parked under `a.reply` in `t`'s own table with `a.words` and the bytes of
-/// `send_buf`, copied in the server's context. A bad buffer leaves the handle usable.
+/// Answers the call parked under `a.reply` in `t`'s own table with `a.words`, the bytes of
+/// `send_buf` and the capabilities named in `a.caps`, copied and derived in the server's context.
+/// A bad buffer, a bad capability or a full caller space leaves the handle usable.
 fn answer(t: &Thread, space: &VmSpace, a: &IpcArgs) -> Result<(), Errno> {
     let data = read_bytes(space, user_slice(a.send_buf, a.send_len)?)?;
-    let w = t.replies.lock().take(a.reply).ok_or(Errno::EBADF)?;
-    w.reply_with(a.words, data);
+    let caps = derive_caps(t, &arg_caps(a))?;
+    let w = t
+        .replies
+        .lock()
+        .peek(a.reply)
+        .cloned()
+        .ok_or(Errno::EBADF)?;
+    // No room in the caller's space is EMFILE here and the handle stays usable.
+    w.deliver(a.words, data, &caps)?;
+    t.replies.lock().take(a.reply);
     Ok(())
 }
 
@@ -637,7 +755,10 @@ mod test {
             Task::yield_now();
         }
 
-        assert_eq!(result.lock().take(), Some(Err(IpcError::Interrupted)));
+        assert_eq!(
+            result.lock().take().unwrap().err(),
+            Some(IpcError::Interrupted)
+        );
         assert_eq!(server.take_redirect(), Some(0x1234));
         // With the interrupt consumed, the endpoint works again.
         sys_send(&client, 0, [9, 0, 0, 0]).unwrap();
@@ -964,7 +1085,7 @@ mod test {
         // The server hears about it: a Cancel for the same handle, which stays answerable.
         let (c, h) = ep.recv_parked(&server).unwrap();
         assert_eq!((c.label, h, c.words), (LABEL_CANCEL, handle, [0; 4]));
-        assert!(server.replies.lock().has(handle));
+        assert!(server.replies.lock().peek(handle).is_some());
         for _ in 0..50 {
             Task::yield_now();
         }
@@ -1099,5 +1220,220 @@ mod test {
     fn interrupted_read_loses_no_data() {
         reader_run(true);
         reader_run(false);
+    }
+
+    /// What a kernel task does to send `list` (slot, mask) from `t`'s space to `ep`, like
+    /// `SYS_CALL` without a reply.
+    fn send_caps(ep: &Endpoint, t: &Thread, list: &[(usize, Rights)]) -> Result<(), IpcError> {
+        let caps = derive_caps(t, list)?;
+        ep.push(t, 0, [0; 4], Vec::new(), caps, None)
+    }
+
+    /// `join` that fails the test, saying where the child is, instead of hanging it.
+    fn join_soon(e: &crate::user::testkit::ExitSlot, t: &Thread) -> Exit {
+        let end = Jiffies::elapsed().as_u64() + 3000;
+        loop {
+            if let Some(x) = e.lock().take() {
+                return x;
+            }
+            assert!(
+                Jiffies::elapsed().as_u64() < end,
+                "child still running, blocked={}",
+                t.is_blocked()
+            );
+            Task::yield_now();
+        }
+    }
+
+    fn insert_until_full(agent: &Agent, cap: &Cap) {
+        let mut cs = agent.cspace.lock();
+        while cs.insert(cap.clone()).is_ok() {}
+    }
+
+    fn is_endpoint(c: &Cap, e: &Arc<Endpoint>) -> bool {
+        matches!(c.resolve(Rights::NONE), Ok(Object::Endpoint(x)) if Arc::ptr_eq(&x, e))
+    }
+
+    /// A kernel agent holding E1, E2 and E3 (all rights, slots 0 to 2) and a ring-3 child holding
+    /// RECV on E1 and SEND on E2.
+    fn chain_world() -> (Vec<Arc<Endpoint>>, Arc<Thread>, Arc<Thread>) {
+        let eps: Vec<_> = (0..3).map(|_| Endpoint::new()).collect();
+        let kernel = Agent::new_root(42, 64);
+        for e in &eps {
+            kernel
+                .cspace
+                .lock()
+                .insert(Cap::new(Object::Endpoint(e.clone()), Rights::ALL))
+                .unwrap();
+        }
+        let child = kernel
+            .spawn_child(&[(0, Rights::RECV), (1, Rights::SEND)], 32, 1)
+            .unwrap();
+        (eps, Thread::new(kernel), Thread::new(child))
+    }
+
+    #[ktest]
+    fn cap_transfer_attenuates_through_a_chain() {
+        let (eps, a, b) = chain_world();
+        let img = load_image(user_image!("cap_recv")).unwrap();
+        let exit = spawn_image(&b, &img, 0);
+
+        // A hands B an E3 capability with SEND|GRANT; B forwards it to E2 with mask ALL, which
+        // cannot widen it.
+        let sg = Rights::SEND.union(Rights::GRANT);
+        send_caps(&eps[0], &a, &[(2, sg)]).unwrap();
+        // A child that fails early must fail the test, not hang it.
+        while eps[1].queue.lock().is_empty() {
+            if let Some(x) = exit.lock().take() {
+                panic!("child exited before forwarding: {x:?}");
+            }
+            Task::yield_now();
+        }
+        let m = eps[1].recv(&a).unwrap();
+        assert_eq!(m.caps.len(), 1);
+        assert_eq!(m.caps[0].rights(), sg);
+        assert!(is_endpoint(&m.caps[0], &eps[2]));
+        m.reply.unwrap().reply([0; 4]);
+
+        // The second capability has no GRANT: B cannot forward it, and nothing reaches E2.
+        send_caps(&eps[0], &a, &[(2, Rights::SEND)]).unwrap();
+        assert_eq!(join_soon(&exit, &b), Exit::Code(0));
+        assert!(eps[1].queue.lock().is_empty());
+    }
+
+    #[ktest]
+    fn send_caps_checks_slot_and_grant() {
+        let (eps, a, _b) = chain_world();
+        assert_eq!(
+            send_caps(&eps[0], &a, &[(2, Rights::SEND), (99, Rights::SEND)]),
+            Err(IpcError::Cap(CapError::NoSlot))
+        );
+        // A source without GRANT cannot be passed on.
+        let weak = a.agent().cspace.lock().get(2).unwrap().derive(Rights::SEND);
+        let slot = a.agent().cspace.lock().insert(weak.unwrap()).unwrap();
+        assert_eq!(
+            send_caps(&eps[0], &a, &[(slot, Rights::SEND)]),
+            Err(IpcError::Cap(CapError::Rights))
+        );
+        assert!(eps[0].queue.lock().is_empty());
+    }
+
+    #[ktest]
+    fn more_than_64_caps_arrive_by_message() {
+        let (eps, a, b) = chain_world();
+        let img = load_image(user_image!("cap_recv")).unwrap();
+        let exit = spawn_image(&b, &img, 0x100);
+        for _ in 0..25 {
+            while send_caps(&eps[0], &a, &[(2, Rights::SEND); 4]) == Err(IpcError::Full) {
+                Task::yield_now();
+            }
+        }
+        assert_eq!(join(&exit), Exit::Code(0));
+
+        // The child started with two capabilities; every received one has its own slot.
+        let cs = b.agent().cspace.lock();
+        let got: Vec<_> = (0..300).filter_map(|i| cs.get(i).ok()).collect();
+        assert_eq!(got.len(), 102);
+        let sends: Vec<_> = got.iter().filter(|c| is_endpoint(c, &eps[2])).collect();
+        assert_eq!(sends.len(), 100);
+        assert!(sends.iter().all(|c| c.rights() == Rights::SEND));
+    }
+
+    #[ktest]
+    fn cap_install_is_all_or_none() {
+        let ep = Endpoint::new();
+        let (sender, receiver) = (Thread::new(agent_with(&ep)), Thread::new(agent_with(&ep)));
+        let obj = Cap::new(Object::Endpoint(ep.clone()), Rights::SEND);
+        // Leave room for two of the four.
+        {
+            let mut cs = receiver.agent().cspace.lock();
+            while cs.room() > 2 {
+                cs.insert(obj.clone()).unwrap();
+            }
+        }
+        send_caps(&ep, &sender, &[(0, Rights::SEND); 4]).unwrap();
+
+        let elsewhere = VmSpace::new();
+        let args = UserPtr::new(0x1000).unwrap();
+        let none = user_slice(0, 0).unwrap();
+        assert_eq!(
+            recv_into(&receiver, &elsewhere, &ep, args, none),
+            Err(Errno::EMFILE)
+        );
+        assert_eq!(receiver.agent().cspace.lock().room(), 2);
+        assert_eq!(ep.queue.lock().len(), 1);
+
+        // Room for all four, but the write-back fails: the slots are given back, the message
+        // stays.
+        receiver.agent().cspace.lock().remove(1).unwrap();
+        receiver.agent().cspace.lock().remove(2).unwrap();
+        assert_eq!(receiver.agent().cspace.lock().room(), 4);
+        assert!(recv_into(&receiver, &elsewhere, &ep, args, none).is_err());
+        assert_eq!(receiver.agent().cspace.lock().room(), 4);
+        assert_eq!(ep.queue.lock().len(), 1);
+
+        let (m, _) = ep.recv_parked(&receiver).unwrap();
+        let got = install_caps(receiver.agent(), &m.caps).unwrap();
+        assert_eq!(got.len(), 4);
+        assert_eq!(receiver.agent().cspace.lock().room(), 0);
+    }
+
+    #[ktest]
+    fn reply_carries_caps_into_the_callers_space() {
+        let ep = Endpoint::new();
+        let server_agent = agent_with(&ep);
+        let obj = Endpoint::new();
+        server_agent
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Endpoint(obj.clone()), Rights::ALL))
+            .unwrap();
+        let client_agent = server_agent
+            .spawn_child(&[(0, Rights::SEND)], 32, 1)
+            .unwrap();
+        let (s, c) = (Thread::new(server_agent), Thread::new(client_agent));
+        let out: Arc<SpinLock<Option<Result<Answer, IpcError>>>> = Arc::new(SpinLock::new(None));
+        let (ep2, c2, o) = (ep.clone(), c.clone(), out.clone());
+        TaskOptions::new(move || {
+            *o.lock() = Some(ep2.call_caps(&c2, 1, [0; 4], Vec::new(), Vec::new()));
+        })
+        .spawn()
+        .unwrap();
+        wait_blocked(&c);
+
+        let (_, handle) = ep.recv_parked(&s).unwrap();
+        // The caller's space is full: the server gets EMFILE, the handle stays valid and the
+        // caller keeps waiting.
+        let filler = Cap::new(Object::Endpoint(ep.clone()), Rights::SEND);
+        insert_until_full(c.agent(), &filler);
+        let mut a = IpcArgs {
+            reply: handle,
+            ncaps: 2,
+            ..IpcArgs::default()
+        };
+        a.caps[..2].copy_from_slice(&[1, 1]);
+        a.cap_rights[..2].copy_from_slice(&[1, 3]);
+        let nowhere = VmSpace::new();
+        assert_eq!(answer(&s, &nowhere, &a), Err(Errno::EMFILE));
+        assert!(s.replies.lock().peek(handle).is_some());
+        assert!(c.is_blocked());
+        assert!(out.lock().is_none());
+
+        c.agent().cspace.lock().remove(5).unwrap();
+        c.agent().cspace.lock().remove(6).unwrap();
+        assert_eq!(answer(&s, &nowhere, &a), Ok(()));
+        assert_eq!(answer(&s, &nowhere, &a), Err(Errno::EBADF));
+        while out.lock().is_none() {
+            Task::yield_now();
+        }
+        let r = out.lock().take().unwrap().unwrap();
+        assert_eq!(r.caps.len(), 2);
+        let cs = c.agent().cspace.lock();
+        let want = [Rights::SEND, Rights::SEND.union(Rights::RECV)];
+        for ((slot, rights), want) in r.caps.iter().zip(want) {
+            assert_eq!(*rights, want);
+            assert_eq!(cs.get(*slot).unwrap().rights(), want);
+            assert!(is_endpoint(cs.get(*slot).unwrap(), &obj));
+        }
     }
 }
