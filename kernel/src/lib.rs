@@ -29,7 +29,7 @@ use ostd::{
 use crate::{
     agent::{Agent, CPU_PERIOD_TICKS},
     thread::Thread,
-    user::{Exit, prog},
+    user::{Exit, prog, user_image},
 };
 
 #[ostd::main]
@@ -38,10 +38,54 @@ fn kernel_main() {
     TaskOptions::new(cpu_budget_check).spawn().unwrap();
 }
 
+/// Two agents each run a ring-3 image that holds a different 16-register xmm pattern in a bare
+/// spin, never yielding. Only the timer can interleave them, so both threads must be charged
+/// CPU, and each must still find its own pattern when redirected (KERN-01, D-03).
+fn fpu_preemption_check() -> bool {
+    const RUN_TICKS: u64 = 50;
+    let runs = [(Agent::new_root(1, 0), 1u64), (Agent::new_root(2, 0), 2)].map(|(agent, seed)| {
+        let img = user::load_image(user_image!("fpu")).unwrap();
+        let t = Thread::new(agent);
+        let exit: Arc<SpinLock<Option<Exit>>> = Arc::new(SpinLock::new(None));
+        let (t2, i2, e) = (t.clone(), img.clone(), exit.clone());
+        TaskOptions::new(move || *e.lock() = Some(user::start(&t2, &i2, 2 | seed << 8)))
+            .data(t.clone())
+            .spawn()
+            .unwrap();
+        (t, img.handler, exit)
+    });
+
+    let start = Jiffies::elapsed().as_u64();
+    while Jiffies::elapsed().as_u64() < start + RUN_TICKS {
+        Task::yield_now();
+    }
+    let ticks = [0, 1].map(|i| runs[i].0.agent().cpu_used_ticks());
+    for (t, handler, _) in &runs {
+        t.interrupt(*handler);
+    }
+    while runs.iter().any(|(_, _, e)| e.lock().is_none()) {
+        Task::yield_now();
+    }
+    let exits_ok = runs
+        .iter()
+        .all(|(_, _, e)| matches!(*e.lock(), Some(Exit::Code(0))));
+    let ok = exits_ok && ticks.iter().all(|&n| n > 0);
+    println!(
+        "aok: fpu preemption: ticks {:?}, exits ok {}",
+        ticks, exits_ok
+    );
+    println!(
+        "aok: fpu preemption check {}",
+        if ok { "passed" } else { "FAILED" }
+    );
+    ok
+}
+
 /// The CPU-budget check that ktests cannot run, since the scheduler must be injected before
 /// the first task. A root agent and a child holding 2 of its 10 ticks per period each spin in
 /// their own address space, until both are redirected to exit.
 fn cpu_budget_check() {
+    let fpu_ok = fpu_preemption_check();
     const RUN_TICKS: u64 = 300;
     const CHILD_QUOTA: u64 = 2;
     let root = Agent::new_root(1, 0);
@@ -92,7 +136,7 @@ fn cpu_budget_check() {
         "aok: cpu budget check {}",
         if ok { "passed" } else { "FAILED" }
     );
-    poweroff(if ok {
+    poweroff(if ok && fpu_ok {
         ExitCode::Success
     } else {
         ExitCode::Failure

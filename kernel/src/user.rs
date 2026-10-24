@@ -194,7 +194,6 @@ pub fn start(thread: &Thread, img: &Image, arg: u64) -> Exit {
 }
 
 /// The bytes of `userland/out/<name>.bin`, built by `userland/build.sh` before `cargo osdk`.
-#[allow(unused_macros)] // only the ktests embed an image until the servers land
 macro_rules! user_image {
     ($name:literal) => {
         include_bytes!(concat!(
@@ -205,7 +204,6 @@ macro_rules! user_image {
         ))
     };
 }
-#[allow(unused_imports)]
 pub(crate) use user_image;
 
 fn sys_futex(t: &Thread, space: &VmSpace, ctx: &UserContext) -> isize {

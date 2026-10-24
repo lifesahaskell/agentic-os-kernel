@@ -1,9 +1,10 @@
 //! Ring-3 runtime: the syscall stub, process entry and panic handler. The only ring-3 crate
-//! with inline asm, confined to `raw.rs` and `rt.rs` (ledger rows U-01, U-02).
+//! with inline asm, confined to `raw.rs`, `rt.rs` and `fpu.rs` (ledger rows U-01, U-02, U-03).
 
 #![no_std]
 #![deny(unsafe_code)]
 
+pub mod fpu;
 pub mod raw;
 pub mod rt;
 
@@ -11,7 +12,9 @@ use abi::{IpcArgs, SYS_CALL, SYS_EXIT, SYS_SCHED_YIELD};
 
 pub fn exit(code: u64) -> ! {
     raw::syscall6(SYS_EXIT, [code as usize, 0, 0, 0, 0, 0]);
-    loop {}
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 pub fn sched_yield() {
