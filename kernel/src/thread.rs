@@ -4,20 +4,60 @@
 //! pending redirect. The thread applies the redirect itself between `UserMode::execute` calls, so
 //! the register rewrite can never race syscall entry.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use ostd::{
     arch::cpu::context::FpuContext,
     irq::DisabledLocalIrqGuard,
     mm::{Vaddr, VmSpace},
     sync::{LocalIrqDisabled, SpinLock, WaitQueue, Waiter, Waker},
+    timer::{Jiffies, register_callback_on_cpu},
     user::UserModeHooks,
 };
 
 use crate::{agent::Agent, cap::Cap};
 
+/// Why `Thread::block_until` gave up.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Interrupted;
+pub enum BlockError {
+    /// A redirect is pending (`Thread::interrupt`).
+    Interrupted,
+    /// The deadline tick was reached.
+    TimedOut,
+}
+
+/// Waiters with a deadline: (absolute `Jiffies` tick, waker). The timer callback wakes and drops
+/// every entry whose tick has passed; `block_until` drops its own entry on every exit path.
+static DEADLINES: SpinLock<Vec<(u64, Arc<Waker>)>, LocalIrqDisabled> = SpinLock::new(Vec::new());
+static DEADLINE_TIMER: AtomicBool = AtomicBool::new(false);
+
+// shortcut: the callback is registered on the CPU of the first deadline wait only; `-smp 1` makes
+// that the only CPU. SMP needs one registration per CPU.
+fn arm_deadline_timer() {
+    if DEADLINE_TIMER.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    register_callback_on_cpu(|| {
+        let now = Jiffies::elapsed().as_u64();
+        DEADLINES.lock().retain(|(due, w)| {
+            let pending = *due > now;
+            if !pending {
+                w.wake_up();
+            }
+            pending
+        });
+    });
+}
+
+/// Ktest-only hook for forcing a wake-versus-interrupt interleaving inside `block_until`: the
+/// closure runs on the blocking thread when execution reaches the numbered point (1: waker
+/// published; 2: condition false, about to sleep; 3: wait over, waker not yet cleared).
+#[cfg(ktest)]
+pub(crate) type FailHook = Arc<dyn Fn(&Thread) + Send + Sync>;
+#[cfg(ktest)]
+pub(crate) static FAILPOINT: SpinLock<Option<(u8, FailHook)>, LocalIrqDisabled> =
+    SpinLock::new(None);
 
 /// A handler's verdict on a faulted thread. A redirect needs no variant: the handler calls
 /// `Thread::interrupt`, which aborts the wait.
@@ -107,8 +147,8 @@ impl Thread {
     }
 
     /// Blocks until the handler replies; `Interrupted` means the handler redirected the thread.
-    pub fn wait_exception_reply(&self) -> Result<ExcReply, Interrupted> {
-        self.block_on(&self.exc_wq, || self.state.lock().exc_reply.take())
+    pub fn wait_exception_reply(&self) -> Result<ExcReply, BlockError> {
+        self.block_until(&self.exc_wq, || self.state.lock().exc_reply.take(), None)
     }
 
     pub fn space(&self) -> Option<Arc<VmSpace>> {
@@ -136,28 +176,63 @@ impl Thread {
         self.state.lock().redirect.take()
     }
 
-    /// Blocks on `wq` until `cond` yields a value, or fails with `Interrupted` if an interrupt is
-    /// pending or arrives while blocked.
-    pub fn block_on<R>(
+    #[cfg(ktest)]
+    fn failpoint(&self, point: u8) {
+        let hook = match &*FAILPOINT.lock() {
+            Some((p, f)) if *p == point => Some(f.clone()),
+            _ => None,
+        };
+        if let Some(f) = hook {
+            f(self);
+        }
+    }
+
+    #[cfg(not(ktest))]
+    fn failpoint(&self, _: u8) {}
+
+    /// The one blocking primitive. Blocks on `wq` until `cond` yields a value, an interrupt is
+    /// pending or arrives (`Interrupted`), or the absolute `Jiffies` tick `deadline` is reached
+    /// (`TimedOut`). A condition that holds wins over both, including at the moment of giving up:
+    /// OSTD evaluates `cond` before the cancel check and again after it.
+    pub fn block_until<R>(
         &self,
         wq: &WaitQueue,
         mut cond: impl FnMut() -> Option<R>,
-    ) -> Result<R, Interrupted> {
+        deadline: Option<u64>,
+    ) -> Result<R, BlockError> {
         let (waiter, waker) = Waiter::new_pair();
         // Published under the same lock `interrupt` takes, so an interrupt either sees this
         // waker or is seen by the cancel check below.
-        self.state.lock().blocked = Some(waker);
+        self.state.lock().blocked = Some(waker.clone());
+        if let Some(due) = deadline {
+            arm_deadline_timer();
+            DEADLINES.lock().push((due, waker.clone()));
+        }
+        self.failpoint(1);
         let res = waiter.wait_until_or_cancelled(
             || {
                 wq.enqueue(waiter.waker());
-                cond()
+                let r = cond();
+                if r.is_none() {
+                    self.failpoint(2);
+                }
+                r
             },
-            || match self.state.lock().redirect {
-                Some(_) => Err(Interrupted),
-                None => Ok(()),
+            || {
+                if self.state.lock().redirect.is_some() {
+                    Err(BlockError::Interrupted)
+                } else if deadline.is_some_and(|due| Jiffies::elapsed().as_u64() >= due) {
+                    Err(BlockError::TimedOut)
+                } else {
+                    Ok(())
+                }
             },
         );
+        self.failpoint(3);
         self.state.lock().blocked = None;
+        if deadline.is_some() {
+            DEADLINES.lock().retain(|(_, w)| !Arc::ptr_eq(w, &waker));
+        }
         res
     }
 }
@@ -188,9 +263,13 @@ impl UserModeHooks for Thread {
 
 #[cfg(ktest)]
 mod test {
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
-    use ostd::{prelude::*, task::Task};
+    use ostd::{
+        prelude::*,
+        task::{Task, TaskOptions},
+        timer::Jiffies,
+    };
 
     use super::*;
     use crate::{
@@ -254,6 +333,193 @@ mod test {
             exits.iter().any(|e| *e != Exit::Code(0)),
             "without the swap the two threads must corrupt each other: {exits:?}"
         );
+    }
+
+    /// A kernel task blocked in `block_until` on a flag, with the levers a test pulls.
+    struct Rig {
+        t: Arc<Thread>,
+        wq: Arc<WaitQueue>,
+        flag: Arc<AtomicBool>,
+        out: Arc<SpinLock<Option<Result<(), BlockError>>>>,
+    }
+
+    impl Rig {
+        fn spawn(deadline: Option<u64>) -> Self {
+            let t = Thread::new(Agent::new_root(1, 0));
+            let wq = Arc::new(WaitQueue::new());
+            let flag = Arc::new(AtomicBool::new(false));
+            let out = Arc::new(SpinLock::new(None));
+            let (t2, wq2, f2, o2) = (t.clone(), wq.clone(), flag.clone(), out.clone());
+            TaskOptions::new(move || {
+                let r = t2.block_until(&wq2, || f2.load(Ordering::Acquire).then_some(()), deadline);
+                *o2.lock() = Some(r);
+            })
+            .spawn()
+            .unwrap();
+            Self { t, wq, flag, out }
+        }
+
+        fn wake(&self) {
+            self.flag.store(true, Ordering::Release);
+            self.wq.wake_all();
+        }
+
+        fn interrupt(&self) {
+            self.t.interrupt(0x1);
+        }
+
+        /// Applies action 0 (interrupt), 1 (wake) or 2 (both).
+        fn act(&self, action: u8) {
+            if action != 1 {
+                self.interrupt();
+            }
+            if action != 0 {
+                self.wake();
+            }
+        }
+
+        fn result(&self) -> Result<(), BlockError> {
+            loop {
+                if let Some(r) = self.out.lock().take() {
+                    return r;
+                }
+                Task::yield_now();
+            }
+        }
+    }
+
+    /// One forced interleaving. Points 1 and 2 inject `action` from inside `block_until`. At
+    /// point 3 the wait is already over, so `action` is delivered from outside while the thread
+    /// is blocked and the hook injects the opposite event late: a late interrupt must not undo
+    /// a wake, and a late wake must not undo an interrupt.
+    fn run_case(point: u8, action: u8, deadline: u64) -> Result<(), BlockError> {
+        let rig = Rig::spawn(Some(deadline));
+        let target = Arc::as_ptr(&rig.t) as usize;
+        let (wq, flag, t) = (rig.wq.clone(), rig.flag.clone(), rig.t.clone());
+        let late = match action {
+            0 => 1,
+            1 => 0,
+            _ => 3, // nothing
+        };
+        let hook_action = if point == 3 { late } else { action };
+        *FAILPOINT.lock() = Some((
+            point,
+            Arc::new(move |me: &Thread| {
+                if me as *const Thread as usize != target {
+                    return;
+                }
+                if hook_action == 0 || hook_action == 2 {
+                    t.interrupt(0x1);
+                }
+                if hook_action == 1 || hook_action == 2 {
+                    flag.store(true, Ordering::Release);
+                    wq.wake_all();
+                }
+            }),
+        ));
+        if point == 3 {
+            while !rig.t.is_blocked() {
+                Task::yield_now();
+            }
+            rig.act(action);
+        }
+        let r = rig.result();
+        *FAILPOINT.lock() = None;
+        rig.t.take_redirect();
+        r
+    }
+
+    fn expected(action: u8) -> Result<(), BlockError> {
+        // A satisfied condition beats a pending interrupt, so only interrupt-alone is an error.
+        if action == 0 {
+            Err(BlockError::Interrupted)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[ktest]
+    fn block_until_failpoints_resolve_wake_versus_interrupt() {
+        for point in 1..=3 {
+            for action in 0..3 {
+                let deadline = Jiffies::elapsed().as_u64() + 50;
+                assert_eq!(
+                    run_case(point, action, deadline),
+                    expected(action),
+                    "point {point} action {action}"
+                );
+            }
+        }
+    }
+
+    #[ktest]
+    fn block_until_interleavings_1000x() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        // counts[point - 1][action] = (ok, interrupted, timed out)
+        let mut counts = [[(0u32, 0u32, 0u32); 3]; 3];
+        for i in 0..1000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let (point, action) = (1 + (x % 3) as u8, ((x >> 8) % 3) as u8);
+            let deadline = Jiffies::elapsed().as_u64() + 50;
+            let r = run_case(point, action, deadline);
+            let c = &mut counts[point as usize - 1][action as usize];
+            match r {
+                Ok(()) => c.0 += 1,
+                Err(BlockError::Interrupted) => c.1 += 1,
+                Err(BlockError::TimedOut) => c.2 += 1,
+            }
+            assert_eq!(
+                r,
+                expected(action),
+                "iteration {i}: point {point} action {action}"
+            );
+        }
+        let total =
+            |f: fn(&(u32, u32, u32)) -> u32| -> u32 { counts.iter().flatten().map(f).sum() };
+        println!(
+            "block_until 1000x: ok={} interrupted={} timed_out={} {:?}",
+            total(|c| c.0),
+            total(|c| c.1),
+            total(|c| c.2),
+            counts
+        );
+        assert_eq!(total(|c| c.2), 0, "a timeout here is a lost wake");
+    }
+
+    #[ktest]
+    fn block_until_times_out() {
+        let wq = WaitQueue::new();
+        let t = Thread::new(Agent::new_root(1, 0));
+
+        let due = Jiffies::elapsed().as_u64() + 3;
+        assert_eq!(
+            t.block_until(&wq, || None::<()>, Some(due)),
+            Err(BlockError::TimedOut)
+        );
+        assert!(Jiffies::elapsed().as_u64() >= due);
+        assert!(DEADLINES.lock().is_empty(), "the deadline entry is removed");
+
+        // A wake before the deadline returns the value and also removes the entry.
+        let rig = Rig::spawn(Some(Jiffies::elapsed().as_u64() + 50));
+        while !rig.t.is_blocked() {
+            Task::yield_now();
+        }
+        rig.wake();
+        assert_eq!(rig.result(), Ok(()));
+        assert!(DEADLINES.lock().is_empty());
+
+        // Without sleeping: a satisfied condition wins over a pending interrupt; otherwise the
+        // interrupt wins over an unreached deadline.
+        t.interrupt(0x1);
+        let far = Some(Jiffies::elapsed().as_u64() + 50);
+        assert_eq!(t.block_until(&wq, || Some(7), far), Ok(7));
+        assert_eq!(
+            t.block_until(&wq, || None::<()>, far),
+            Err(BlockError::Interrupted)
+        );
+        t.take_redirect();
     }
 
     #[ktest]

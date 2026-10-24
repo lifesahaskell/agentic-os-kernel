@@ -33,6 +33,8 @@ impl Errno {
     pub const EFAULT: Errno = Errno(errno::EFAULT);
     pub const EINVAL: Errno = Errno(errno::EINVAL);
     pub const ENOSYS: Errno = Errno(errno::ENOSYS);
+    pub const EMSGSIZE: Errno = Errno(errno::EMSGSIZE);
+    pub const ETIMEDOUT: Errno = Errno(errno::ETIMEDOUT);
 }
 
 impl From<CapError> for Errno {
@@ -52,6 +54,7 @@ impl From<IpcError> for Errno {
             IpcError::WrongType => Errno::EINVAL,
             IpcError::Full => Errno::EAGAIN,
             IpcError::Interrupted => Errno::EINTR,
+            IpcError::TimedOut => Errno::ETIMEDOUT,
         }
     }
 }
@@ -410,7 +413,7 @@ mod test {
         }
     }
 
-    const KNOWN: [isize; 8] = [
+    const KNOWN: [isize; 10] = [
         errno::EPERM,
         errno::EINTR,
         errno::EBADF,
@@ -419,6 +422,8 @@ mod test {
         errno::EFAULT,
         errno::EINVAL,
         errno::ENOSYS,
+        errno::EMSGSIZE,
+        errno::ETIMEDOUT,
     ];
 
     #[ktest]

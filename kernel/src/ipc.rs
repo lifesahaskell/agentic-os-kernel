@@ -14,7 +14,7 @@ use crate::{
     agent::Credential,
     cap::{CapError, Object, Rights},
     syscall::{Errno, Handle, UserPtr, UserSlice},
-    thread::{Interrupted, Thread},
+    thread::{BlockError, Thread},
     vm::{copy_from_user, copy_to_user},
 };
 
@@ -70,6 +70,7 @@ pub enum IpcError {
     WrongType,
     Full,
     Interrupted,
+    TimedOut,
 }
 
 impl From<CapError> for IpcError {
@@ -78,9 +79,12 @@ impl From<CapError> for IpcError {
     }
 }
 
-impl From<Interrupted> for IpcError {
-    fn from(_: Interrupted) -> Self {
-        IpcError::Interrupted
+impl From<BlockError> for IpcError {
+    fn from(e: BlockError) -> Self {
+        match e {
+            BlockError::Interrupted => IpcError::Interrupted,
+            BlockError::TimedOut => IpcError::TimedOut,
+        }
     }
 }
 
@@ -111,7 +115,7 @@ impl Endpoint {
     pub fn call(&self, from: &Thread, label: u64, words: [u64; 4]) -> Result<[u64; 4], IpcError> {
         let reply = ReplyWait::new();
         self.push(from, label, words, Some(reply.clone()))?;
-        Ok(from.block_on(&reply.wq, || reply.words.lock().take())?)
+        Ok(from.block_until(&reply.wq, || reply.words.lock().take(), None)?)
     }
 
     fn push(
@@ -137,7 +141,7 @@ impl Endpoint {
     }
 
     pub fn recv(&self, me: &Thread) -> Result<Message, IpcError> {
-        Ok(me.block_on(&self.wq, || self.queue.lock().pop_front())?)
+        Ok(me.block_until(&self.wq, || self.queue.lock().pop_front(), None)?)
     }
 }
 

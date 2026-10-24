@@ -20,6 +20,8 @@ pub mod errno {
     pub const EFAULT: isize = 14;
     pub const EINVAL: isize = 22;
     pub const ENOSYS: isize = 38;
+    pub const EMSGSIZE: isize = 90;
+    pub const ETIMEDOUT: isize = 110;
 }
 
 /// The one argument block for multi-value IPC calls. The kernel reads it from the pointer in

@@ -20,7 +20,7 @@ use ostd::{
 use crate::{
     cap::{Object, Rights},
     syscall::{self, Outcome},
-    thread::{ExcReply, Interrupted, Thread},
+    thread::{ExcReply, Thread},
     vm::handle_cow_fault,
 };
 
@@ -262,7 +262,7 @@ fn deliver(thread: &Thread, exc: CpuException, rip: usize) -> Option<Exit> {
         return fatal();
     }
     match thread.wait_exception_reply() {
-        Ok(ExcReply::Resume) | Err(Interrupted) => None,
+        Ok(ExcReply::Resume) | Err(_) => None,
         Ok(ExcReply::Kill) => fatal(),
     }
 }
