@@ -2,14 +2,19 @@
 //! blocked receive can be cancelled by `Thread::interrupt`. A ring-3 server answers a call
 //! through a reply handle the kernel parks in its own thread's `ReplyTable`.
 
-use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+use alloc::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    vec,
+    vec::Vec,
+};
 use core::{
     fmt,
     mem::offset_of,
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use abi::IpcArgs;
+use abi::{IpcArgs, LABEL_CANCEL};
 use ostd::{
     mm::VmSpace,
     sync::{SpinLock, WaitQueue},
@@ -38,28 +43,58 @@ pub struct Message {
     pub reply: Option<Arc<ReplyWait>>,
 }
 
+/// Where a call is. Changes under the endpoint's queue lock (Queued to Received) or the state
+/// lock alone (the rest), so the caller's interrupt sees exactly one of them.
+enum ReplyState {
+    /// In the endpoint queue; no server has it.
+    Queued,
+    /// A server holds it. `server` and its reply handle are known when it was received into a
+    /// reply table (`recv_parked`), `None` when a kernel task took the message directly.
+    Received(Option<(Weak<Thread>, u64)>),
+    Replied(([u64; 4], Vec<u8>)),
+    /// The caller has the answer.
+    Done,
+}
+
 /// The rendezvous between a `call`er blocked for its answer and the server that replies.
 pub struct ReplyWait {
-    answer: SpinLock<Option<([u64; 4], Vec<u8>)>>,
+    state: SpinLock<ReplyState>,
+    caller: Weak<Thread>,
     wq: WaitQueue,
 }
 
 impl ReplyWait {
-    fn new() -> Arc<Self> {
+    fn new(caller: Weak<Thread>) -> Arc<Self> {
         Arc::new(Self {
-            answer: SpinLock::new(None),
+            state: SpinLock::new(ReplyState::Queued),
+            caller,
             wq: WaitQueue::new(),
         })
     }
 
-    /// Hands the answer to the caller and wakes it. A caller that gave up never sees it.
+    /// Hands the answer to the caller and wakes it. An answer for a caller that no longer exists
+    /// is dropped.
     pub fn reply(&self, words: [u64; 4]) {
         self.reply_with(words, Vec::new());
     }
 
     pub fn reply_with(&self, words: [u64; 4], data: Vec<u8>) {
-        *self.answer.lock() = Some((words, data));
+        if self.caller.strong_count() == 0 {
+            return;
+        }
+        *self.state.lock() = ReplyState::Replied((words, data));
         self.wq.wake_all();
+    }
+
+    fn take_answer(&self) -> Option<([u64; 4], Vec<u8>)> {
+        let mut s = self.state.lock();
+        match core::mem::replace(&mut *s, ReplyState::Done) {
+            ReplyState::Replied(a) => Some(a),
+            other => {
+                *s = other;
+                None
+            }
+        }
     }
 }
 
@@ -109,6 +144,12 @@ impl ReplyTable {
         Some((generation as u64) << 32 | index as u64)
     }
 
+    fn has(&self, handle: u64) -> bool {
+        let slot = self.slots.get((handle & 0xFFFF_FFFF) as usize);
+        slot.and_then(Option::as_ref)
+            .is_some_and(|(g, _)| *g as u64 == handle >> 32)
+    }
+
     /// Takes the call out: a handle answers once. Unknown and stale handles are `None`.
     fn take(&mut self, handle: u64) -> Option<Arc<ReplyWait>> {
         let slot = self.slots.get_mut((handle & 0xFFFF_FFFF) as usize)?;
@@ -127,6 +168,8 @@ pub enum IpcError {
     Full,
     Interrupted,
     TimedOut,
+    /// A label only the kernel may send.
+    Invalid,
 }
 
 impl From<CapError> for IpcError {
@@ -165,9 +208,9 @@ impl Endpoint {
     }
 
     /// Queues a message and blocks until the server replies. The sender credential is taken
-    /// from `from`, never from the caller's arguments.
-    // shortcut: an interrupt abandons the message in the queue and the server's late reply goes
-    // nowhere; 01-06 replaces this with Cancel-then-wait.
+    /// from `from`, never from the caller's arguments. An interrupt (Cancel-then-wait) takes a
+    /// call no server has received back out of the queue (`Interrupted`); once a server holds it,
+    /// the server is sent a Cancel and the caller waits, uninterruptibly, for its reply.
     pub fn call(&self, from: &Thread, label: u64, words: [u64; 4]) -> Result<[u64; 4], IpcError> {
         Ok(self.call_bulk(from, label, words, Vec::new())?.0)
     }
@@ -180,9 +223,39 @@ impl Endpoint {
         words: [u64; 4],
         data: Vec<u8>,
     ) -> Result<([u64; 4], Vec<u8>), IpcError> {
-        let reply = ReplyWait::new();
+        let reply = ReplyWait::new(from.downgrade());
         self.push(from, label, words, data, Some(reply.clone()))?;
-        Ok(from.block_until(&reply.wq, || reply.answer.lock().take(), None)?)
+        match from.block_until(&reply.wq, || reply.take_answer(), None) {
+            Ok(answer) => Ok(answer),
+            Err(e) => self.abandon(from, &reply, e),
+        }
+    }
+
+    /// The caller of `reply` was interrupted (or timed out) while waiting.
+    fn abandon(
+        &self,
+        from: &Thread,
+        reply: &Arc<ReplyWait>,
+        why: BlockError,
+    ) -> Result<([u64; 4], Vec<u8>), IpcError> {
+        // The queue lock orders this against a receive: `Queued` flips to `Received` only while
+        // a receiver holds it, so under it the message is either still queued or already taken.
+        let mut q = self.queue.lock();
+        let server = match &*reply.state.lock() {
+            ReplyState::Queued => {
+                q.retain(|m| !m.reply.as_ref().is_some_and(|r| Arc::ptr_eq(r, reply)));
+                return Err(why.into());
+            }
+            ReplyState::Received(server) => server.clone(),
+            ReplyState::Replied(_) | ReplyState::Done => None,
+        };
+        drop(q);
+        if let Some((server, handle)) = server.and_then(|(t, h)| Some((t.upgrade()?, h))) {
+            server.push_cancel(handle);
+        }
+        // shortcut: a server that never answers, or whose thread is gone, strands this caller
+        // (accepted, T-01-26); only the Phase 2 kill path frees it.
+        Ok(from.block_until_committed(&reply.wq, || reply.take_answer()))
     }
 
     fn push(
@@ -193,6 +266,9 @@ impl Endpoint {
         data: Vec<u8>,
         reply: Option<Arc<ReplyWait>>,
     ) -> Result<(), IpcError> {
+        if label == LABEL_CANCEL {
+            return Err(IpcError::Invalid);
+        }
         let mut q = self.queue.lock();
         if q.len() >= Self::QUEUE_LEN {
             return Err(IpcError::Full);
@@ -211,21 +287,42 @@ impl Endpoint {
         Ok(())
     }
 
+    /// For a kernel task as the server: the call's `ReplyWait` stays in the message and no Cancel
+    /// can reach the task.
     pub fn recv(&self, me: &Thread) -> Result<Message, IpcError> {
-        Ok(me.block_until(&self.wq, || self.queue.lock().pop_front(), None)?)
+        Ok(me.block_until(
+            &self.wq,
+            || {
+                let mut q = self.queue.lock();
+                let m = q.pop_front()?;
+                if let Some(w) = &m.reply {
+                    *w.state.lock() = ReplyState::Received(None);
+                }
+                Some(m)
+            },
+            None,
+        )?)
     }
 
     /// Like `recv`, for a server that answers later: a call's `ReplyWait` moves into `me`'s
     /// reply table and the returned handle (0 for a plain `send`) answers it. `Full` when the
-    /// table has no room; the message then stays queued.
+    /// table has no room; the message then stays queued. A pending Cancel comes first, as a
+    /// message labelled `LABEL_CANCEL` whose handle is that of the cancelled call, which stays
+    /// in the table until the server answers it.
     fn recv_parked(&self, me: &Thread) -> Result<(Message, u64), IpcError> {
         me.block_until(
             &self.wq,
             || {
+                if let Some(handle) = next_cancel(me) {
+                    return Some(Ok((cancel_message(me), handle)));
+                }
                 let mut q = self.queue.lock();
                 let handle = match &q.front()?.reply {
                     Some(w) => match me.replies.lock().insert(w.clone()) {
-                        Some(h) => h,
+                        Some(h) => {
+                            *w.state.lock() = ReplyState::Received(Some((me.downgrade(), h)));
+                            h
+                        }
                         None => return Some(Err(IpcError::Full)),
                     },
                     None => 0,
@@ -240,9 +337,41 @@ impl Endpoint {
 
     /// Undoes a `recv_parked` whose delivery to ring 3 failed, so the call is not lost.
     fn unreceive(&self, me: &Thread, mut m: Message, handle: u64) {
+        if m.label == LABEL_CANCEL {
+            me.cancels.lock().push_front(handle);
+            return;
+        }
+        let mut q = self.queue.lock();
         m.reply = me.replies.lock().take(handle);
-        self.queue.lock().push_front(m);
+        if let Some(w) = &m.reply {
+            *w.state.lock() = ReplyState::Queued;
+        }
+        q.push_front(m);
+        drop(q);
         self.wq.wake_one();
+    }
+}
+
+/// The first queued Cancel whose call is still parked in `me`'s table; the others (the server
+/// answered first) are dropped.
+fn next_cancel(me: &Thread) -> Option<u64> {
+    loop {
+        let handle = me.cancels.lock().pop_front()?;
+        if me.replies.lock().has(handle) {
+            return Some(handle);
+        }
+    }
+}
+
+fn cancel_message(me: &Thread) -> Message {
+    Message {
+        sender: me.agent().credential(),
+        tid: 0,
+        tag: 0,
+        words: [0; 4],
+        data: Vec::new(),
+        label: LABEL_CANCEL,
+        reply: None,
     }
 }
 
@@ -434,6 +563,7 @@ mod test {
         mm::{FallibleVmRead, PAGE_SIZE, VmWriter},
         prelude::*,
         task::{Task, TaskOptions},
+        timer::Jiffies,
     };
 
     use super::*;
@@ -770,5 +900,204 @@ mod test {
         );
         assert_eq!(user_slice(0xffff_8000_0000_0000, 8), Err(Errno::EFAULT));
         assert!(user_slice(0x40_0000, abi::MAX_IPC_BYTES as u64).is_ok());
+    }
+
+    type Outcome = Arc<SpinLock<Option<Result<([u64; 4], Vec<u8>), IpcError>>>>;
+
+    /// A kernel task that calls `ep` as `t` with label 7; the result appears in the slot.
+    fn spawn_call_outcome(ep: &Arc<Endpoint>, t: &Arc<Thread>) -> Outcome {
+        let out: Outcome = Arc::new(SpinLock::new(None));
+        let (ep, t, o) = (ep.clone(), t.clone(), out.clone());
+        TaskOptions::new(move || {
+            *o.lock() = Some(ep.call_bulk(&t, 7, [7, 0, 0, 0], Vec::new()));
+        })
+        .spawn()
+        .unwrap();
+        out
+    }
+
+    fn wait_outcome(out: &Outcome) -> Result<([u64; 4], Vec<u8>), IpcError> {
+        loop {
+            if let Some(r) = out.lock().take() {
+                return r;
+            }
+            Task::yield_now();
+        }
+    }
+
+    /// A call that `server` has received (reply handle returned) and whose caller was then
+    /// interrupted at pc 0x1.
+    fn interrupted_call() -> (Arc<Endpoint>, Arc<Thread>, Arc<Thread>, u64, Outcome) {
+        let ep = Endpoint::new();
+        let agent = agent_with(&ep);
+        let (server, caller) = (Thread::new(agent.clone()), Thread::new(agent));
+        let out = spawn_call_outcome(&ep, &caller);
+        let (m, handle) = ep.recv_parked(&server).unwrap();
+        assert_eq!(m.label, 7);
+        wait_blocked(&caller);
+        caller.interrupt(0x1);
+        (ep, server, caller, handle, out)
+    }
+
+    #[ktest]
+    fn queued_call_interrupt_is_not_started() {
+        let ep = Endpoint::new();
+        let agent = agent_with(&ep);
+        let (server, caller) = (Thread::new(agent.clone()), Thread::new(agent));
+        let out = spawn_call_outcome(&ep, &caller);
+        while ep.queue.lock().is_empty() {
+            Task::yield_now();
+        }
+        wait_blocked(&caller);
+        caller.interrupt(0x1);
+        assert_eq!(wait_outcome(&out).err(), Some(IpcError::Interrupted));
+        // The call is gone from the queue, so no server can start it.
+        assert!(ep.queue.lock().is_empty());
+        caller.take_redirect();
+        ep.send(&caller, [3, 0, 0, 0]).unwrap();
+        assert_eq!(ep.recv(&server).unwrap().words[0], 3);
+    }
+
+    #[ktest]
+    fn interrupted_call_waits_for_reply() {
+        let (ep, server, caller, handle, out) = interrupted_call();
+        // The server hears about it: a Cancel for the same handle, which stays answerable.
+        let (c, h) = ep.recv_parked(&server).unwrap();
+        assert_eq!((c.label, h, c.words), (LABEL_CANCEL, handle, [0; 4]));
+        assert!(server.replies.lock().has(handle));
+        for _ in 0..50 {
+            Task::yield_now();
+        }
+        assert!(out.lock().is_none() && caller.is_blocked());
+
+        let w = server.replies.lock().take(handle).unwrap();
+        w.reply_with([5, 0, 0, 0], vec![1, 2]);
+        assert_eq!(wait_outcome(&out), Ok(([5, 0, 0, 0], vec![1, 2])));
+        // The interrupt is still pending for ring 3 and nothing else is queued.
+        assert_eq!(caller.take_redirect(), Some(0x1));
+        assert!(ep.queue.lock().is_empty());
+    }
+
+    #[ktest]
+    fn never_answering_server_keeps_caller_blocked() {
+        let (_ep, server, caller, handle, out) = interrupted_call();
+        // Cancel is a request, not a kill: 30 timer ticks later the caller still waits.
+        let until = Jiffies::elapsed().as_u64() + 30;
+        while Jiffies::elapsed().as_u64() < until {
+            Task::yield_now();
+        }
+        assert!(out.lock().is_none() && caller.is_blocked());
+        server
+            .replies
+            .lock()
+            .take(handle)
+            .unwrap()
+            .reply([1, 2, 3, 4]);
+        assert_eq!(wait_outcome(&out), Ok(([1, 2, 3, 4], Vec::new())));
+    }
+
+    #[ktest]
+    fn blocked_recv_still_aborts_at_once() {
+        let ep = Endpoint::new();
+        let agent = agent_with(&ep);
+        let server = Thread::new(agent);
+        let result: Arc<SpinLock<Option<Result<(Message, u64), IpcError>>>> =
+            Arc::new(SpinLock::new(None));
+        let (t, e, r) = (server.clone(), ep.clone(), result.clone());
+        TaskOptions::new(move || *r.lock() = Some(e.recv_parked(&t)))
+            .spawn()
+            .unwrap();
+        wait_blocked(&server);
+        server.interrupt(0x2);
+        while result.lock().is_none() {
+            Task::yield_now();
+        }
+        assert_eq!(
+            result.lock().take().unwrap().err(),
+            Some(IpcError::Interrupted)
+        );
+    }
+
+    #[ktest]
+    fn reply_to_dead_waiter_is_dropped() {
+        let ep = Endpoint::new();
+        let agent = agent_with(&ep);
+        let (server, caller) = (Thread::new(agent.clone()), Thread::new(agent));
+        let w = ReplyWait::new(caller.downgrade());
+        let handle = server.replies.lock().insert(w.clone()).unwrap();
+        drop(caller);
+        let a = IpcArgs {
+            reply: handle,
+            words: [1, 0, 0, 0],
+            ..IpcArgs::default()
+        };
+        let nowhere = VmSpace::new();
+        assert_eq!(answer(&server, &nowhere, &a), Ok(()));
+        assert!(matches!(*w.state.lock(), ReplyState::Queued));
+        // The slot is free again.
+        assert_eq!(answer(&server, &nowhere, &a), Err(Errno::EBADF));
+    }
+
+    #[ktest]
+    fn only_the_kernel_sends_cancel() {
+        let (_server, client) = pair();
+        let ep = endpoint(&client, 0, Rights::SEND).unwrap();
+        assert_eq!(
+            ep.call(&client, LABEL_CANCEL, [0; 4]).err(),
+            Some(IpcError::Invalid)
+        );
+        assert!(ep.queue.lock().is_empty());
+    }
+
+    /// `reader` streams 64 bytes from a kernel-task server in 8-byte calls and is interrupted
+    /// while it waits for the first answer. `commit`: the server has the call, gets a Cancel and
+    /// answers it, so the chunk arrives despite the interrupt. Otherwise the server has not
+    /// looked yet, the call is taken back and made again. Either way no byte is lost or doubled.
+    fn reader_run(commit: bool) {
+        let ep = Endpoint::new();
+        let server_agent = agent_with(&ep);
+        let client_agent = server_agent
+            .spawn_child(&[(0, Rights::SEND)], 32, 1)
+            .unwrap();
+        let img = load_image(user_image!("reader")).unwrap();
+        let (server, client) = (Thread::new(server_agent), Thread::new(client_agent));
+        let exit = spawn_image(&client, &img, 0);
+        let chunk =
+            |k: usize| -> Vec<u8> { (8 * k..8 * k + 8).map(|i| (i * 7 % 251) as u8).collect() };
+
+        let mut next = 0;
+        if commit {
+            let (_, handle) = ep.recv_parked(&server).unwrap();
+            wait_blocked(&client);
+            client.interrupt(img.handler);
+            let (cancel, h) = ep.recv_parked(&server).unwrap();
+            assert_eq!((cancel.label, h), (LABEL_CANCEL, handle));
+            let w = server.replies.lock().take(handle).unwrap();
+            w.reply_with([0; 4], chunk(0));
+            next = 1;
+        } else {
+            while ep.queue.lock().is_empty() {
+                Task::yield_now();
+            }
+            wait_blocked(&client);
+            client.interrupt(img.handler);
+        }
+        while next < 8 {
+            let (_, handle) = ep.recv_parked(&server).unwrap();
+            let w = server.replies.lock().take(handle).unwrap();
+            w.reply_with([0; 4], chunk(next));
+            next += 1;
+        }
+        // End of stream.
+        let (_, handle) = ep.recv_parked(&server).unwrap();
+        server.replies.lock().take(handle).unwrap().reply([0; 4]);
+        assert_eq!(join(&exit), Exit::Code(0));
+        assert!(ep.queue.lock().is_empty());
+    }
+
+    #[ktest]
+    fn interrupted_read_loses_no_data() {
+        reader_run(true);
+        reader_run(false);
     }
 }

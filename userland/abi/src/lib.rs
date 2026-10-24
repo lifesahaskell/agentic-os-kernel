@@ -119,6 +119,10 @@ impl IpcArgs {
 pub const USER_TOP: usize = 0x0000_8000_0000_0000;
 /// Largest byte count the kernel copies for one syscall buffer.
 pub const MAX_IPC_BYTES: usize = 64 * 1024;
+/// The `label` of the kernel's Cancel message: a caller was interrupted after its call was
+/// received, `reply` is the handle of that call. Only the kernel sends it; a ring-3 `call` with
+/// this label is EINVAL.
+pub const LABEL_CANCEL: u64 = u64::MAX;
 
 /// Flat image: `userland/link.ld` puts five little-endian u64 at `IMAGE_BASE`: magic, entry,
 /// handler, `rx_end`, `mem_end`. Pages below `rx_end` map RX, pages up to `mem_end` map RW and

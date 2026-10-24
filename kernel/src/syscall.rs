@@ -52,7 +52,7 @@ impl From<IpcError> for Errno {
     fn from(e: IpcError) -> Self {
         match e {
             IpcError::Cap(c) => c.into(),
-            IpcError::WrongType => Errno::EINVAL,
+            IpcError::WrongType | IpcError::Invalid => Errno::EINVAL,
             IpcError::Full => Errno::EAGAIN,
             IpcError::Interrupted => Errno::EINTR,
             IpcError::TimedOut => Errno::ETIMEDOUT,
