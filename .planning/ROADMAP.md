@@ -46,6 +46,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 ## Phase Details
 
 ### Phase 1: Userland, syscall ABI and IPC v2
+
 **Goal:** As a server author, I want a Rust ring-3 toolchain, a fuzz-safe syscall ABI and call/reply IPC, so that servers can run and the IPC cost is known.
 **Mode:** mvp
 **Depends on:** Nothing (first phase; builds on the validated B2 kernel)
@@ -56,11 +57,33 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. A fuzz-style ktest feeds malformed syscall numbers, pointers and lengths and gets errno returns, never a kernel panic.
   4. A server parks a request and replies later. Interrupting a blocked `call` sends Cancel and the caller stays blocked until the reply, so an interrupted `read` loses no data. A fail-point ktest forces the wake-versus-interrupt interleaving through the shared `block_until`, and a 1000x loop passes.
   5. A server tells two forked siblings apart by the kernel-stamped `tid` and `tag`. A multi-page cross-space copy matches byte for byte, including the first write into a CoW page after clone. A capability sent in a message cannot exceed its attenuated rights. More than 64 capabilities install and derive. The null-IPC round trip is recorded with N, median and p99.
+
 **Research:** research-phase AND spike. Read the OSTD 0.19.0 source (docs.rs failed for 0.19.0): user-mode FPU/SSE enablement and per-thread save (highest-risk unknown; a musl binary cannot run without it), OSDK initramfs key and `boot_info()` contents, serial RX, custom target flags, LLVM 21 in the image. Spike: frame-level cross-space copy and CoW-break order (inferred, never run), the cancel-then-wait protocol (no tested precedent here), whether `VmSpace::activate` keeps TLB entries.
 **Decisions due:** `libaok` sits on `posix-client`; Linux syscall numbers stop at `libaok` and server protocols are POSIX-operation granular. Per-thread `tid`/`tag` is the process identity, badged endpoints only for server-to-server delegation. Cancel semantics replace the older "interrupt aborts blocked IPC" wording; abort-at-once stays for a blocked `recv`. One custom user target JSON for all user code.
-**Plans:** TBD
+**Plans:** 7 plans
+
+Plans:
+**Wave 1**
+- [ ] 01-01-PLAN.md — Tracer: Rust ring-3 image through the real syscall entry, then ring-3 call/reply to a kernel server (W1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [ ] 01-02-PLAN.md — Unsafe ledger + checker, scripts/check.sh and CI, FPU/SSE spike with route recorded (W2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 01-03-PLAN.md — Typed syscall decode, copy_to_user/copy_from_user with CoW break, syscall fuzz ktest (W3)
+- [ ] 01-04-PLAN.md — Growable CSpace past 64 slots, bounded by MAX_SLOTS (W3, parallel with 01-03)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+- [ ] 01-05-PLAN.md — block_until with fail-points, reply handles and reply_recv, tid/tag stamping, bulk copy (W4)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+- [ ] 01-06-PLAN.md — Cancel-then-wait and capability transfer with attenuation (W5)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+- [ ] 01-07-PLAN.md — Port B2 byte programs to Rust bins, null-IPC measurement, full gate green (W6)
 
 ### Phase 2: Process objects, teardown and timers
+
 **Goal:** As the procmgr author, I want Space and Thread capabilities, full process teardown and timers, so that processes can be created, signalled and destroyed without leaks.
 **Mode:** mvp
 **Depends on:** Phase 1
@@ -71,11 +94,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. A 10,000x fork+exit loop leaves page and capability counts flat, and a dead process's futex waiters are woken.
   4. With every agent blocked the CPU halts instead of spinning. Timed futex waits and `recv` timeouts expire within a stated tolerance, and a timer delivers a message to an endpoint.
   5. A ring-3 `mmap` past the agent's memory budget returns `ENOMEM`. The server CPU-exemption decision is recorded with a per-client request ledger and a documented limit, and the core-value wording in PROJECT.md does not claim kernel-enforced CPU limits cover server-side work.
+
 **Research:** spike required. `thread_create` from a syscall onto an OSTD `Task`, the scheduler protocol (reverse-engineered from source), idle task versus `pick_next`. Add scheduler-protocol ktests and pin OSTD and the toolchain, since each OSTD upgrade is a deliberate task.
 **Decisions due:** Saved-context stack holds FPU state (revisit only if OSTD cannot). Self-memory calls (`mmap`, `brk`, `mprotect`) are cap-less syscalls on the caller's own space, not routed through procmgr. Scope the kernel calls LIBC-04 needs (set-FS-base, thread create for musl start-up, exit-and-unmap) here so Phase 6 does not reopen the kernel; they are verified under LIBC-04.
 **Plans:** TBD
 
 ### Phase 3: Bootstrap, server runtime and vfs
+
 **Goal:** As an agent developer, I want bootstrap, a server runtime and a vfs with per-domain namespaces, so that a name outside my grant resolves to ENOENT.
 **Mode:** mvp
 **Depends on:** Phase 2
@@ -86,11 +111,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Domain A cannot name domain B's files; a name outside the grant gives `ENOENT`. A read-only grant fails with the errno recorded in the vfs ADR. Mode bits are checked against the uid/gid the test client pushes. Offset sharing holds across a simulated `fork`, `dup` and `dup2` through shared open file descriptions.
   4. A pipe reader blocks until data arrives, `O_NONBLOCK` returns `EAGAIN`, a write to a closed read end returns `EPIPE`, and EOF follows the last writer's close, all by deferred reply without stalling vfs. Pipe latency and throughput are recorded when pipes land.
   5. Path-resolution unit tests run on the host without QEMU. Every server audit record carries the kernel-stamped credential, and a client-supplied one is ignored.
+
 **Research:** standard patterns (MINIX VFS, QNX, Redox; the namespace design is in the repo). Uses the OSTD initramfs and serial findings from Phase 1; fallback is `include_bytes!` of a cpio.
 **Decisions due:** Read-only grant errno (`EROFS`, the POSIX errno, versus `EACCES` in option-b section 7) and cross-domain `kill` errno (`ESRCH` versus `EPERM`, used in Phase 5). Needs Corey's sign-off and one ADR amending option-b.
 **Plans:** TBD
 
 ### Phase 4: exec and procmgr
+
 **Goal:** As a POSIX program author, I want fork, exec, posix_spawn and wait, so that process trees run with exactly the authority they started with.
 **Mode:** mvp
 **Depends on:** Phase 2, Phase 3
@@ -101,11 +128,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. The process state machine (zombie, limbo, reparent-to-init, pgrp, session) is a pure library with a host model-based test. Rust ports of the os-test `process` cases for `setpgid`, `setsid`, `getpgid` and `getsid` pass, against an ownership table (procmgr owns pgrp, session and the ctty link; ttyd owns the tty-to-session label) written before the code.
   4. A pipe reader sees EOF when its writer is killed, through kernel-to-procmgr-to-vfs fan-out. Credentials inherit across `fork`, `exec` and `posix_spawn`, and an adversarial exec of a file in a wider namespace gains no capability.
   5. The host harness runs Rust test binaries in QEMU over serial with framed records, a watchdog and a distinct hang outcome. The "layer is wrong" threshold and the predicted fork+exec sum are published from the IPC and `cow_clone` timings before the first fork+exec run. The libc ADR is recorded from the bounded spike (`hello`, `fork`, `read`).
+
 **Research:** standard patterns (MINIX PM, Redox procmgr). The libc spike is a bounded task with go/no-go criteria (fd-table placement, `clone` mapping, `pthread_join` on futex), not a research phase. Watch pitfalls 7, 8, 9, 11, 13, 14.
 **Decisions due:** libc ADR at phase end (musl is the default; the spike confirms). Exec stays kill-and-create-thread with no in-place swap primitive; the failed-exec and mid-swap-signal tests are written against it and re-open the design only if they expose a race. `SPAWN` is part of the procmgr protocol; benchmark both fork+exec and spawn.
 **Plans:** TBD
 
 ### Phase 5: Signals, sessions and tty
+
 **Goal:** As a shell author, I want signals, process groups, a controlling terminal and pty pairs, so that job control behaves as POSIX specifies.
 **Mode:** mvp
 **Depends on:** Phase 4
@@ -116,11 +145,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Restartable and non-restartable calls behave per POSIX when interrupted (`EINTR` versus `SA_RESTART`) for every blocking server call, including `wait`, pipe reads, `ppoll` and blocking lock waits. OFD locks and advisory record locks work and are released on process death.
   4. A cross-domain `kill` returns the errno recorded in the amending ADR and reveals no existence information.
   5. On the serial console, ttyd provides canonical and raw modes, echo and `ISIG`. Ctrl-C reaches only the foreground group, and background reads and writes raise `SIGTTIN` and `SIGTTOU`. A pty master and slave pass data. `ppoll`/`poll` report readiness for fds, pipes and ttys. Rust ports of the os-test `pty` cases pass from the first tty build.
+
 **Research:** deeper research. Multithread signal routing, `SA_RESTART` interplay with Cancel, async-signal-safety of the entry stub, ctty and job-control ownership. Needs the serial RX findings from Phase 1. Watch pitfalls 1, 3, 7, 8, 22.
 **Decisions due:** The EINTR/`SA_RESTART` contract is defined once, before any server implements it. Cross-domain `kill` errno per the Phase 3 sign-off.
 **Plans:** TBD
 
 ### Phase 6: libc, BusyBox, conformance and measurement
+
 **Goal:** As the researcher, I want BusyBox on musl, gated os-test results and Linux-relative timings, so that B3 reports measured adherence and the cost of the layer.
 **Mode:** mvp
 **Depends on:** Phase 4, Phase 5
@@ -131,6 +162,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. os-test at the pinned commit runs in CI with per-suite allowlists that only grow, gated on every outcome including hang and neutral. Kernel-heavy suites (`process`, `signal`, `pty`, `io`) are reported separately from libc-bound ones (`include`, `namespace`, `limits`, `basic`). A musl-on-Linux control row runs the same suites. The Open POSIX Test Suite and musl libc-test run as secondary suites with allowlists.
   4. Fork+exec, `posix_spawn`, signal round trip, pipe throughput and latency, and null `read`/`write` are measured against a Linux guest in the same QEMU/KVM configuration. The write-up in `docs/architecture/` records N, median, p99, commit, QEMU flags and host CPU, with the Phase 4 prediction beside the measurement.
   5. A process without an agent credential scores identically to an agent with a full grant on the same suites. A real BusyBox tool run under a narrowed namespace fails with `ENOENT` outside the grant and works inside it.
+
 **Research:** research-phase for the musl patch (asm syscall entry and `__set_thread_area` against the chosen pin; `clone`, `CLONE_CHILD_CLEARTID` and `set_tid_address` mapping; OPTS build on musl headers). The harness and allowlist mechanism are specified in STACK; read the os-test JSON schema in-phase. KVM on the CI host is assumed, not checked.
 **Decisions due:** Verify whether musl's `posix_spawn` uses `clone(CLONE_VM|CLONE_VFORK)` in the pin and map it to the procmgr `SPAWN`. No os-test target tier is set here (B5 owns it); the allowlist baseline is whatever the first full run produces.
 **Plans:** TBD
