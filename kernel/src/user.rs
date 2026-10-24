@@ -786,6 +786,16 @@ mod test {
         assert_eq!((m.label, m.words[0]), (7, 41));
     }
 
+    #[ktest]
+    fn badsys_gets_errno_from_ring3() {
+        let (_server, client) = handler_pair();
+        let img = load_image(user_image!("badsys")).unwrap();
+        // Every case fails before the endpoint is used, so no server is needed. Exit code 0 means
+        // each hostile syscall came back as the expected errno.
+        let exit = spawn_image(&client, &img, 0);
+        assert_eq!(join(&exit), Exit::Code(0));
+    }
+
     /// A header with the given quads, padded to `IMAGE_HEADER_LEN`.
     fn header(magic: u64, entry: usize, handler: usize, rx_end: usize, mem_end: usize) -> Vec<u8> {
         [

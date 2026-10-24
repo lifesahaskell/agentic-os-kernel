@@ -380,4 +380,150 @@ mod test {
             })
         );
     }
+
+    /// xorshift64: deterministic, so a failing case index reproduces.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// One syscall as `run_ctx` makes it: the value `rax` would hold, or 0 for an exit.
+    fn step(t: &Thread, space: &VmSpace, nr: usize, a: [usize; 6]) -> isize {
+        match decode(nr, a) {
+            Err(e) => -e.0,
+            Ok(call) => match dispatch(t, space, call) {
+                Outcome::Return(v) => v,
+                Outcome::Exit(_) => 0,
+            },
+        }
+    }
+
+    const KNOWN: [isize; 8] = [
+        errno::EPERM,
+        errno::EINTR,
+        errno::EBADF,
+        errno::EAGAIN,
+        errno::ENOMEM,
+        errno::EFAULT,
+        errno::EINVAL,
+        errno::ENOSYS,
+    ];
+
+    #[ktest]
+    fn fuzz_syscalls_never_panic() {
+        use abi::USER_STACK_PAGES;
+        use ostd::mm::PAGE_SIZE;
+
+        use crate::{
+            agent::Agent,
+            cap::{Cap, Object, Rights},
+            ipc::Endpoint,
+            user::{load_image, user_image},
+        };
+
+        const ITERATIONS: usize = 100_000;
+        let stack_base = abi::USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
+        let mapped = stack_base + 0x100;
+
+        let img = load_image(user_image!("tracer")).unwrap();
+        let agent = Agent::new_root(7, 64);
+        let slot = agent
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Endpoint(Endpoint::new()), Rights::SEND))
+            .unwrap();
+        assert_eq!(slot, 0);
+        let t = Thread::new(agent);
+        img.space.activate();
+        t.set_space(img.space.clone());
+        // Pending, so every blocking path returns EINTR instead of hanging the fuzzer.
+        t.interrupt(0x1);
+        let space = &*img.space;
+
+        // Each decode and copy error path once, with its exact errno.
+        let z = [0usize; 6];
+        let targeted: [(usize, [usize; 6], isize); 11] = [
+            (0xFFFF, z, errno::ENOSYS),
+            (SYS_FUTEX, [mapped, 99, 0, 0, 0, 0], errno::ENOSYS),
+            (SYS_FUTEX, [mapped, 0, 0, 1, 0, 0], errno::ENOSYS),
+            (SYS_CALL, [0, KERNEL_HALF, 0, 0, 0, 0], errno::EFAULT),
+            (SYS_CALL, [0, USER_TOP - 100, 0, 0, 0, 0], errno::EFAULT),
+            (SYS_CALL, [0, 0x1000, 0, 0, 0, 0], errno::EFAULT),
+            (SYS_FUTEX, [KERNEL_HALF, 1, 1, 0, 0, 0], errno::EFAULT),
+            (SYS_FUTEX, [mapped + 2, 1, 1, 0, 0, 0], errno::EINVAL),
+            (SYS_CALL, [1 << 40, mapped, 0, 0, 0, 0], errno::EBADF),
+            (SYS_CALL, [5, mapped, 0, 0, 0, 0], errno::EBADF),
+            (SYS_CALL, [0, mapped, 0, 0, 0, 0], errno::EINTR),
+        ];
+        for (i, (nr, a, want)) in targeted.into_iter().enumerate() {
+            assert_eq!(
+                step(&t, space, nr, a),
+                -want,
+                "targeted case {} nr={:#x} a={:x?}",
+                i,
+                nr,
+                a
+            );
+        }
+
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        let numbers = [SYS_EXIT, SYS_SCHED_YIELD, SYS_FUTEX, SYS_CALL];
+        let (mut enosys, mut efault, mut einval, mut ebadf, mut eintr) = (0, 0, 0, 0, 0);
+        for i in 0..ITERATIONS {
+            let nr = match rng.below(6) {
+                0..=3 => numbers[rng.below(4)],
+                4 => rng.below(512),
+                _ => rng.next() as usize,
+            };
+            let mut a = z;
+            for x in &mut a {
+                *x = match rng.below(8) {
+                    0 => 0,
+                    1 => rng.below(4),
+                    2 => rng.next() as usize,
+                    3 | 4 => (mapped + rng.below(0x8000 - 0x200)) & !3,
+                    5 => USER_TOP - rng.below(256),
+                    6 => KERNEL_HALF + rng.below(4096),
+                    _ => 1 << rng.below(64),
+                };
+            }
+            if nr == SYS_FUTEX && rng.below(4) != 0 {
+                a[1] = [0, 1, 3, 4, 99, 128, 129, 131, 132][rng.below(9)];
+            }
+            let v = step(&t, space, nr, a);
+            assert!(
+                v >= 0 || KNOWN.contains(&-v),
+                "case {}: nr={:#x} a={:x?} returned {}",
+                i,
+                nr,
+                a,
+                v
+            );
+            match -v {
+                errno::ENOSYS => enosys += 1,
+                errno::EFAULT => efault += 1,
+                errno::EINVAL => einval += 1,
+                errno::EBADF => ebadf += 1,
+                errno::EINTR => eintr += 1,
+                _ => {}
+            }
+        }
+        t.take_redirect();
+        println!(
+            "aok: fuzz n={} enosys={} efault={} einval={} ebadf={} eintr={}",
+            ITERATIONS, enosys, efault, einval, ebadf, eintr
+        );
+    }
 }
