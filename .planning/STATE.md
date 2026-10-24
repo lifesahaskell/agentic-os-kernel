@@ -1,18 +1,18 @@
 ---
 gsd_state_version: "1.0"
-current_phase: 01
+current_phase: 1
 current_phase_name: Userland, syscall ABI and IPC v2
 status: executing
-stopped_at: context exhaustion at 86% (2026-10-24)
-last_updated: "2026-10-24T16:27:37.841Z"
+stopped_at: Completed 01-01-PLAN.md
+last_updated: "2026-10-24T16:46:54.342Z"
 last_activity: 2026-10-24
-last_activity_desc: Roadmap created (6 phases, 72/72 requirements mapped); SAFE-01 added 2026-10-24 (73/73)
-state_head: 53ec09d194cf56c25132215d2bff49aef382af54
+last_activity_desc: Phase 1 execution resumed (wave continue)
+state_head: 784c501d5cbd28ae254431dc85ad613d52d32c3f
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 7
-  completed_plans: 0
+  completed_plans: 1
   percent: 0
 ---
 
@@ -23,14 +23,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-23)
 
 **Core value:** The protection boundary knows what an agent is: authority is exactly the set of capability handles an agent holds, and the kernel stamps its identity on every message, while unmodified POSIX programs still run.
-**Current focus:** Phase 1 - Userland, syscall ABI and IPC v2
+**Current focus:** Phase 1 — Userland, syscall ABI and IPC v2
 
 ## Current Position
 
-Phase: 01 (Userland, syscall ABI and IPC v2) — READY TO EXECUTE
-Plan: 0 of 0 in current phase
+Phase: 1 (Userland, syscall ABI and IPC v2) — EXECUTING
+Plan: 2 of 7
 Status: Ready to execute
-Last activity: 2026-10-24 - Roadmap created (6 phases, 72/72 requirements mapped); SAFE-01 added 2026-10-24 (73/73)
+Last activity: 2026-10-24 — Phase 1 execution resumed (wave continue)
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -52,6 +52,11 @@ Progress: [░░░░░░░░░░] 0%
 - Trend: -
 
 *Updated after each plan completion*
+**Per-Plan Metrics:**
+
+| Plan | Duration | Tasks | Files |
+|------|----------|-------|-------|
+| Phase 1 P01-01 | 10min | 2 tasks | 22 files |
 
 ## Accumulated Context
 
@@ -63,6 +68,7 @@ Recent decisions affecting current work:
 - [Roadmap]: 6 phases, not the researched 8. Research phases 1+2 and 7+8 merged; Phase 6 is the largest (16) and splits after SHELL-04 if planning finds it too big.
 - [Roadmap]: Phases 1-5 use Rust ring-3 test binaries; the C os-test suites first run in Phase 6.
 - [Roadmap]: Requirement maps to the phase that builds its primary component; later legs are separate requirements.
+- [Phase 1]: 01-01: abi path dependency resolves under OSDK; Message is Clone (not Copy) carrying Arc<ReplyWait>; sys_call rejects buffer/cap fields until later plans
 
 ### Pending Todos
 
@@ -87,6 +93,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-24T16:22:00.682Z
-Stopped at: context exhaustion at 86% (2026-10-24)
-Resume file: .planning/phases/01-userland-syscall-abi-and-ipc-v2/01-CONTEXT.md
+Last session: 2026-10-24T16:46:54.321Z
+Stopped at: Completed 01-01-PLAN.md
+Resume file: None

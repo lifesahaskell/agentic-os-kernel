@@ -60,11 +60,11 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Research:** research-phase AND spike. Read the OSTD 0.19.0 source (docs.rs failed for 0.19.0): user-mode FPU/SSE enablement and per-thread save (highest-risk unknown; a musl binary cannot run without it), OSDK initramfs key and `boot_info()` contents, serial RX, custom target flags, LLVM 21 in the image. Spike: frame-level cross-space copy and CoW-break order (inferred, never run), the cancel-then-wait protocol (no tested precedent here), whether `VmSpace::activate` keeps TLB entries.
 **Decisions due:** `libaok` sits on `posix-client`; Linux syscall numbers stop at `libaok` and server protocols are POSIX-operation granular. Per-thread `tid`/`tag` is the process identity, badged endpoints only for server-to-server delegation. Cancel semantics replace the older "interrupt aborts blocked IPC" wording; abort-at-once stays for a blocked `recv`. One custom user target JSON for all user code.
-**Plans:** 7 plans
+**Plans:** 1/7 plans executed
 
 Plans:
 **Wave 1**
-- [ ] 01-01-PLAN.md — Tracer: Rust ring-3 image through the real syscall entry, then ring-3 call/reply to a kernel server (W1)
+- [x] 01-01-PLAN.md — Tracer: Rust ring-3 image through the real syscall entry, then ring-3 call/reply to a kernel server (W1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 - [ ] 01-02-PLAN.md — Unsafe ledger + checker, scripts/check.sh and CI, FPU/SSE spike with route recorded (W2)
@@ -174,7 +174,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6.
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Userland, syscall ABI and IPC v2 | 0/0 | Not started | - |
+| 1. Userland, syscall ABI and IPC v2 | 1/7 | In Progress | - |
 | 2. Process objects, teardown and timers | 0/0 | Not started | - |
 | 3. Bootstrap, server runtime and vfs | 0/0 | Not started | - |
 | 4. exec and procmgr | 0/0 | Not started | - |

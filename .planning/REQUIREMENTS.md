@@ -16,7 +16,7 @@ recorded measurement. "Test" below names what would show it worked.
 
 - [ ] **KERN-01**: User-mode FPU/SSE state is enabled under OSTD 0.19.0 and saved and restored per thread across context switches and signal delivery. Try a safe OSTD route first, then a contained `unsafe` block (see SAFE-01). Only if neither works, or the fix needs an OSTD patch, B3 stops and the Redox-fork re-score in ADR 0002 is triggered. Test: a ring-3 program keeps an XMM value across a yield and a signal redirect.
 - [ ] **KERN-02**: A ring-3 syscall ABI exists (`syscall.rs`) with a typed decode layer. Test: a fuzz-style ktest feeds malformed numbers, pointers and lengths and gets errno returns, never a kernel panic.
-- [ ] **KERN-03**: User code (servers, tests, bootstrap) builds as Rust `no_std` for a custom `x86_64-aok-user.json` target inside the Docker image and loads from a flat bootstrap image. Test: a Rust ring-3 test crate replaces the hand-assembled B2 test programs.
+- [x] **KERN-03**: User code (servers, tests, bootstrap) builds as Rust `no_std` for a custom `x86_64-aok-user.json` target inside the Docker image and loads from a flat bootstrap image. Test: a Rust ring-3 test crate replaces the hand-assembled B2 test programs.
 - [ ] **KERN-04**: `Object::Space` and `Object::Thread` capability types exist, with `thread_create(space, ctx, tag)` gated by the Space capability. Test: a holder can create and signal a thread in another space; a non-holder cannot.
 - [ ] **KERN-05**: CSpace grows past the 64-slot B2 limit. Test: install and derive more than 64 capabilities.
 - [ ] **KERN-06**: Every kernel write into user memory goes through one `copy_to_user` that breaks CoW and retries. Test: the first `read` into a buffer after `fork` succeeds (written before procmgr exists).
@@ -30,7 +30,7 @@ recorded measurement. "Test" below names what would show it worked.
 
 ### IPC (IPC)
 
-- [ ] **IPC-01**: Synchronous `call` with a kernel-held reply handle, deferred reply, and `reply_recv`. Test: a server parks a request and replies later from another event.
+- [x] **IPC-01**: Synchronous `call` with a kernel-held reply handle, deferred reply, and `reply_recv`. Test: a server parks a request and replies later from another event.
 - [ ] **IPC-02**: Interrupting a blocked `call` sends a Cancel to the server and the caller stays blocked until the server replies, with commit-or-not-started semantics. Replies to dead waiters are dropped by the kernel. Abort-at-once EINTR stays only for a blocked `recv`. Test: an interrupted `read` loses no data.
 - [ ] **IPC-03**: The kernel stamps every message with the sender's `tid` and `tag` (the tag is set at `thread_create`). Test: two forked siblings are distinguishable by a server.
 - [ ] **IPC-04**: Bulk data moves by kernel copy between address spaces with CoW break on the destination. Test: a multi-page `read` and `write` across spaces matches byte for byte.
@@ -181,7 +181,7 @@ Each v1 requirement maps to exactly one phase. Rule: the phase that builds its p
 | KERN-01 | Phase 1 | Pending |
 | SAFE-01 | Phase 1 | Pending |
 | KERN-02 | Phase 1 | Pending |
-| KERN-03 | Phase 1 | Pending |
+| KERN-03 | Phase 1 | Complete |
 | KERN-04 | Phase 2 | Pending |
 | KERN-05 | Phase 1 | Pending |
 | KERN-06 | Phase 1 | Pending |
@@ -191,7 +191,7 @@ Each v1 requirement maps to exactly one phase. Rule: the phase that builds its p
 | KERN-10 | Phase 2 | Pending |
 | KERN-11 | Phase 2 | Pending |
 | KERN-12 | Phase 1 | Pending |
-| IPC-01 | Phase 1 | Pending |
+| IPC-01 | Phase 1 | Complete |
 | IPC-02 | Phase 1 | Pending |
 | IPC-03 | Phase 1 | Pending |
 | IPC-04 | Phase 1 | Pending |
