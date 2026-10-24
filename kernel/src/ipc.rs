@@ -4,16 +4,18 @@
 use alloc::{collections::VecDeque, sync::Arc};
 use core::{fmt, mem::offset_of};
 
-use abi::{IpcArgs, errno};
+use abi::IpcArgs;
 use ostd::{
-    mm::{FallibleVmRead, FallibleVmWrite, Vaddr, VmReader, VmSpace, VmWriter},
+    mm::VmSpace,
     sync::{SpinLock, WaitQueue},
 };
 
 use crate::{
     agent::Credential,
     cap::{CapError, Object, Rights},
+    syscall::{Errno, Handle, UserPtr, UserSlice},
     thread::{Interrupted, Thread},
+    vm::{copy_from_user, copy_to_user},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,76 +169,30 @@ pub fn sys_recv(t: &Thread, slot: usize) -> Result<Message, IpcError> {
     endpoint(t, slot, Rights::RECV)?.recv(t)
 }
 
-fn errno_of(e: &IpcError) -> isize {
-    match e {
-        IpcError::Cap(CapError::NoSlot | CapError::Revoked) => errno::EBADF,
-        IpcError::Cap(CapError::Rights) => errno::EPERM,
-        IpcError::Cap(CapError::Full) | IpcError::WrongType => errno::EINVAL,
-        IpcError::Full => errno::EAGAIN,
-        IpcError::Interrupted => errno::EINTR,
-    }
-}
-
-fn read_args(space: &VmSpace, at: Vaddr) -> Option<IpcArgs> {
-    let mut raw = [0u8; size_of::<IpcArgs>()];
-    let mut r = space.reader(at, raw.len()).ok()?;
-    if r.read_fallible(&mut VmWriter::from(&mut raw[..])).ok()? != raw.len() {
-        return None;
-    }
-    let mut q = raw
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|c| u64::from_le_bytes(*c));
-    let mut next = || q.next().unwrap();
-    Some(IpcArgs {
-        label: next(),
-        words: [next(), next(), next(), next()],
-        send_buf: next(),
-        send_len: next(),
-        recv_buf: next(),
-        recv_len: next(),
-        caps: [next(), next(), next(), next()],
-        cap_rights: [next(), next(), next(), next()],
-        ncaps: next(),
-        tid: next(),
-        tag: next(),
-        reply: next(),
-    })
-}
-
-fn write_words(space: &VmSpace, args: Vaddr, words: [u64; 4]) -> Option<()> {
-    let raw: [u8; 32] = core::array::from_fn(|i| words[i / 8].to_le_bytes()[i % 8]);
-    let mut w = space
-        .writer(args.checked_add(offset_of!(IpcArgs, words))?, raw.len())
-        .ok()?;
-    (w.write_fallible(&mut VmReader::from(&raw[..])).ok()? == raw.len()).then_some(())
-}
-
 /// `SYS_CALL`: sends `IpcArgs` (read from `args` in the caller's active `space`) to the endpoint
-/// in `slot` and writes the reply words back to `IpcArgs.words`. Buffers and capability transfer
+/// in `ep` and writes the reply words back to `IpcArgs.words`. Buffers and capability transfer
 /// are not implemented yet, so those fields must be zero.
-pub fn sys_call(t: &Thread, space: &VmSpace, slot: usize, args: Vaddr) -> isize {
-    let ep = match endpoint(t, slot, Rights::SEND) {
-        Ok(ep) => ep,
-        Err(e) => return -errno_of(&e),
-    };
-    let Some(a) = read_args(space, args) else {
-        return -errno::EFAULT;
-    };
+pub fn sys_call(
+    t: &Thread,
+    space: &VmSpace,
+    ep: Handle,
+    args: UserPtr<IpcArgs>,
+) -> Result<(), Errno> {
+    let ep = endpoint(t, ep.index(), Rights::SEND)?;
+    let mut raw = [0u8; size_of::<IpcArgs>()];
+    let src = UserSlice::new(args.addr(), raw.len())?;
+    copy_from_user(space, &mut raw, src)?;
+    let a = IpcArgs::from_bytes(&raw);
     if [a.send_buf, a.send_len, a.recv_buf, a.recv_len, a.ncaps]
         .iter()
         .any(|&x| x != 0)
     {
-        return -errno::EINVAL;
+        return Err(Errno::EINVAL);
     }
-    match ep.call(t, a.label, a.words) {
-        Ok(words) => match write_words(space, args, words) {
-            Some(()) => 0,
-            None => -errno::EFAULT,
-        },
-        Err(e) => -errno_of(&e),
-    }
+    let words = ep.call(t, a.label, a.words)?;
+    let raw: [u8; 32] = core::array::from_fn(|i| words[i / 8].to_le_bytes()[i % 8]);
+    let dst = UserSlice::new(args.addr() + offset_of!(IpcArgs, words), raw.len())?;
+    copy_to_user(space, t.agent(), dst, &raw)
 }
 
 #[cfg(ktest)]

@@ -4,8 +4,7 @@
 use core::ops::Range;
 
 use abi::{
-    IMAGE_BASE, IMAGE_HEADER_LEN, IMAGE_MAGIC, MAX_IMAGE_SIZE, SYS_CALL, SYS_EXIT, SYS_FUTEX,
-    SYS_SCHED_YIELD, USER_STACK_PAGES, USER_STACK_TOP, errno::ENOSYS,
+    IMAGE_BASE, IMAGE_HEADER_LEN, IMAGE_MAGIC, MAX_IMAGE_SIZE, USER_STACK_PAGES, USER_STACK_TOP,
 };
 use alloc::sync::Arc;
 
@@ -14,23 +13,16 @@ use ostd::{
     mm::{
         CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmIo, VmSpace,
     },
-    task::{Task, disable_preempt},
+    task::disable_preempt,
     user::{ReturnReason, UserMode},
 };
 
 use crate::{
     cap::{Object, Rights},
-    futex, ipc,
+    syscall::{self, Outcome},
     thread::{ExcReply, Interrupted, Thread},
     vm::handle_cow_fault,
 };
-
-const FUTEX_WAIT: usize = 0;
-const FUTEX_WAKE: usize = 1;
-const FUTEX_REQUEUE: usize = 3;
-const FUTEX_CMP_REQUEUE: usize = 4;
-/// Ignored: futexes are keyed by physical address, so private and shared behave the same.
-const FUTEX_PRIVATE_FLAG: usize = 128;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Exit {
@@ -206,29 +198,6 @@ macro_rules! user_image {
 }
 pub(crate) use user_image;
 
-fn sys_futex(t: &Thread, space: &VmSpace, ctx: &UserContext) -> isize {
-    let (uaddr, op, val) = (ctx.rdi(), ctx.rsi() & !FUTEX_PRIVATE_FLAG, ctx.rdx());
-    let (val2, uaddr2, val3) = (ctx.r10(), ctx.r8(), ctx.r9());
-    let n = val as u32 as usize;
-    let r = match op {
-        // shortcut: no timeouts; add one with a timer callback when pthread_cond_timedwait needs it.
-        FUTEX_WAIT if val2 != 0 => return -ENOSYS,
-        FUTEX_WAIT => futex::wait(t, space, uaddr, val as u32).map(|()| 0),
-        FUTEX_WAKE => futex::wake(t, space, uaddr, n),
-        // Return values follow futex(2): REQUEUE reports woken, CMP_REQUEUE woken plus moved.
-        FUTEX_REQUEUE => {
-            futex::requeue(t, space, uaddr, n, uaddr2, val2, None).map(|(woken, _)| woken)
-        }
-        FUTEX_CMP_REQUEUE => futex::requeue(t, space, uaddr, n, uaddr2, val2, Some(val3 as u32))
-            .map(|(woken, moved)| woken + moved),
-        _ => return -ENOSYS,
-    };
-    match r {
-        Ok(n) => n as isize,
-        Err(e) => -e.errno(),
-    }
-}
-
 /// x86 vector of an exception, for the fault message.
 fn vector(exc: &CpuException) -> u64 {
     use CpuException::*;
@@ -312,18 +281,23 @@ fn run_ctx(thread: &Thread, space: &Arc<VmSpace>, ctx: UserContext) -> Exit {
         let reason = um.execute(thread);
         let ctx = um.context_mut();
         match reason {
-            ReturnReason::UserSyscall => match ctx.rax() {
-                SYS_EXIT => return Exit::Code(ctx.rdi()),
-                SYS_SCHED_YIELD => {
-                    Task::yield_now();
-                    ctx.set_rax(0);
+            ReturnReason::UserSyscall => {
+                let a = [
+                    ctx.rdi(),
+                    ctx.rsi(),
+                    ctx.rdx(),
+                    ctx.r10(),
+                    ctx.r8(),
+                    ctx.r9(),
+                ];
+                match syscall::decode(ctx.rax(), a) {
+                    Err(e) => ctx.set_rax(-e.0 as usize),
+                    Ok(call) => match syscall::dispatch(thread, space, call) {
+                        Outcome::Return(v) => ctx.set_rax(v as usize),
+                        Outcome::Exit(code) => return Exit::Code(code as usize),
+                    },
                 }
-                SYS_FUTEX => ctx.set_rax(sys_futex(thread, space, ctx) as usize),
-                SYS_CALL => {
-                    ctx.set_rax(ipc::sys_call(thread, space, ctx.rdi(), ctx.rsi()) as usize)
-                }
-                _ => ctx.set_rax(-ENOSYS as usize),
-            },
+            }
             ReturnReason::UserException => match ctx.take_exception() {
                 Some(exc) => {
                     let cow = match exc {
@@ -420,7 +394,7 @@ mod test {
         },
         prelude::*,
         sync::{LocalIrqDisabled, SpinLock},
-        task::{TaskOptions, disable_preempt},
+        task::{Task, TaskOptions, disable_preempt},
         timer::{Jiffies, register_callback_on_cpu},
     };
 
@@ -428,6 +402,7 @@ mod test {
     use crate::{
         agent::Agent,
         cap::Cap,
+        futex,
         ipc::{Endpoint, Message, sys_recv, sys_set_exception_handler},
         user::testkit::{join, spawn_image, spawn_user, wait_blocked},
         vm::cow_clone,
