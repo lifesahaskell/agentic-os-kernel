@@ -243,4 +243,74 @@ mod test {
         cs.remove(7).unwrap();
         assert_eq!(cs.insert(cap).unwrap(), 7);
     }
+
+    #[ktest]
+    fn cspace_grows_past_64_with_install_and_derive() {
+        let mut cs = CSpace::new();
+        for _ in 0..200 {
+            cs.insert(ep_cap(Rights::ALL)).unwrap();
+        }
+        for slot in 64..200 {
+            let d = cs.get(slot).unwrap().derive(Rights::SEND).unwrap();
+            let ds = cs.insert(d).unwrap();
+            assert!(ds >= 200);
+            let derived = cs.get(ds).unwrap();
+            assert!(derived.resolve(Rights::SEND).is_ok());
+            assert_eq!(derived.resolve(Rights::RECV).err(), Some(CapError::Rights));
+            assert!(cs.get(slot).unwrap().resolve(Rights::SEND).is_ok());
+        }
+    }
+
+    #[ktest]
+    fn cspace_reuses_freed_slots() {
+        let mut cs = CSpace::new();
+        for _ in 0..100 {
+            cs.insert(ep_cap(Rights::SEND)).unwrap();
+        }
+        for slot in 70..80 {
+            cs.remove(slot).unwrap();
+        }
+        let mut got: Vec<usize> = (0..10)
+            .map(|_| cs.insert(ep_cap(Rights::SEND)).unwrap())
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, (70..80).collect::<Vec<_>>());
+        assert_eq!(cs.slots.len(), 100);
+    }
+
+    #[ktest]
+    fn revoke_reaches_copies_above_slot_64() {
+        let root = ep_cap(Rights::ALL);
+        let (granted, fwd) = root.grant_revocable(Rights::ALL).unwrap();
+        let mut cs = CSpace::new();
+        cs.insert(ep_cap(Rights::SEND)).unwrap();
+        for _ in 0..100 {
+            cs.insert(granted.derive(Rights::SEND).unwrap()).unwrap();
+        }
+        fwd.revoke();
+        for slot in 1..=100 {
+            assert_eq!(
+                cs.get(slot).unwrap().resolve(Rights::SEND).err(),
+                Some(CapError::Revoked)
+            );
+        }
+        assert!(cs.get(0).unwrap().resolve(Rights::SEND).is_ok());
+    }
+
+    #[ktest]
+    fn spawn_child_grants_from_slot_above_64() {
+        let parent = Agent::new_root(1000, 10);
+        {
+            let mut cs = parent.cspace.lock();
+            let ep = Object::Endpoint(Endpoint::new());
+            for _ in 0..100 {
+                cs.insert(Cap::new(ep.clone(), Rights::ALL)).unwrap();
+            }
+        }
+        let child = parent.spawn_child(&[(99, Rights::SEND)], 1, 1).unwrap();
+        let cs = child.cspace.lock();
+        let c = cs.get(0).unwrap();
+        assert!(c.resolve(Rights::SEND).is_ok());
+        assert_eq!(c.resolve(Rights::GRANT).err(), Some(CapError::Rights));
+    }
 }
