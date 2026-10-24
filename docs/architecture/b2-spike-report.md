@@ -10,7 +10,7 @@ address-space switch; see [the last section](#what-would-reverse-the-verdict)). 
 built on OSTD 0.19.0's public API in ~640 lines of safe Rust (`#![deny(unsafe_code)]`), with
 no OSTD patches. The two pieces named as the B3 failure signal, a CPU-budget scheduler and the
 per-task address-space switch, were then built the same way: the crate is now ~1000 non-test
-lines, still with no `unsafe` and no patch. All 17 kernel tests and the boot-time budget check
+lines, still with no `unsafe` and no patch. All 26 kernel tests and the boot-time budget check
 pass in QEMU/KVM on x86-64. The Redox-fork fallback is not triggered. The recommendation is to
 continue on OSTD into B3, carrying the friction list below.
 
@@ -28,6 +28,8 @@ Time box: no number was set. The spike took one working session.
 | CPU budget: each agent holds a quota of ticks per 10-tick period, carved from its parent like memory; a round-robin scheduler skips threads whose agent is out until the next period | `agent.rs`, `sched.rs`, `lib.rs` | `inject_scheduler`, `Scheduler`, `LocalRunQueue`, `enable_preemption_on_cpu`, `Task::data` | `out_of_budget_agent_is_skipped_until_the_next_period`, `child_gets_attenuated_subset_and_carved_budget`; boot check in `cargo osdk run` |
 | Per-task address-space switch: the incoming task's `VmSpace` is activated after every context switch | `sched.rs`, `thread.rs` | `inject_post_schedule_handler`, `VmSpace::activate` | `each_task_resumes_in_its_own_address_space` |
 | Lazy CoW address-space clone plus write-fault handler that charges the faulting agent | `vm.rs`, `user.rs` | `VmSpace::cursor_mut`, `CursorMut::{query, protect_next, map, unmap}`, `PageFlags::AVAIL2`, `Frame::reference_count`, `UserContext::take_exception` | `cow_clone_isolates_writes_and_charges_the_writer`, `cow_fault_over_budget_stops_the_thread`, `write_to_read_only_page_is_a_fault_not_cow` |
+| Exceptions as messages: a non-CoW user fault is sent to the thread's handler endpoint as `[vector, address, rip, error code]` with the kernel-stamped credential; the handler resumes, kills or redirects the thread | `user.rs`, `thread.rs`, `ipc.rs` | `UserContext::take_exception`, `Waiter::wait_until_or_cancelled` (via `block_on`) | `fault_message_carries_vector_addr_rip_and_credential`, `pager_maps_the_page_and_resumes`, `kill_reply_makes_the_fault_fatal`, `revoked_or_missing_handler_is_fatal` |
+| Futex wait/wake/requeue/cmp-requeue from ring 3, keyed by physical address, with CoW broken before the key is taken | `futex.rs`, `user.rs` | `HasPaddr`, `VmSpace::cursor` + `query`, `VmIo::read_val` on a frame, `WaitQueue` | `futex_wakes_across_spaces_sharing_a_frame`, `futex_wait_with_stale_value_is_eagain`, `futex_key_survives_cow_break`, `interrupt_aborts_futex_wait`, `requeue_moves_waiters` |
 
 The user-mode tests run real ring-3 code: a 50-byte hand-assembled program, checked with
 `objdump`. The redirect test spins in `jmp .` until a timer callback interrupts the thread. Its
@@ -35,14 +37,23 @@ exit code is the interrupted pc, which only the redirect path can produce.
 
 ## Verified
 
-- `cargo osdk test`: 17/17 pass. `cargo fmt --check` and `cargo osdk clippy` are clean.
+- `cargo osdk test`: 26/26 pass. `cargo fmt --check` and `cargo osdk clippy` are clean.
 - `cargo osdk run` installs the budget scheduler, then runs a root agent (quota 8 of 10 ticks)
   and a child (quota 2), each spinning in ring 3 in its own address space for 300 ticks under
   tick preemption. Measured: over 33 periods, the child used 60-61 ticks (cap 66) and the root
   223-225 (cap 264). Both threads then exit through the redirect with their pc inside their own
   spin loop, and the kernel powers off with exit 0. It exits 1 if a cap is exceeded or either
   exit is wrong.
-- Both new pieces can fail:
+- The exception and futex tests can fail:
+  - With the CoW break removed from the futex key lookup, `futex_key_survives_cow_break` fails
+    (the waker's store copies the page, so its wake finds no waiter).
+  - With the handler capability resolved when it is set instead of when the fault happens,
+    `revoked_or_missing_handler_is_fatal` hangs: the revoked handler still receives the message
+    and nothing replies. It is caught as a hang, not as an assertion.
+  - **Not caught:** removing the "a wake that raced the interrupt wins" re-check in
+    `futex::wait` leaves 26/26 passing. That window is reasoned about, not tested.
+  - Restoring the files restores 26/26.
+- Both B3 entry pieces can fail:
   - With the post-schedule handler replaced by a no-op,
     `each_task_resumes_in_its_own_address_space` fails with `Fault(0x40000f)`: the first thread
     resumed under the second one's page table and faulted fetching the instruction after its
@@ -76,8 +87,15 @@ exit code is the interrupted pc, which only the redirect path can produce.
   are kernel functions, called by the tests directly.
 - **Capability-gated clone.** `cow_clone` takes a `&VmSpace`. An address-space object type in
   `cap::Object` is needed before procmgr can call it on another process's behalf.
-- **Exceptions as messages** (shortcut in `user.rs`) and **futex**. Neither was in B2's scope.
-  Both are mandatory in option B section 2.
+- **Exception messages do not name the faulting thread** (shortcut in `user.rs`).
+  `cap::Object` has no thread type, so the handler replies through an `Arc<Thread>` held by
+  kernel code. procmgr needs an `Object::Thread` capability first. Only x86 vectors 0-21 and
+  28-30 are encoded; FPU and SIMD exceptions are untested, since OSTD may not enable FPU state
+  for user mode.
+- **Futex.** No timeouts (`WAIT` with a timeout returns `ENOSYS`), and no `FUTEX_WAKE_OP` or PI
+  futexes. One global table lock (shortcut in `futex.rs`); SMP wants hashed buckets. A page
+  unmapped between the key lookup and the table lock leaves a waiter on a dead frame, as in
+  Linux.
 - **Teardown.** Budget carved out for a child is never returned to the parent, and caps held by a
   dead agent are not cleaned up (shortcut in `agent.rs`).
 

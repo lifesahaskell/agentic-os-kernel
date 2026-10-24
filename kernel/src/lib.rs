@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod agent;
 pub mod cap;
+pub mod futex;
 pub mod ipc;
 pub mod sched;
 pub mod thread;

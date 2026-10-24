@@ -79,6 +79,18 @@ fn endpoint(t: &Thread, slot: usize, need: Rights) -> Result<Arc<Endpoint>, IpcE
     }
 }
 
+/// Routes this thread's user exceptions to the endpoint in `slot` (needs SEND).
+pub fn sys_set_exception_handler(t: &Thread, slot: usize) -> Result<(), IpcError> {
+    let cap = t.agent().cspace.lock().get(slot)?.clone();
+    match cap.resolve(Rights::SEND)? {
+        Object::Endpoint(_) => {
+            t.set_exception_handler(cap);
+            Ok(())
+        }
+        _ => Err(IpcError::WrongType),
+    }
+}
+
 /// Send through a capability slot in the calling thread's agent.
 pub fn sys_send(t: &Thread, slot: usize, words: [u64; 4]) -> Result<(), IpcError> {
     endpoint(t, slot, Rights::SEND)?.send(t, words)
