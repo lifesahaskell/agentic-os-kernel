@@ -1,6 +1,12 @@
 //! Runs a thread in user mode: syscalls, CoW faults, and redirects applied between `execute`
-//! calls. The spike's syscalls are `exit(code)`, `sched_yield()` and `futex(2)`.
+//! calls. The syscall numbers live in the shared `abi` crate.
 
+use core::ops::Range;
+
+use abi::{
+    IMAGE_BASE, IMAGE_HEADER_LEN, IMAGE_MAGIC, MAX_IMAGE_SIZE, SYS_EXIT, SYS_FUTEX,
+    SYS_SCHED_YIELD, USER_STACK_PAGES, USER_STACK_TOP, errno::ENOSYS,
+};
 use alloc::sync::Arc;
 
 use ostd::{
@@ -18,11 +24,6 @@ use crate::{
     thread::{ExcReply, Interrupted, Thread},
     vm::handle_cow_fault,
 };
-
-const SYS_SCHED_YIELD: usize = 24;
-const SYS_EXIT: usize = 60;
-const SYS_FUTEX: usize = 202;
-const ENOSYS: isize = 38;
 
 const FUTEX_WAIT: usize = 0;
 const FUTEX_WAKE: usize = 1;
@@ -91,6 +92,121 @@ pub fn load(code: Vaddr) -> Arc<VmSpace> {
     }
     Arc::new(space)
 }
+
+/// A loaded flat image: the space holds the mapped image and the user stack.
+#[derive(Clone)]
+pub struct Image {
+    pub space: Arc<VmSpace>,
+    pub entry: Vaddr,
+    pub handler: Vaddr,
+    pub text: Range<Vaddr>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoadError {
+    /// Too short for the header, or the magic is wrong.
+    Header,
+    /// The header's addresses are inconsistent or exceed the limits.
+    Layout,
+}
+
+/// Maps a flat image (see `abi::IMAGE_MAGIC`) into a new space: every page of
+/// `[IMAGE_BASE, mem_end)` with the matching bytes (zero beyond the file), RX below `rx_end` and
+/// RW above, plus `USER_STACK_PAGES` zeroed RW pages ending at `USER_STACK_TOP`. Nothing is
+/// mapped until the header has passed every check.
+pub fn load_image(bytes: &[u8]) -> Result<Image, LoadError> {
+    if bytes.len() < IMAGE_HEADER_LEN {
+        return Err(LoadError::Header);
+    }
+    let quad = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+    if quad(0) != IMAGE_MAGIC {
+        return Err(LoadError::Header);
+    }
+    let [entry, handler, rx_end, mem_end] = [1, 2, 3, 4].map(|i| quad(i) as usize);
+    let text = IMAGE_BASE..rx_end;
+    let layout_ok = IMAGE_BASE < rx_end
+        && rx_end <= mem_end
+        && rx_end % PAGE_SIZE == 0
+        && mem_end - IMAGE_BASE <= MAX_IMAGE_SIZE
+        && bytes.len() <= mem_end - IMAGE_BASE
+        && text.contains(&entry)
+        && text.contains(&handler);
+    // The header values are u64 on a 64-bit target, so the `as usize` casts above are lossless.
+    if !layout_ok {
+        return Err(LoadError::Layout);
+    }
+
+    let space = VmSpace::new();
+    let guard = disable_preempt();
+    let image_end = mem_end.next_multiple_of(PAGE_SIZE);
+    let mut c = space
+        .cursor_mut(&guard, &(IMAGE_BASE..image_end))
+        .map_err(|_| LoadError::Layout)?;
+    for va in (IMAGE_BASE..image_end).step_by(PAGE_SIZE) {
+        let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+        let off = va - IMAGE_BASE;
+        if off < bytes.len() {
+            frame
+                .write_bytes(0, &bytes[off..bytes.len().min(off + PAGE_SIZE)])
+                .unwrap();
+        }
+        let flags = if va < rx_end {
+            PageFlags::RX
+        } else {
+            PageFlags::RW
+        };
+        c.map(
+            frame.into(),
+            PageProperty::new_user(flags, CachePolicy::Writeback),
+        );
+    }
+    drop(c);
+
+    let stack = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE..USER_STACK_TOP;
+    let mut c = space
+        .cursor_mut(&guard, &stack)
+        .map_err(|_| LoadError::Layout)?;
+    for _ in 0..USER_STACK_PAGES {
+        let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+        c.map(
+            frame.into(),
+            PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback),
+        );
+    }
+    drop(c);
+    drop(guard);
+    Ok(Image {
+        space: Arc::new(space),
+        entry,
+        handler,
+        text,
+    })
+}
+
+/// Runs `img` on `thread` from its entry point with `arg` in `rdi` and the stack at the top of
+/// the mapped stack region.
+pub fn start(thread: &Thread, img: &Image, arg: u64) -> Exit {
+    let mut ctx = UserContext::default();
+    ctx.set_rip(img.entry);
+    ctx.set_rsp(USER_STACK_TOP);
+    ctx.set_rdi(arg as usize);
+    run_ctx(thread, &img.space, ctx)
+}
+
+/// The bytes of `userland/out/<name>.bin`, built by `userland/build.sh` before `cargo osdk`.
+#[allow(unused_macros)] // only the ktests embed an image until the servers land
+macro_rules! user_image {
+    ($name:literal) => {
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../userland/out/",
+            $name,
+            ".bin"
+        ))
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use user_image;
 
 fn sys_futex(t: &Thread, space: &VmSpace, ctx: &UserContext) -> isize {
     let (uaddr, op, val) = (ctx.rdi(), ctx.rsi() & !FUTEX_PRIVATE_FLAG, ctx.rdx());
@@ -185,10 +301,14 @@ fn deliver(thread: &Thread, exc: CpuException, rip: usize) -> Option<Exit> {
 }
 
 pub fn run(thread: &Thread, space: &Arc<VmSpace>, entry: Vaddr) -> Exit {
-    thread.set_space(space.clone());
-    space.activate();
     let mut ctx = UserContext::default();
     ctx.set_rip(entry);
+    run_ctx(thread, space, ctx)
+}
+
+fn run_ctx(thread: &Thread, space: &Arc<VmSpace>, ctx: UserContext) -> Exit {
+    thread.set_space(space.clone());
+    space.activate();
     let mut um = UserMode::new(ctx);
     loop {
         let reason = um.execute(thread);
@@ -236,6 +356,59 @@ pub fn run(thread: &Thread, space: &Arc<VmSpace>, entry: Vaddr) -> Exit {
 }
 
 #[cfg(ktest)]
+pub(crate) mod testkit {
+    use ostd::{
+        sync::SpinLock,
+        task::{Task, TaskOptions},
+    };
+
+    use super::*;
+    use crate::sched::install_space_switch;
+
+    pub type ExitSlot = Arc<SpinLock<Option<Exit>>>;
+
+    /// Runs `entry` in `space` on a new task and returns where its exit will appear.
+    pub fn spawn_user(t: &Arc<Thread>, space: &Arc<VmSpace>, entry: Vaddr) -> ExitSlot {
+        install_space_switch();
+        let exit: ExitSlot = Arc::new(SpinLock::new(None));
+        let (t2, space, e) = (t.clone(), space.clone(), exit.clone());
+        TaskOptions::new(move || *e.lock() = Some(run(&t2, &space, entry)))
+            .data(t.clone())
+            .spawn()
+            .unwrap();
+        exit
+    }
+
+    /// Runs `img` with `arg` on a new task, like `spawn_user`.
+    pub fn spawn_image(t: &Arc<Thread>, img: &Image, arg: u64) -> ExitSlot {
+        install_space_switch();
+        let exit: ExitSlot = Arc::new(SpinLock::new(None));
+        let (t2, img, e) = (t.clone(), img.clone(), exit.clone());
+        TaskOptions::new(move || *e.lock() = Some(start(&t2, &img, arg)))
+            .data(t.clone())
+            .spawn()
+            .unwrap();
+        exit
+    }
+
+    pub fn join(e: &ExitSlot) -> Exit {
+        loop {
+            if let Some(x) = e.lock().take() {
+                return x;
+            }
+            Task::yield_now();
+        }
+    }
+
+    /// Returns once `t` is blocked in the kernel, or its run already ended.
+    pub fn wait_blocked(t: &Thread, e: &ExitSlot) {
+        while !t.is_blocked() && e.lock().is_none() {
+            Task::yield_now();
+        }
+    }
+}
+
+#[cfg(ktest)]
 mod test {
     use alloc::{vec, vec::Vec};
 
@@ -255,7 +428,7 @@ mod test {
         agent::Agent,
         cap::Cap,
         ipc::{Endpoint, sys_recv, sys_set_exception_handler},
-        sched::install_space_switch,
+        user::testkit::{join, spawn_image, spawn_user, wait_blocked},
         vm::cow_clone,
     };
 
@@ -411,36 +584,6 @@ mod test {
         let f = FrameAllocOptions::new().alloc_frame().unwrap();
         f.write_bytes(0, &[first]).unwrap();
         f.into()
-    }
-
-    type ExitSlot = Arc<SpinLock<Option<Exit>>>;
-
-    /// Runs `entry` in `space` on a new task and returns where its exit will appear.
-    fn spawn_user(t: &Arc<Thread>, space: &Arc<VmSpace>, entry: Vaddr) -> ExitSlot {
-        install_space_switch();
-        let exit: ExitSlot = Arc::new(SpinLock::new(None));
-        let (t2, space, e) = (t.clone(), space.clone(), exit.clone());
-        TaskOptions::new(move || *e.lock() = Some(run(&t2, &space, entry)))
-            .data(t.clone())
-            .spawn()
-            .unwrap();
-        exit
-    }
-
-    fn join(e: &ExitSlot) -> Exit {
-        loop {
-            if let Some(x) = e.lock().take() {
-                return x;
-            }
-            Task::yield_now();
-        }
-    }
-
-    /// Returns once `t` is blocked in the kernel, or its run already ended.
-    fn wait_blocked(t: &Thread, e: &ExitSlot) {
-        while !t.is_blocked() && e.lock().is_none() {
-            Task::yield_now();
-        }
     }
 
     /// A handler thread holding RECV on an endpoint, and a client thread whose exceptions go
@@ -639,5 +782,94 @@ mod test {
                 Err(futex::FutexError::Fault)
             );
         }
+    }
+
+    #[ktest]
+    fn tracer_runs_rust_ring3_image() {
+        let img = load_image(user_image!("tracer")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 4));
+        assert_eq!(join(&spawn_image(&t, &img, 0)), Exit::Code(0));
+    }
+
+    /// A header with the given quads, padded to `IMAGE_HEADER_LEN`.
+    fn header(magic: u64, entry: usize, handler: usize, rx_end: usize, mem_end: usize) -> Vec<u8> {
+        [
+            magic,
+            entry as u64,
+            handler as u64,
+            rx_end as u64,
+            mem_end as u64,
+        ]
+        .iter()
+        .flat_map(|q| q.to_le_bytes())
+        .collect()
+    }
+
+    #[ktest]
+    fn load_image_rejects_malformed_headers() {
+        use abi::IMAGE_BASE as B;
+        let ok = header(
+            IMAGE_MAGIC,
+            B + 0x30,
+            B + 0x30,
+            B + PAGE_SIZE,
+            B + 2 * PAGE_SIZE,
+        );
+        assert!(load_image(&ok).is_ok(), "the baseline header must load");
+
+        let bad_magic = header(
+            !IMAGE_MAGIC,
+            B + 0x30,
+            B + 0x30,
+            B + PAGE_SIZE,
+            B + 2 * PAGE_SIZE,
+        );
+        assert_eq!(load_image(&bad_magic).err(), Some(LoadError::Header));
+        assert_eq!(load_image(&ok[..39]).err(), Some(LoadError::Header));
+
+        let layouts = [
+            // entry == rx_end is outside [base, rx_end)
+            header(
+                IMAGE_MAGIC,
+                B + PAGE_SIZE,
+                B + 0x30,
+                B + PAGE_SIZE,
+                B + 2 * PAGE_SIZE,
+            ),
+            header(
+                IMAGE_MAGIC,
+                B + 0x30,
+                B - 1,
+                B + PAGE_SIZE,
+                B + 2 * PAGE_SIZE,
+            ),
+            // rx_end beyond mem_end
+            header(
+                IMAGE_MAGIC,
+                B + 0x30,
+                B + 0x30,
+                B + 2 * PAGE_SIZE,
+                B + PAGE_SIZE,
+            ),
+            // rx_end not page aligned: a page would mix RX and RW
+            header(IMAGE_MAGIC, B + 0x30, B + 0x30, B + 0x800, B + PAGE_SIZE),
+            // larger than MAX_IMAGE_SIZE
+            header(
+                IMAGE_MAGIC,
+                B + 0x30,
+                B + 0x30,
+                B + PAGE_SIZE,
+                B + MAX_IMAGE_SIZE + PAGE_SIZE,
+            ),
+            header(IMAGE_MAGIC, 0, 0, 0, 0),
+            header(IMAGE_MAGIC, usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        ];
+        for h in layouts {
+            assert_eq!(load_image(&h).err(), Some(LoadError::Layout), "{h:x?}");
+        }
+        // The file may not be longer than the image it declares.
+        let mut long = ok.clone();
+        long.resize(2 * PAGE_SIZE + 1, 0);
+        assert_eq!(load_image(&long).err(), Some(LoadError::Layout));
     }
 }

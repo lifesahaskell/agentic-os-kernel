@@ -1,0 +1,8 @@
+[package]
+name = "aok-tests"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aok-abi = { path = "../abi" }
+libsys = { path = "../libsys" }

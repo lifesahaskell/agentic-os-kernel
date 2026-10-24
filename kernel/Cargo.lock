@@ -23,8 +23,13 @@ checksum = "c1c330e503236d0b06386ae6cc42a513ef1ccc23c52b603c1b52f018564faf44"
 name = "aok"
 version = "0.1.0"
 dependencies = [
+ "aok-abi",
  "ostd",
 ]
+
+[[package]]
+name = "aok-abi"
+version = "0.1.0"
 
 [[package]]
 name = "autocfg"

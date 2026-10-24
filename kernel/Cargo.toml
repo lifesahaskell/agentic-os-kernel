@@ -3,6 +3,9 @@ name = "aok"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies]
+abi = { package = "aok-abi", path = "../userland/abi" }
+
 [dependencies.ostd]
 version = "0.19.0"
 
