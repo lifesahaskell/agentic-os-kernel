@@ -1,0 +1,12 @@
+[workspace]
+members = ["abi", "libsys", "tests"]
+resolver = "3"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+debug = false
+
+[profile.dev]
+panic = "abort"

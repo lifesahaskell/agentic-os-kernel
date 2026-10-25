@@ -1,3 +1,5 @@
 raw/
 .obsidian/
 __pycache__/
+userland/target/
+userland/out/

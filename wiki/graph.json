@@ -29,8 +29,20 @@
    "group": "concepts"
   },
   {
+   "id": "agent-collaboration-patterns",
+   "group": "concepts"
+  },
+  {
+   "id": "agent-recursion-os-implications",
+   "group": "concepts"
+  },
+  {
    "id": "agent-scheduler",
    "group": "concepts"
+  },
+  {
+   "id": "aide2",
+   "group": "sources"
   },
   {
    "id": "aios",
@@ -62,6 +74,10 @@
   },
   {
    "id": "authentication",
+   "group": "concepts"
+  },
+  {
+   "id": "bandit-search-policy-with-forking",
    "group": "concepts"
   },
   {
@@ -165,12 +181,48 @@
    "group": "concepts"
   },
   {
+   "id": "harness-robustness-mechanisms",
+   "group": "concepts"
+  },
+  {
    "id": "idempotency",
    "group": "concepts"
   },
   {
    "id": "index",
    "group": "wiki"
+  },
+  {
+   "id": "index-agent-research",
+   "group": "indexes"
+  },
+  {
+   "id": "index-aios",
+   "group": "indexes"
+  },
+  {
+   "id": "index-concurrency",
+   "group": "indexes"
+  },
+  {
+   "id": "index-distribution",
+   "group": "indexes"
+  },
+  {
+   "id": "index-persistence",
+   "group": "indexes"
+  },
+  {
+   "id": "index-security",
+   "group": "indexes"
+  },
+  {
+   "id": "index-virtualization",
+   "group": "indexes"
+  },
+  {
+   "id": "inner-outer-loop-training",
+   "group": "concepts"
   },
   {
    "id": "inode",
@@ -186,6 +238,10 @@
   },
   {
    "id": "journaling",
+   "group": "concepts"
+  },
+  {
+   "id": "latent-vs-text-agent-communication",
    "group": "concepts"
   },
   {
@@ -269,6 +325,10 @@
    "group": "concepts"
   },
   {
+   "id": "private-held-out-grading",
+   "group": "concepts"
+  },
+  {
    "id": "process",
    "group": "concepts"
   },
@@ -298,6 +358,30 @@
   },
   {
    "id": "reader-writer-lock",
+   "group": "concepts"
+  },
+  {
+   "id": "recursion-depth-scaling",
+   "group": "concepts"
+  },
+  {
+   "id": "recursive-multi-agent-system",
+   "group": "concepts"
+  },
+  {
+   "id": "recursive-self-improvement-loop",
+   "group": "concepts"
+  },
+  {
+   "id": "recursivelink",
+   "group": "concepts"
+  },
+  {
+   "id": "recursivemas",
+   "group": "sources"
+  },
+  {
+   "id": "reward-hacking-measurement",
    "group": "concepts"
   },
   {
@@ -503,6 +587,106 @@
    "target": "scheduling"
   },
   {
+   "source": "agent-collaboration-patterns",
+   "target": "access-control"
+  },
+  {
+   "source": "agent-collaboration-patterns",
+   "target": "agent-as-process"
+  },
+  {
+   "source": "agent-collaboration-patterns",
+   "target": "agent-scheduler"
+  },
+  {
+   "source": "agent-collaboration-patterns",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "agent-collaboration-patterns",
+   "target": "tool-manager"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "access-control"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "access-manager"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "agent-as-process"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "agent-collaboration-patterns"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "aios-ostep-mapping"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "capabilities"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "context-window-management"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "mechanism-vs-policy"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "principle-of-least-privilege"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "recursion-depth-scaling"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "recursivelink"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "reward-hacking-measurement"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "scheduling"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "trusted-computing-base"
+  },
+  {
    "source": "agent-scheduler",
    "target": "agent-as-process"
   },
@@ -521,6 +705,34 @@
   {
    "source": "agent-scheduler",
    "target": "scheduling"
+  },
+  {
+   "source": "aide2",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "aide2",
+   "target": "bandit-search-policy-with-forking"
+  },
+  {
+   "source": "aide2",
+   "target": "context-window-management"
+  },
+  {
+   "source": "aide2",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "aide2",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "aide2",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "aide2",
+   "target": "reward-hacking-measurement"
   },
   {
    "source": "aios",
@@ -613,6 +825,10 @@
   {
    "source": "aios-ostep-mapping",
    "target": "agent-as-process"
+  },
+  {
+   "source": "aios-ostep-mapping",
+   "target": "agent-recursion-os-implications"
   },
   {
    "source": "aios-ostep-mapping",
@@ -819,6 +1035,26 @@
    "target": "password-storage"
   },
   {
+   "source": "bandit-search-policy-with-forking",
+   "target": "agent-scheduler"
+  },
+  {
+   "source": "bandit-search-policy-with-forking",
+   "target": "mechanism-vs-policy"
+  },
+  {
+   "source": "bandit-search-policy-with-forking",
+   "target": "mlfq"
+  },
+  {
+   "source": "bandit-search-policy-with-forking",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "bandit-search-policy-with-forking",
+   "target": "scheduling"
+  },
+  {
    "source": "cache-consistency",
    "target": "afs"
   },
@@ -908,11 +1144,27 @@
   },
   {
    "source": "context-window-management",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "context-window-management",
+   "target": "memory-manager"
+  },
+  {
+   "source": "context-window-management",
    "target": "paging"
   },
   {
    "source": "context-window-management",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "context-window-management",
    "target": "swapping"
+  },
+  {
+   "source": "context-window-management",
+   "target": "working-set-and-thrashing"
   },
   {
    "source": "copy-on-write",
@@ -1183,6 +1435,30 @@
    "target": "raid"
   },
   {
+   "source": "harness-robustness-mechanisms",
+   "target": "isolation-and-protection"
+  },
+  {
+   "source": "harness-robustness-mechanisms",
+   "target": "principle-of-least-privilege"
+  },
+  {
+   "source": "harness-robustness-mechanisms",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "harness-robustness-mechanisms",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "harness-robustness-mechanisms",
+   "target": "reward-hacking-measurement"
+  },
+  {
+   "source": "harness-robustness-mechanisms",
+   "target": "trusted-computing-base"
+  },
+  {
    "source": "idempotency",
    "target": "distributed-systems-communication"
   },
@@ -1200,31 +1476,11 @@
   },
   {
    "source": "index",
-   "target": "access-control-lists"
+   "target": "agent-recursion-os-implications"
   },
   {
    "source": "index",
-   "target": "access-manager"
-  },
-  {
-   "source": "index",
-   "target": "address-space"
-  },
-  {
-   "source": "index",
-   "target": "address-translation"
-  },
-  {
-   "source": "index",
-   "target": "afs"
-  },
-  {
-   "source": "index",
-   "target": "agent-as-process"
-  },
-  {
-   "source": "index",
-   "target": "agent-scheduler"
+   "target": "aide2"
   },
   {
    "source": "index",
@@ -1232,35 +1488,7 @@
   },
   {
    "source": "index",
-   "target": "aios-architecture"
-  },
-  {
-   "source": "index",
    "target": "aios-ostep-mapping"
-  },
-  {
-   "source": "index",
-   "target": "aios-sdk"
-  },
-  {
-   "source": "index",
-   "target": "atomic-instructions"
-  },
-  {
-   "source": "index",
-   "target": "atomic-rename"
-  },
-  {
-   "source": "index",
-   "target": "atomicity-and-ordering-violations"
-  },
-  {
-   "source": "index",
-   "target": "authentication"
-  },
-  {
-   "source": "index",
-   "target": "cache-consistency"
   },
   {
    "source": "index",
@@ -1268,171 +1496,31 @@
   },
   {
    "source": "index",
-   "target": "condition-variable"
+   "target": "index-agent-research"
   },
   {
    "source": "index",
-   "target": "context-manager"
+   "target": "index-aios"
   },
   {
    "source": "index",
-   "target": "context-snapshot-restore"
+   "target": "index-concurrency"
   },
   {
    "source": "index",
-   "target": "context-switch"
+   "target": "index-distribution"
   },
   {
    "source": "index",
-   "target": "context-window-management"
+   "target": "index-persistence"
   },
   {
    "source": "index",
-   "target": "copy-on-write"
+   "target": "index-security"
   },
   {
    "source": "index",
-   "target": "crash-consistency"
-  },
-  {
-   "source": "index",
-   "target": "cryptography"
-  },
-  {
-   "source": "index",
-   "target": "data-integrity"
-  },
-  {
-   "source": "index",
-   "target": "deadlock"
-  },
-  {
-   "source": "index",
-   "target": "demand-paging"
-  },
-  {
-   "source": "index",
-   "target": "dining-philosophers"
-  },
-  {
-   "source": "index",
-   "target": "distributed-security"
-  },
-  {
-   "source": "index",
-   "target": "distributed-systems-communication"
-  },
-  {
-   "source": "index",
-   "target": "evaluation-aios"
-  },
-  {
-   "source": "index",
-   "target": "event-based-concurrency"
-  },
-  {
-   "source": "index",
-   "target": "fast-file-system"
-  },
-  {
-   "source": "index",
-   "target": "file-and-directory-api"
-  },
-  {
-   "source": "index",
-   "target": "file-descriptor"
-  },
-  {
-   "source": "index",
-   "target": "file-system-implementation"
-  },
-  {
-   "source": "index",
-   "target": "flash-ssd"
-  },
-  {
-   "source": "index",
-   "target": "fsync-and-durability"
-  },
-  {
-   "source": "index",
-   "target": "hard-disk"
-  },
-  {
-   "source": "index",
-   "target": "idempotency"
-  },
-  {
-   "source": "index",
-   "target": "inode"
-  },
-  {
-   "source": "index",
-   "target": "io-devices-and-drivers"
-  },
-  {
-   "source": "index",
-   "target": "isolation-and-protection"
-  },
-  {
-   "source": "index",
-   "target": "journaling"
-  },
-  {
-   "source": "index",
-   "target": "limited-direct-execution"
-  },
-  {
-   "source": "index",
-   "target": "linux-virtual-memory"
-  },
-  {
-   "source": "index",
-   "target": "llm-system-calls"
-  },
-  {
-   "source": "index",
-   "target": "lock"
-  },
-  {
-   "source": "index",
-   "target": "lock-based-data-structures"
-  },
-  {
-   "source": "index",
-   "target": "lock-free-synchronization"
-  },
-  {
-   "source": "index",
-   "target": "log-structured-file-system"
-  },
-  {
-   "source": "index",
-   "target": "mechanism-vs-policy"
-  },
-  {
-   "source": "index",
-   "target": "memory-api"
-  },
-  {
-   "source": "index",
-   "target": "memory-manager"
-  },
-  {
-   "source": "index",
-   "target": "mlfq"
-  },
-  {
-   "source": "index",
-   "target": "multi-level-page-table"
-  },
-  {
-   "source": "index",
-   "target": "multiprocessor-scheduling"
-  },
-  {
-   "source": "index",
-   "target": "nfs"
+   "target": "index-virtualization"
   },
   {
    "source": "index",
@@ -1440,127 +1528,463 @@
   },
   {
    "source": "index",
-   "target": "page-replacement-policy"
+   "target": "recursive-multi-agent-system"
   },
   {
    "source": "index",
-   "target": "paging"
+   "target": "recursive-self-improvement-loop"
   },
   {
    "source": "index",
-   "target": "password-storage"
+   "target": "recursivemas"
   },
   {
    "source": "index",
-   "target": "principle-of-least-privilege"
+   "target": "trusted-computing-base"
   },
   {
-   "source": "index",
-   "target": "process"
+   "source": "index-agent-research",
+   "target": "agent-collaboration-patterns"
   },
   {
-   "source": "index",
-   "target": "process-api"
+   "source": "index-agent-research",
+   "target": "bandit-search-policy-with-forking"
   },
   {
-   "source": "index",
-   "target": "proportional-share-scheduling"
+   "source": "index-agent-research",
+   "target": "harness-robustness-mechanisms"
   },
   {
-   "source": "index",
+   "source": "index-agent-research",
+   "target": "index"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "recursion-depth-scaling"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "recursivelink"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "reward-hacking-measurement"
+  },
+  {
+   "source": "index-aios",
+   "target": "access-manager"
+  },
+  {
+   "source": "index-aios",
+   "target": "agent-as-process"
+  },
+  {
+   "source": "index-aios",
+   "target": "agent-scheduler"
+  },
+  {
+   "source": "index-aios",
+   "target": "aios-architecture"
+  },
+  {
+   "source": "index-aios",
+   "target": "aios-sdk"
+  },
+  {
+   "source": "index-aios",
+   "target": "context-manager"
+  },
+  {
+   "source": "index-aios",
+   "target": "context-snapshot-restore"
+  },
+  {
+   "source": "index-aios",
+   "target": "context-window-management"
+  },
+  {
+   "source": "index-aios",
+   "target": "evaluation-aios"
+  },
+  {
+   "source": "index-aios",
+   "target": "index"
+  },
+  {
+   "source": "index-aios",
+   "target": "llm-system-calls"
+  },
+  {
+   "source": "index-aios",
+   "target": "memory-manager"
+  },
+  {
+   "source": "index-aios",
+   "target": "storage-manager"
+  },
+  {
+   "source": "index-aios",
+   "target": "tool-manager"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "atomic-instructions"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "atomicity-and-ordering-violations"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "condition-variable"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "deadlock"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "dining-philosophers"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "event-based-concurrency"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "index"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "lock"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "lock-based-data-structures"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "lock-free-synchronization"
+  },
+  {
+   "source": "index-concurrency",
    "target": "pthreads-api"
   },
   {
-   "source": "index",
+   "source": "index-concurrency",
    "target": "race-condition"
   },
   {
-   "source": "index",
-   "target": "raid"
-  },
-  {
-   "source": "index",
-   "target": "rbac-and-mac"
-  },
-  {
-   "source": "index",
+   "source": "index-concurrency",
    "target": "reader-writer-lock"
   },
   {
-   "source": "index",
-   "target": "rpc"
-  },
-  {
-   "source": "index",
-   "target": "scheduling"
-  },
-  {
-   "source": "index",
-   "target": "security-goals-and-threat-model"
-  },
-  {
-   "source": "index",
-   "target": "segmentation-and-free-space"
-  },
-  {
-   "source": "index",
-   "target": "segmented-fifo-and-vms"
-  },
-  {
-   "source": "index",
+   "source": "index-concurrency",
    "target": "semaphore"
   },
   {
-   "source": "index",
-   "target": "setuid-and-privilege-escalation"
-  },
-  {
-   "source": "index",
+   "source": "index-concurrency",
    "target": "spin-lock"
   },
   {
-   "source": "index",
-   "target": "storage-manager"
-  },
-  {
-   "source": "index",
-   "target": "swapping"
-  },
-  {
-   "source": "index",
-   "target": "system-call"
-  },
-  {
-   "source": "index",
+   "source": "index-concurrency",
    "target": "thread"
   },
   {
-   "source": "index",
-   "target": "tlb"
+   "source": "index-distribution",
+   "target": "afs"
   },
   {
-   "source": "index",
-   "target": "tool-manager"
+   "source": "index-distribution",
+   "target": "cache-consistency"
   },
   {
-   "source": "index",
-   "target": "trap-and-interrupt"
+   "source": "index-distribution",
+   "target": "distributed-systems-communication"
   },
   {
-   "source": "index",
+   "source": "index-distribution",
+   "target": "idempotency"
+  },
+  {
+   "source": "index-distribution",
+   "target": "index"
+  },
+  {
+   "source": "index-distribution",
+   "target": "nfs"
+  },
+  {
+   "source": "index-distribution",
+   "target": "rpc"
+  },
+  {
+   "source": "index-persistence",
+   "target": "atomic-rename"
+  },
+  {
+   "source": "index-persistence",
+   "target": "crash-consistency"
+  },
+  {
+   "source": "index-persistence",
+   "target": "data-integrity"
+  },
+  {
+   "source": "index-persistence",
+   "target": "fast-file-system"
+  },
+  {
+   "source": "index-persistence",
+   "target": "file-and-directory-api"
+  },
+  {
+   "source": "index-persistence",
+   "target": "file-descriptor"
+  },
+  {
+   "source": "index-persistence",
+   "target": "file-system-implementation"
+  },
+  {
+   "source": "index-persistence",
+   "target": "flash-ssd"
+  },
+  {
+   "source": "index-persistence",
+   "target": "fsync-and-durability"
+  },
+  {
+   "source": "index-persistence",
+   "target": "hard-disk"
+  },
+  {
+   "source": "index-persistence",
+   "target": "index"
+  },
+  {
+   "source": "index-persistence",
+   "target": "inode"
+  },
+  {
+   "source": "index-persistence",
+   "target": "io-devices-and-drivers"
+  },
+  {
+   "source": "index-persistence",
+   "target": "journaling"
+  },
+  {
+   "source": "index-persistence",
+   "target": "log-structured-file-system"
+  },
+  {
+   "source": "index-persistence",
+   "target": "raid"
+  },
+  {
+   "source": "index-security",
+   "target": "access-control"
+  },
+  {
+   "source": "index-security",
+   "target": "access-control-lists"
+  },
+  {
+   "source": "index-security",
+   "target": "authentication"
+  },
+  {
+   "source": "index-security",
+   "target": "capabilities"
+  },
+  {
+   "source": "index-security",
+   "target": "cryptography"
+  },
+  {
+   "source": "index-security",
+   "target": "distributed-security"
+  },
+  {
+   "source": "index-security",
+   "target": "index"
+  },
+  {
+   "source": "index-security",
+   "target": "password-storage"
+  },
+  {
+   "source": "index-security",
+   "target": "principle-of-least-privilege"
+  },
+  {
+   "source": "index-security",
+   "target": "rbac-and-mac"
+  },
+  {
+   "source": "index-security",
+   "target": "security-goals-and-threat-model"
+  },
+  {
+   "source": "index-security",
+   "target": "setuid-and-privilege-escalation"
+  },
+  {
+   "source": "index-security",
    "target": "trusted-computing-base"
   },
   {
-   "source": "index",
+   "source": "index-virtualization",
+   "target": "address-space"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "address-translation"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "context-switch"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "copy-on-write"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "demand-paging"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "index"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "isolation-and-protection"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "limited-direct-execution"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "linux-virtual-memory"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "mechanism-vs-policy"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "memory-api"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "mlfq"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "multi-level-page-table"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "multiprocessor-scheduling"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "page-replacement-policy"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "paging"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "process"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "process-api"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "proportional-share-scheduling"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "scheduling"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "segmentation-and-free-space"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "segmented-fifo-and-vms"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "swapping"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "system-call"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "tlb"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "trap-and-interrupt"
+  },
+  {
+   "source": "index-virtualization",
    "target": "virtual-machine-monitor"
   },
   {
-   "source": "index",
+   "source": "index-virtualization",
    "target": "virtualization-and-resource-management"
   },
   {
-   "source": "index",
+   "source": "index-virtualization",
    "target": "working-set-and-thrashing"
+  },
+  {
+   "source": "inner-outer-loop-training",
+   "target": "mechanism-vs-policy"
+  },
+  {
+   "source": "inner-outer-loop-training",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "inner-outer-loop-training",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "inner-outer-loop-training",
+   "target": "recursivelink"
   },
   {
    "source": "inode",
@@ -1625,6 +2049,34 @@
   {
    "source": "journaling",
    "target": "log-structured-file-system"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "access-manager"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "context-window-management"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "distributed-systems-communication"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "recursivelink"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "rpc"
   },
   {
    "source": "limited-direct-execution",
@@ -2011,6 +2463,30 @@
    "target": "setuid-and-privilege-escalation"
   },
   {
+   "source": "private-held-out-grading",
+   "target": "access-control"
+  },
+  {
+   "source": "private-held-out-grading",
+   "target": "aide2"
+  },
+  {
+   "source": "private-held-out-grading",
+   "target": "capabilities"
+  },
+  {
+   "source": "private-held-out-grading",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "private-held-out-grading",
+   "target": "reward-hacking-measurement"
+  },
+  {
+   "source": "private-held-out-grading",
+   "target": "trusted-computing-base"
+  },
+  {
    "source": "process",
    "target": "address-space"
   },
@@ -2109,6 +2585,166 @@
   {
    "source": "reader-writer-lock",
    "target": "semaphore"
+  },
+  {
+   "source": "recursion-depth-scaling",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "recursion-depth-scaling",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "recursion-depth-scaling",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "recursion-depth-scaling",
+   "target": "scheduling"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "access-control"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "agent-as-process"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "agent-collaboration-patterns"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "aios-architecture"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "capabilities"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "recursion-depth-scaling"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "recursivelink"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "agent-as-process"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "bandit-search-policy-with-forking"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "isolation-and-protection"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "reward-hacking-measurement"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "trusted-computing-base"
+  },
+  {
+   "source": "recursivelink",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "recursivelink",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "recursivelink",
+   "target": "isolation-and-protection"
+  },
+  {
+   "source": "recursivelink",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "recursivelink",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "recursivelink",
+   "target": "rpc"
+  },
+  {
+   "source": "recursivemas",
+   "target": "agent-collaboration-patterns"
+  },
+  {
+   "source": "recursivemas",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "recursivemas",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "recursivemas",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "recursivemas",
+   "target": "recursion-depth-scaling"
+  },
+  {
+   "source": "recursivemas",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "recursivemas",
+   "target": "recursivelink"
+  },
+  {
+   "source": "reward-hacking-measurement",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "reward-hacking-measurement",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "reward-hacking-measurement",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "reward-hacking-measurement",
+   "target": "security-goals-and-threat-model"
+  },
+  {
+   "source": "reward-hacking-measurement",
+   "target": "trusted-computing-base"
   },
   {
    "source": "rpc",

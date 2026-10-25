@@ -1,0 +1,104 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-10-24T19:09:53.224Z",
+  "phase": "1",
+  "phase_name": "Userland, syscall ABI and IPC v2",
+  "phase_dir": ".planning/phases/01-userland-syscall-abi-and-ipc-v2",
+  "plan": 7,
+  "task": 1,
+  "total_tasks": null,
+  "status": "paused",
+  "completed_tasks": [
+    {
+      "id": "01-01",
+      "name": "Tracer: ring-3 Rust image, syscall entry, call/reply",
+      "status": "done",
+      "commit": "433ae60"
+    },
+    {
+      "id": "01-02",
+      "name": "Unsafe ledger, check.sh, CI, FPU route",
+      "status": "done",
+      "commit": "8422111"
+    },
+    {
+      "id": "01-03",
+      "name": "Typed syscall decode, user copy, fuzz",
+      "status": "done",
+      "commit": "ff4a490"
+    },
+    {
+      "id": "01-04",
+      "name": "Growable CSpace, MAX_SLOTS=65536",
+      "status": "done",
+      "commit": "926f4eb"
+    },
+    {
+      "id": "01-05",
+      "name": "block_until, reply handles, tid/tag stamping, bulk copy",
+      "status": "done",
+      "commit": "1ae5158"
+    },
+    {
+      "id": "01-06",
+      "name": "Cancel-then-wait and cap transfer",
+      "status": "done",
+      "commit": "f94fa31"
+    }
+  ],
+  "remaining_tasks": [
+    {
+      "id": "01-07",
+      "name": "Port B2 programs to Rust bins, null-IPC measurement, full gate",
+      "status": "not_started"
+    },
+    {
+      "id": "verify",
+      "name": "code review gate, gsd-verifier, phase.complete 1, transition",
+      "status": "not_started"
+    }
+  ],
+  "blockers": [
+    {
+      "description": "Boot check 'aok: cpu budget check' flaky (~1 in 4 runs, child one tick over bound); reproduces on 37dc2fd, predates 01-05",
+      "type": "technical",
+      "workaround": "re-run check.sh once; needs a real fix before phase sign-off"
+    },
+    {
+      "description": "REQUIREMENTS.md marks KERN-03 and IPC-01 complete early (set by 01-01 executor); KERN-03 port lands in 01-07",
+      "type": "technical",
+      "workaround": "verifier should correct; check at verify step"
+    },
+    {
+      "description": "Cancel-then-wait does not free callers parked on a dead/never-answering server; interrupt now waits instead of EINTR (shortcut in abandon). Only Phase 2 kill path frees it",
+      "type": "technical",
+      "workaround": "accept for phase 1 or add a fix plan"
+    }
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [],
+  "decisions": [
+    {
+      "decision": "FPU via safe OSTD route (per-thread FpuContext swap), no kernel unsafe",
+      "rationale": "keeps deny(unsafe_code)",
+      "phase": "1"
+    },
+    {
+      "decision": "Executors dispatched with isolation=worktree, model sonnet, shared rules file",
+      "rationale": "isolation-guard hook blocks non-worktree gsd-executor dispatch",
+      "phase": "1"
+    },
+    {
+      "decision": "Accepted 01-05 out-of-plan cow_clone fix in kernel/src/vm.rs",
+      "rationale": "latent panic on second clone; adds no unsafe",
+      "phase": "1"
+    }
+  ],
+  "uncommitted_files": [
+    " M .planning/config.json",
+    "?? .planning/milestone.lock",
+    "?? .planning/state.json"
+  ],
+  "next_action": "Run /gsd-execute-phase 1: dispatch wave 6 (01-07) with EXPECTED_BASE=HEAD and a fresh manifest",
+  "context_notes": "Resume via /gsd-execute-phase 1; it resumes at the first plan without a SUMMARY. config.json, milestone.lock, state.json were dirty before this session; leave them."
+}

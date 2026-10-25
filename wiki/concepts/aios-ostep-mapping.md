@@ -56,3 +56,4 @@ handles, Capsicum), and later AIOS versions.
 - [[mechanism-vs-policy]]
 - [[principle-of-least-privilege]]
 - [[isolation-and-protection]]
+- [[agent-recursion-os-implications]]

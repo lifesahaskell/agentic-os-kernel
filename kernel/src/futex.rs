@@ -19,7 +19,7 @@ use ostd::{
 };
 
 use crate::{
-    thread::{Interrupted, Thread},
+    thread::{BlockError, Thread},
     vm::handle_cow_fault,
 };
 
@@ -31,6 +31,7 @@ pub enum FutexError {
     /// Misaligned address.
     Inval,
     Interrupted,
+    TimedOut,
     /// Breaking copy-on-write exceeded the agent's memory budget.
     Budget,
 }
@@ -42,14 +43,18 @@ impl FutexError {
             Self::Fault => 14,
             Self::Inval => 22,
             Self::Interrupted => 4,
+            Self::TimedOut => 110,
             Self::Budget => 12,
         }
     }
 }
 
-impl From<Interrupted> for FutexError {
-    fn from(_: Interrupted) -> Self {
-        Self::Interrupted
+impl From<BlockError> for FutexError {
+    fn from(e: BlockError) -> Self {
+        match e {
+            BlockError::Interrupted => Self::Interrupted,
+            BlockError::TimedOut => Self::TimedOut,
+        }
     }
 }
 
@@ -138,9 +143,14 @@ pub fn wait(t: &Thread, space: &VmSpace, va: Vaddr, expected: u32) -> Result<(),
             .waiters
             .push_back(w.clone());
     }
-    match t.block_on(&w.wq, || w.woken.load(Ordering::Acquire).then_some(())) {
+    let blocked = t.block_until(
+        &w.wq,
+        || w.woken.load(Ordering::Acquire).then_some(()),
+        None,
+    );
+    match blocked {
         Ok(()) => Ok(()),
-        Err(Interrupted) => {
+        Err(e) => {
             let mut tab = TABLE.lock();
             // A wake that raced the interrupt wins, so it is not lost.
             if w.woken.load(Ordering::Acquire) {
@@ -153,7 +163,7 @@ pub fn wait(t: &Thread, space: &VmSpace, va: Vaddr, expected: u32) -> Result<(),
                     tab.remove(&key);
                 }
             }
-            Err(FutexError::Interrupted)
+            Err(e.into())
         }
     }
 }
