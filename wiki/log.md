@@ -48,3 +48,13 @@ Append-only. Newest entry last.
 - Filed `docs/architecture/research/recursion-and-cheap-inference-spikes.md` (outside the wiki; web
   sources cannot carry PDF-page cites). No new wiki pages. `index.md` gained a routing block so a query
   reads one named page instead of scanning the groups; the synthesis page links the research doc.
+
+## 2026-10-25 restructure: split the index
+
+- `wiki/index.md` (20.5 KB) is now a router (2.3 KB: where-to-start block, sources, synthesis, group
+  links). The seven group sections moved verbatim to `wiki/indexes/index-<group>.md` (1.2-5.5 KB each).
+  No concept or source page moved or was renamed; links are slug-only, so no wikilink changed.
+- Query cost on the index: 20.5 KB before; 2.3 KB plus one group (3.5-7.8 KB) now. Bytes, not tokens.
+- Check: 100 concept entries before and after; lint exits 0 with 115 pages (108 + 7 group indexes), 629
+  links, no orphans. `AGENTS.md` layout, ingest, query and lint lines updated to match.
+- Not done: entry descriptions are still the full definition sentence (average 182 characters).

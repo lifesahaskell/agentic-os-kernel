@@ -193,6 +193,34 @@
    "group": "wiki"
   },
   {
+   "id": "index-agent-research",
+   "group": "indexes"
+  },
+  {
+   "id": "index-aios",
+   "group": "indexes"
+  },
+  {
+   "id": "index-concurrency",
+   "group": "indexes"
+  },
+  {
+   "id": "index-distribution",
+   "group": "indexes"
+  },
+  {
+   "id": "index-persistence",
+   "group": "indexes"
+  },
+  {
+   "id": "index-security",
+   "group": "indexes"
+  },
+  {
+   "id": "index-virtualization",
+   "group": "indexes"
+  },
+  {
    "id": "inner-outer-loop-training",
    "group": "concepts"
   },
@@ -1448,39 +1476,7 @@
   },
   {
    "source": "index",
-   "target": "access-control-lists"
-  },
-  {
-   "source": "index",
-   "target": "access-manager"
-  },
-  {
-   "source": "index",
-   "target": "address-space"
-  },
-  {
-   "source": "index",
-   "target": "address-translation"
-  },
-  {
-   "source": "index",
-   "target": "afs"
-  },
-  {
-   "source": "index",
-   "target": "agent-as-process"
-  },
-  {
-   "source": "index",
-   "target": "agent-collaboration-patterns"
-  },
-  {
-   "source": "index",
    "target": "agent-recursion-os-implications"
-  },
-  {
-   "source": "index",
-   "target": "agent-scheduler"
   },
   {
    "source": "index",
@@ -1492,39 +1488,7 @@
   },
   {
    "source": "index",
-   "target": "aios-architecture"
-  },
-  {
-   "source": "index",
    "target": "aios-ostep-mapping"
-  },
-  {
-   "source": "index",
-   "target": "aios-sdk"
-  },
-  {
-   "source": "index",
-   "target": "atomic-instructions"
-  },
-  {
-   "source": "index",
-   "target": "atomic-rename"
-  },
-  {
-   "source": "index",
-   "target": "atomicity-and-ordering-violations"
-  },
-  {
-   "source": "index",
-   "target": "authentication"
-  },
-  {
-   "source": "index",
-   "target": "bandit-search-policy-with-forking"
-  },
-  {
-   "source": "index",
-   "target": "cache-consistency"
   },
   {
    "source": "index",
@@ -1532,243 +1496,35 @@
   },
   {
    "source": "index",
-   "target": "condition-variable"
+   "target": "index-agent-research"
   },
   {
    "source": "index",
-   "target": "context-manager"
+   "target": "index-aios"
   },
   {
    "source": "index",
-   "target": "context-snapshot-restore"
+   "target": "index-concurrency"
   },
   {
    "source": "index",
-   "target": "context-switch"
+   "target": "index-distribution"
   },
   {
    "source": "index",
-   "target": "context-window-management"
+   "target": "index-persistence"
   },
   {
    "source": "index",
-   "target": "copy-on-write"
+   "target": "index-security"
   },
   {
    "source": "index",
-   "target": "crash-consistency"
-  },
-  {
-   "source": "index",
-   "target": "cryptography"
-  },
-  {
-   "source": "index",
-   "target": "data-integrity"
-  },
-  {
-   "source": "index",
-   "target": "deadlock"
-  },
-  {
-   "source": "index",
-   "target": "demand-paging"
-  },
-  {
-   "source": "index",
-   "target": "dining-philosophers"
-  },
-  {
-   "source": "index",
-   "target": "distributed-security"
-  },
-  {
-   "source": "index",
-   "target": "distributed-systems-communication"
-  },
-  {
-   "source": "index",
-   "target": "evaluation-aios"
-  },
-  {
-   "source": "index",
-   "target": "event-based-concurrency"
-  },
-  {
-   "source": "index",
-   "target": "fast-file-system"
-  },
-  {
-   "source": "index",
-   "target": "file-and-directory-api"
-  },
-  {
-   "source": "index",
-   "target": "file-descriptor"
-  },
-  {
-   "source": "index",
-   "target": "file-system-implementation"
-  },
-  {
-   "source": "index",
-   "target": "flash-ssd"
-  },
-  {
-   "source": "index",
-   "target": "fsync-and-durability"
-  },
-  {
-   "source": "index",
-   "target": "hard-disk"
-  },
-  {
-   "source": "index",
-   "target": "harness-robustness-mechanisms"
-  },
-  {
-   "source": "index",
-   "target": "idempotency"
-  },
-  {
-   "source": "index",
-   "target": "inner-outer-loop-training"
-  },
-  {
-   "source": "index",
-   "target": "inode"
-  },
-  {
-   "source": "index",
-   "target": "io-devices-and-drivers"
-  },
-  {
-   "source": "index",
-   "target": "isolation-and-protection"
-  },
-  {
-   "source": "index",
-   "target": "journaling"
-  },
-  {
-   "source": "index",
-   "target": "latent-vs-text-agent-communication"
-  },
-  {
-   "source": "index",
-   "target": "limited-direct-execution"
-  },
-  {
-   "source": "index",
-   "target": "linux-virtual-memory"
-  },
-  {
-   "source": "index",
-   "target": "llm-system-calls"
-  },
-  {
-   "source": "index",
-   "target": "lock"
-  },
-  {
-   "source": "index",
-   "target": "lock-based-data-structures"
-  },
-  {
-   "source": "index",
-   "target": "lock-free-synchronization"
-  },
-  {
-   "source": "index",
-   "target": "log-structured-file-system"
-  },
-  {
-   "source": "index",
-   "target": "mechanism-vs-policy"
-  },
-  {
-   "source": "index",
-   "target": "memory-api"
-  },
-  {
-   "source": "index",
-   "target": "memory-manager"
-  },
-  {
-   "source": "index",
-   "target": "mlfq"
-  },
-  {
-   "source": "index",
-   "target": "multi-level-page-table"
-  },
-  {
-   "source": "index",
-   "target": "multiprocessor-scheduling"
-  },
-  {
-   "source": "index",
-   "target": "nfs"
+   "target": "index-virtualization"
   },
   {
    "source": "index",
    "target": "ostep"
-  },
-  {
-   "source": "index",
-   "target": "page-replacement-policy"
-  },
-  {
-   "source": "index",
-   "target": "paging"
-  },
-  {
-   "source": "index",
-   "target": "password-storage"
-  },
-  {
-   "source": "index",
-   "target": "principle-of-least-privilege"
-  },
-  {
-   "source": "index",
-   "target": "private-held-out-grading"
-  },
-  {
-   "source": "index",
-   "target": "process"
-  },
-  {
-   "source": "index",
-   "target": "process-api"
-  },
-  {
-   "source": "index",
-   "target": "proportional-share-scheduling"
-  },
-  {
-   "source": "index",
-   "target": "pthreads-api"
-  },
-  {
-   "source": "index",
-   "target": "race-condition"
-  },
-  {
-   "source": "index",
-   "target": "raid"
-  },
-  {
-   "source": "index",
-   "target": "rbac-and-mac"
-  },
-  {
-   "source": "index",
-   "target": "reader-writer-lock"
-  },
-  {
-   "source": "index",
-   "target": "recursion-depth-scaling"
   },
   {
    "source": "index",
@@ -1780,90 +1536,438 @@
   },
   {
    "source": "index",
-   "target": "recursivelink"
-  },
-  {
-   "source": "index",
    "target": "recursivemas"
-  },
-  {
-   "source": "index",
-   "target": "reward-hacking-measurement"
-  },
-  {
-   "source": "index",
-   "target": "rpc"
-  },
-  {
-   "source": "index",
-   "target": "scheduling"
-  },
-  {
-   "source": "index",
-   "target": "security-goals-and-threat-model"
-  },
-  {
-   "source": "index",
-   "target": "segmentation-and-free-space"
-  },
-  {
-   "source": "index",
-   "target": "segmented-fifo-and-vms"
-  },
-  {
-   "source": "index",
-   "target": "semaphore"
-  },
-  {
-   "source": "index",
-   "target": "setuid-and-privilege-escalation"
-  },
-  {
-   "source": "index",
-   "target": "spin-lock"
-  },
-  {
-   "source": "index",
-   "target": "storage-manager"
-  },
-  {
-   "source": "index",
-   "target": "swapping"
-  },
-  {
-   "source": "index",
-   "target": "system-call"
-  },
-  {
-   "source": "index",
-   "target": "thread"
-  },
-  {
-   "source": "index",
-   "target": "tlb"
-  },
-  {
-   "source": "index",
-   "target": "tool-manager"
-  },
-  {
-   "source": "index",
-   "target": "trap-and-interrupt"
   },
   {
    "source": "index",
    "target": "trusted-computing-base"
   },
   {
-   "source": "index",
+   "source": "index-agent-research",
+   "target": "agent-collaboration-patterns"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "bandit-search-policy-with-forking"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "index"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "recursion-depth-scaling"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "recursivelink"
+  },
+  {
+   "source": "index-agent-research",
+   "target": "reward-hacking-measurement"
+  },
+  {
+   "source": "index-aios",
+   "target": "access-manager"
+  },
+  {
+   "source": "index-aios",
+   "target": "agent-as-process"
+  },
+  {
+   "source": "index-aios",
+   "target": "agent-scheduler"
+  },
+  {
+   "source": "index-aios",
+   "target": "aios-architecture"
+  },
+  {
+   "source": "index-aios",
+   "target": "aios-sdk"
+  },
+  {
+   "source": "index-aios",
+   "target": "context-manager"
+  },
+  {
+   "source": "index-aios",
+   "target": "context-snapshot-restore"
+  },
+  {
+   "source": "index-aios",
+   "target": "context-window-management"
+  },
+  {
+   "source": "index-aios",
+   "target": "evaluation-aios"
+  },
+  {
+   "source": "index-aios",
+   "target": "index"
+  },
+  {
+   "source": "index-aios",
+   "target": "llm-system-calls"
+  },
+  {
+   "source": "index-aios",
+   "target": "memory-manager"
+  },
+  {
+   "source": "index-aios",
+   "target": "storage-manager"
+  },
+  {
+   "source": "index-aios",
+   "target": "tool-manager"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "atomic-instructions"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "atomicity-and-ordering-violations"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "condition-variable"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "deadlock"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "dining-philosophers"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "event-based-concurrency"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "index"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "lock"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "lock-based-data-structures"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "lock-free-synchronization"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "pthreads-api"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "race-condition"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "reader-writer-lock"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "semaphore"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "spin-lock"
+  },
+  {
+   "source": "index-concurrency",
+   "target": "thread"
+  },
+  {
+   "source": "index-distribution",
+   "target": "afs"
+  },
+  {
+   "source": "index-distribution",
+   "target": "cache-consistency"
+  },
+  {
+   "source": "index-distribution",
+   "target": "distributed-systems-communication"
+  },
+  {
+   "source": "index-distribution",
+   "target": "idempotency"
+  },
+  {
+   "source": "index-distribution",
+   "target": "index"
+  },
+  {
+   "source": "index-distribution",
+   "target": "nfs"
+  },
+  {
+   "source": "index-distribution",
+   "target": "rpc"
+  },
+  {
+   "source": "index-persistence",
+   "target": "atomic-rename"
+  },
+  {
+   "source": "index-persistence",
+   "target": "crash-consistency"
+  },
+  {
+   "source": "index-persistence",
+   "target": "data-integrity"
+  },
+  {
+   "source": "index-persistence",
+   "target": "fast-file-system"
+  },
+  {
+   "source": "index-persistence",
+   "target": "file-and-directory-api"
+  },
+  {
+   "source": "index-persistence",
+   "target": "file-descriptor"
+  },
+  {
+   "source": "index-persistence",
+   "target": "file-system-implementation"
+  },
+  {
+   "source": "index-persistence",
+   "target": "flash-ssd"
+  },
+  {
+   "source": "index-persistence",
+   "target": "fsync-and-durability"
+  },
+  {
+   "source": "index-persistence",
+   "target": "hard-disk"
+  },
+  {
+   "source": "index-persistence",
+   "target": "index"
+  },
+  {
+   "source": "index-persistence",
+   "target": "inode"
+  },
+  {
+   "source": "index-persistence",
+   "target": "io-devices-and-drivers"
+  },
+  {
+   "source": "index-persistence",
+   "target": "journaling"
+  },
+  {
+   "source": "index-persistence",
+   "target": "log-structured-file-system"
+  },
+  {
+   "source": "index-persistence",
+   "target": "raid"
+  },
+  {
+   "source": "index-security",
+   "target": "access-control"
+  },
+  {
+   "source": "index-security",
+   "target": "access-control-lists"
+  },
+  {
+   "source": "index-security",
+   "target": "authentication"
+  },
+  {
+   "source": "index-security",
+   "target": "capabilities"
+  },
+  {
+   "source": "index-security",
+   "target": "cryptography"
+  },
+  {
+   "source": "index-security",
+   "target": "distributed-security"
+  },
+  {
+   "source": "index-security",
+   "target": "index"
+  },
+  {
+   "source": "index-security",
+   "target": "password-storage"
+  },
+  {
+   "source": "index-security",
+   "target": "principle-of-least-privilege"
+  },
+  {
+   "source": "index-security",
+   "target": "rbac-and-mac"
+  },
+  {
+   "source": "index-security",
+   "target": "security-goals-and-threat-model"
+  },
+  {
+   "source": "index-security",
+   "target": "setuid-and-privilege-escalation"
+  },
+  {
+   "source": "index-security",
+   "target": "trusted-computing-base"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "address-space"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "address-translation"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "context-switch"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "copy-on-write"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "demand-paging"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "index"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "isolation-and-protection"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "limited-direct-execution"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "linux-virtual-memory"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "mechanism-vs-policy"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "memory-api"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "mlfq"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "multi-level-page-table"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "multiprocessor-scheduling"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "page-replacement-policy"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "paging"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "process"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "process-api"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "proportional-share-scheduling"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "scheduling"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "segmentation-and-free-space"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "segmented-fifo-and-vms"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "swapping"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "system-call"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "tlb"
+  },
+  {
+   "source": "index-virtualization",
+   "target": "trap-and-interrupt"
+  },
+  {
+   "source": "index-virtualization",
    "target": "virtual-machine-monitor"
   },
   {
-   "source": "index",
+   "source": "index-virtualization",
    "target": "virtualization-and-resource-management"
   },
   {
-   "source": "index",
+   "source": "index-virtualization",
    "target": "working-set-and-thrashing"
   },
   {
