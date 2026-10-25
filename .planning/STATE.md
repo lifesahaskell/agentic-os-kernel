@@ -4,10 +4,10 @@ current_phase: 1
 current_phase_name: Userland, syscall ABI and IPC v2
 status: executing
 stopped_at: context exhaustion at 99% (2026-10-24)
-last_updated: "2026-10-24T19:13:29.507Z"
-last_activity: 2026-10-24
+last_updated: "2026-10-25T19:24:05.365Z"
+last_activity: 2026-10-25
 last_activity_desc: Phase 1 execution resumed (wave continue)
-state_head: f94fa31c0941d5b0ae597e05a577971e0e5b71b1
+state_head: 093e9f170933c6d5d8713ff8a1dc9d50d2339f27
 progress:
   total_phases: 6
   completed_phases: 0
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-23)
 Phase: 1 (Userland, syscall ABI and IPC v2) — EXECUTING
 Plan: 7 of 7
 Status: Ready to execute
-Last activity: 2026-10-24 — Phase 1 execution resumed (wave continue)
+Last activity: 2026-10-25 - Completed quick task 261025-jbm: Ingest recursivemas and aide2 papers into the wiki
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -82,6 +82,13 @@ None yet.
 - [Phase 4]: musl is the default libc on source-level evidence only; nothing was built. The Phase 4 spike confirms or overturns it.
 - [Phase 6]: KVM on the CI host is assumed, not checked.
 - [Docs]: Kernel gap IDs (K1-K12) in REQUIREMENTS.md do not match the K-numbering in research/ARCHITECTURE.md (only K10 agrees). Use requirement IDs, not K-numbers.
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 261025-jbm | Ingest recursivemas and aide2 papers into the wiki | 2026-10-25 | 093e9f1 | [261025-jbm-ingest-recursivemas-and-aide2-papers-int](./quick/261025-jbm-ingest-recursivemas-and-aide2-papers-int/) |
+| 261025-kpm | Research doc: spike candidates for recursion and cheap-GPU inference | 2026-10-25 | 093e9f1 | [261025-kpm-spike-candidates-recursion-and-cheap-gpu](./quick/261025-kpm-spike-candidates-recursion-and-cheap-gpu/) |
 
 ## Deferred Items
 
