@@ -29,8 +29,20 @@
    "group": "concepts"
   },
   {
+   "id": "agent-collaboration-patterns",
+   "group": "concepts"
+  },
+  {
+   "id": "agent-recursion-os-implications",
+   "group": "concepts"
+  },
+  {
    "id": "agent-scheduler",
    "group": "concepts"
+  },
+  {
+   "id": "aide2",
+   "group": "sources"
   },
   {
    "id": "aios",
@@ -62,6 +74,10 @@
   },
   {
    "id": "authentication",
+   "group": "concepts"
+  },
+  {
+   "id": "bandit-search-policy-with-forking",
    "group": "concepts"
   },
   {
@@ -165,12 +181,20 @@
    "group": "concepts"
   },
   {
+   "id": "harness-robustness-mechanisms",
+   "group": "concepts"
+  },
+  {
    "id": "idempotency",
    "group": "concepts"
   },
   {
    "id": "index",
    "group": "wiki"
+  },
+  {
+   "id": "inner-outer-loop-training",
+   "group": "concepts"
   },
   {
    "id": "inode",
@@ -186,6 +210,10 @@
   },
   {
    "id": "journaling",
+   "group": "concepts"
+  },
+  {
+   "id": "latent-vs-text-agent-communication",
    "group": "concepts"
   },
   {
@@ -269,6 +297,10 @@
    "group": "concepts"
   },
   {
+   "id": "private-held-out-grading",
+   "group": "concepts"
+  },
+  {
    "id": "process",
    "group": "concepts"
   },
@@ -298,6 +330,30 @@
   },
   {
    "id": "reader-writer-lock",
+   "group": "concepts"
+  },
+  {
+   "id": "recursion-depth-scaling",
+   "group": "concepts"
+  },
+  {
+   "id": "recursive-multi-agent-system",
+   "group": "concepts"
+  },
+  {
+   "id": "recursive-self-improvement-loop",
+   "group": "concepts"
+  },
+  {
+   "id": "recursivelink",
+   "group": "concepts"
+  },
+  {
+   "id": "recursivemas",
+   "group": "sources"
+  },
+  {
+   "id": "reward-hacking-measurement",
    "group": "concepts"
   },
   {
@@ -503,6 +559,106 @@
    "target": "scheduling"
   },
   {
+   "source": "agent-collaboration-patterns",
+   "target": "access-control"
+  },
+  {
+   "source": "agent-collaboration-patterns",
+   "target": "agent-as-process"
+  },
+  {
+   "source": "agent-collaboration-patterns",
+   "target": "agent-scheduler"
+  },
+  {
+   "source": "agent-collaboration-patterns",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "agent-collaboration-patterns",
+   "target": "tool-manager"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "access-control"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "access-manager"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "agent-as-process"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "agent-collaboration-patterns"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "aios-ostep-mapping"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "capabilities"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "context-window-management"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "mechanism-vs-policy"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "principle-of-least-privilege"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "recursion-depth-scaling"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "recursivelink"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "reward-hacking-measurement"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "scheduling"
+  },
+  {
+   "source": "agent-recursion-os-implications",
+   "target": "trusted-computing-base"
+  },
+  {
    "source": "agent-scheduler",
    "target": "agent-as-process"
   },
@@ -521,6 +677,34 @@
   {
    "source": "agent-scheduler",
    "target": "scheduling"
+  },
+  {
+   "source": "aide2",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "aide2",
+   "target": "bandit-search-policy-with-forking"
+  },
+  {
+   "source": "aide2",
+   "target": "context-window-management"
+  },
+  {
+   "source": "aide2",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "aide2",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "aide2",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "aide2",
+   "target": "reward-hacking-measurement"
   },
   {
    "source": "aios",
@@ -613,6 +797,10 @@
   {
    "source": "aios-ostep-mapping",
    "target": "agent-as-process"
+  },
+  {
+   "source": "aios-ostep-mapping",
+   "target": "agent-recursion-os-implications"
   },
   {
    "source": "aios-ostep-mapping",
@@ -819,6 +1007,26 @@
    "target": "password-storage"
   },
   {
+   "source": "bandit-search-policy-with-forking",
+   "target": "agent-scheduler"
+  },
+  {
+   "source": "bandit-search-policy-with-forking",
+   "target": "mechanism-vs-policy"
+  },
+  {
+   "source": "bandit-search-policy-with-forking",
+   "target": "mlfq"
+  },
+  {
+   "source": "bandit-search-policy-with-forking",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "bandit-search-policy-with-forking",
+   "target": "scheduling"
+  },
+  {
    "source": "cache-consistency",
    "target": "afs"
   },
@@ -908,11 +1116,27 @@
   },
   {
    "source": "context-window-management",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "context-window-management",
+   "target": "memory-manager"
+  },
+  {
+   "source": "context-window-management",
    "target": "paging"
   },
   {
    "source": "context-window-management",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "context-window-management",
    "target": "swapping"
+  },
+  {
+   "source": "context-window-management",
+   "target": "working-set-and-thrashing"
   },
   {
    "source": "copy-on-write",
@@ -1183,6 +1407,30 @@
    "target": "raid"
   },
   {
+   "source": "harness-robustness-mechanisms",
+   "target": "isolation-and-protection"
+  },
+  {
+   "source": "harness-robustness-mechanisms",
+   "target": "principle-of-least-privilege"
+  },
+  {
+   "source": "harness-robustness-mechanisms",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "harness-robustness-mechanisms",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "harness-robustness-mechanisms",
+   "target": "reward-hacking-measurement"
+  },
+  {
+   "source": "harness-robustness-mechanisms",
+   "target": "trusted-computing-base"
+  },
+  {
    "source": "idempotency",
    "target": "distributed-systems-communication"
   },
@@ -1224,7 +1472,19 @@
   },
   {
    "source": "index",
+   "target": "agent-collaboration-patterns"
+  },
+  {
+   "source": "index",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "index",
    "target": "agent-scheduler"
+  },
+  {
+   "source": "index",
+   "target": "aide2"
   },
   {
    "source": "index",
@@ -1257,6 +1517,10 @@
   {
    "source": "index",
    "target": "authentication"
+  },
+  {
+   "source": "index",
+   "target": "bandit-search-policy-with-forking"
   },
   {
    "source": "index",
@@ -1360,7 +1624,15 @@
   },
   {
    "source": "index",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "index",
    "target": "idempotency"
+  },
+  {
+   "source": "index",
+   "target": "inner-outer-loop-training"
   },
   {
    "source": "index",
@@ -1377,6 +1649,10 @@
   {
    "source": "index",
    "target": "journaling"
+  },
+  {
+   "source": "index",
+   "target": "latent-vs-text-agent-communication"
   },
   {
    "source": "index",
@@ -1456,6 +1732,10 @@
   },
   {
    "source": "index",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "index",
    "target": "process"
   },
   {
@@ -1485,6 +1765,30 @@
   {
    "source": "index",
    "target": "reader-writer-lock"
+  },
+  {
+   "source": "index",
+   "target": "recursion-depth-scaling"
+  },
+  {
+   "source": "index",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "index",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "index",
+   "target": "recursivelink"
+  },
+  {
+   "source": "index",
+   "target": "recursivemas"
+  },
+  {
+   "source": "index",
+   "target": "reward-hacking-measurement"
   },
   {
    "source": "index",
@@ -1563,6 +1867,22 @@
    "target": "working-set-and-thrashing"
   },
   {
+   "source": "inner-outer-loop-training",
+   "target": "mechanism-vs-policy"
+  },
+  {
+   "source": "inner-outer-loop-training",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "inner-outer-loop-training",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "inner-outer-loop-training",
+   "target": "recursivelink"
+  },
+  {
    "source": "inode",
    "target": "fast-file-system"
   },
@@ -1625,6 +1945,34 @@
   {
    "source": "journaling",
    "target": "log-structured-file-system"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "access-manager"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "context-window-management"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "distributed-systems-communication"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "recursivelink"
+  },
+  {
+   "source": "latent-vs-text-agent-communication",
+   "target": "rpc"
   },
   {
    "source": "limited-direct-execution",
@@ -2011,6 +2359,30 @@
    "target": "setuid-and-privilege-escalation"
   },
   {
+   "source": "private-held-out-grading",
+   "target": "access-control"
+  },
+  {
+   "source": "private-held-out-grading",
+   "target": "aide2"
+  },
+  {
+   "source": "private-held-out-grading",
+   "target": "capabilities"
+  },
+  {
+   "source": "private-held-out-grading",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "private-held-out-grading",
+   "target": "reward-hacking-measurement"
+  },
+  {
+   "source": "private-held-out-grading",
+   "target": "trusted-computing-base"
+  },
+  {
    "source": "process",
    "target": "address-space"
   },
@@ -2109,6 +2481,166 @@
   {
    "source": "reader-writer-lock",
    "target": "semaphore"
+  },
+  {
+   "source": "recursion-depth-scaling",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "recursion-depth-scaling",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "recursion-depth-scaling",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "recursion-depth-scaling",
+   "target": "scheduling"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "access-control"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "agent-as-process"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "agent-collaboration-patterns"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "aios-architecture"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "capabilities"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "recursion-depth-scaling"
+  },
+  {
+   "source": "recursive-multi-agent-system",
+   "target": "recursivelink"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "agent-as-process"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "bandit-search-policy-with-forking"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "isolation-and-protection"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "reward-hacking-measurement"
+  },
+  {
+   "source": "recursive-self-improvement-loop",
+   "target": "trusted-computing-base"
+  },
+  {
+   "source": "recursivelink",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "recursivelink",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "recursivelink",
+   "target": "isolation-and-protection"
+  },
+  {
+   "source": "recursivelink",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "recursivelink",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "recursivelink",
+   "target": "rpc"
+  },
+  {
+   "source": "recursivemas",
+   "target": "agent-collaboration-patterns"
+  },
+  {
+   "source": "recursivemas",
+   "target": "agent-recursion-os-implications"
+  },
+  {
+   "source": "recursivemas",
+   "target": "inner-outer-loop-training"
+  },
+  {
+   "source": "recursivemas",
+   "target": "latent-vs-text-agent-communication"
+  },
+  {
+   "source": "recursivemas",
+   "target": "recursion-depth-scaling"
+  },
+  {
+   "source": "recursivemas",
+   "target": "recursive-multi-agent-system"
+  },
+  {
+   "source": "recursivemas",
+   "target": "recursivelink"
+  },
+  {
+   "source": "reward-hacking-measurement",
+   "target": "harness-robustness-mechanisms"
+  },
+  {
+   "source": "reward-hacking-measurement",
+   "target": "private-held-out-grading"
+  },
+  {
+   "source": "reward-hacking-measurement",
+   "target": "recursive-self-improvement-loop"
+  },
+  {
+   "source": "reward-hacking-measurement",
+   "target": "security-goals-and-threat-model"
+  },
+  {
+   "source": "reward-hacking-measurement",
+   "target": "trusted-computing-base"
   },
   {
    "source": "rpc",

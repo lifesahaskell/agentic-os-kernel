@@ -2,14 +2,25 @@
 
 Catalog of every page. Start with [[aios-ostep-mapping]]; it bridges the two sources and lists the open design problems.
 
+Where to start, by question (read the named page, then follow its `## Related`; do not scan the groups):
+
+- OS concept for agents (scheduling, memory, access): [[aios-ostep-mapping]].
+- Self-improving or self-rewriting agents, grader isolation: [[agent-recursion-os-implications]], then [[recursive-self-improvement-loop]].
+- Multi-agent latent communication, cost of rounds: [[agent-recursion-os-implications]], then [[recursive-multi-agent-system]].
+- Protection and authority: [[capabilities]], [[access-control]], [[trusted-computing-base]].
+- Spike candidates and hardware (outside the wiki): `docs/architecture/research/recursion-and-cheap-inference-spikes.md`.
+
 ## Sources
 
 - [[aios]]: AIOS: LLM Agent Operating System (arXiv 2403.16971v2, 2024)
 - [[ostep]]: Operating Systems: Three Easy Pieces (Arpaci-Dusseau)
+- [[recursivemas]]: Recursive Multi-Agent Systems (arXiv 2604.25917v1, 2026)
+- [[aide2]]: Recursive self-improvement of AI research agents (arXiv 2609.26457v1, 2026)
 
-## Synthesis (1)
+## Synthesis (2)
 
 - [[aios-ostep-mapping|AIOS to OSTEP Concept Mapping]]: The bridge page of the wiki.
+- [[agent-recursion-os-implications|Agent Recursion and OS Implications]]: What latent-space agent loops and self-rewriting agents ask of a kernel that treats agents as objects; all interpretation.
 
 ## AIOS (agentic) (13)
 
@@ -26,6 +37,22 @@ Catalog of every page. Start with [[aios-ostep-mapping]]; it bridges the two sou
 - [[memory-manager|Memory Manager]]: Holds each agent's short-term interaction history, available only while the agent is active.
 - [[storage-manager|Storage Manager]]: Persists agent data (interaction logs, user preferences) beyond any agent's lifetime.
 - [[tool-manager|Tool Manager]]: Manages the external API tools agents may call, spanning text and image modalities.
+
+## Agent systems research (11)
+
+From the two 2026 agent papers. Their OS value is in each page's Agentic OS relevance section.
+
+- [[agent-collaboration-patterns|Four Agent Collaboration Patterns]]: Sequential, Mixture, Distillation and Deliberation, the four topologies into which RecursiveMAS is instantiated.
+- [[bandit-search-policy-with-forking|Bandit Search Policy with Periodic Forking]]: UCB1 over labeled drafting strategies, plus a fork of the global best every five steps, replacing greedy best-first search.
+- [[harness-robustness-mechanisms|Harness Robustness Mechanisms]]: Prompt guards, a selection rule that penalizes lucky scores, and a repair of a broken evaluation script.
+- [[inner-outer-loop-training|Inner-Outer Loop Training]]: Warm-start each agent's inner link, then unroll the whole agent loop and train only the outer links with frozen models.
+- [[latent-vs-text-agent-communication|Latent versus Text Inter-Agent Communication]]: The decode-cost argument and measured comparison between passing hidden states and passing decoded text.
+- [[private-held-out-grading|Private Held-Out Grading]]: The inner agent optimizes a public signal while the outer loop selects on a private score it never sees.
+- [[recursion-depth-scaling|Recursion-Depth Scaling]]: Accuracy rises with the number of recursion rounds, at a growing wall-clock cost.
+- [[recursive-multi-agent-system|Recursive Multi-Agent System]]: A multi-agent system cast as one looped latent-space computation.
+- [[recursive-self-improvement-loop|Recursive Self-Improvement Loop]]: An outer loop rewrites a research agent and keeps a rewrite only if its private grade improves.
+- [[recursivelink|RecursiveLink]]: A two-layer residual projection that passes latent states inside an agent and between agents without decoding to text.
+- [[reward-hacking-measurement|Reward Hacking Measured by Proxy-to-Downstream Gap]]: A gain on the optimized signal that does not survive downstream, measured on GPU kernels.
 
 ## Virtualization (28)
 

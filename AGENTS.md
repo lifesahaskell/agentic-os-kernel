@@ -72,3 +72,10 @@ but each one should be linked from at least `index.md`. Check a sample of citati
   filename. Later AIOS versions exist and are not ingested.
 - `ostep`: *Operating Systems: Three Easy Pieces*, Arpaci-Dusseau, 829-page PDF including
   Reiher's security chapters. Concept pages only, no per-chapter pages (decided 2026-10-23).
+- `recursivemas`: `raw/RecursiveAgents.pdf` is *Recursive Multi-Agent Systems* (Yang, Zou et al.),
+  arXiv 2604.25917 **v1 (28 April 2026)**, 36 pp. The filename does not carry the slug. Later
+  versions are not ingested.
+- `aide2`: `raw/RecursiveSelfImprovement.pdf` is *Recursive self-improvement of AI research
+  agents* (Srikanth et al., Weco AI), arXiv 2609.26457 **v1 (22 September 2026)**, 28 pp. The
+  filename does not carry the slug. Later versions are not ingested. Both are ML-agent papers,
+  not OS papers: their OS value is in the `## Agentic OS relevance` sections.
