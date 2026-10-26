@@ -45,10 +45,6 @@ struct Armed {
     /// Counts against `MAX_ARMED_PER_AGENT`.
     agent: u64,
     /// The address space the arming thread ran in, so a dying space can drop its timers.
-    #[allow(
-        dead_code,
-        reason = "plan 02-06 drops a dying space's timers by this field"
-    )]
     owner: Option<Weak<VmSpace>>,
 }
 
@@ -111,6 +107,30 @@ pub fn arm(t: &Thread, ep: Arc<Endpoint>, delay_ms: u64, cookie: u64) -> Result<
     Ok(id)
 }
 
+/// Removes every armed timer whose arming thread ran in `vm`, so a process that ends leaves no
+/// timer to fire into a dead space (OD-04). The entries drop after the lock is released.
+pub(crate) fn drop_space(vm: &VmSpace) {
+    let gone: Vec<Armed> = {
+        let mut armed = ARMED.lock();
+        let keys: Vec<(u64, u64)> = armed
+            .iter()
+            .filter(|(_, a)| {
+                a.owner
+                    .as_ref()
+                    .is_some_and(|w| core::ptr::eq(w.as_ptr(), vm))
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        keys.into_iter().filter_map(|k| armed.remove(&k)).collect()
+    };
+    drop(gone);
+}
+
+/// Timers armed and not yet sent, for the leak checks.
+pub(crate) fn armed_count() -> usize {
+    ARMED.lock().len()
+}
+
 fn kick() {
     KICK.fetch_add(1, Ordering::Release);
     TIMER_WQ.wake_all();
@@ -166,12 +186,6 @@ fn run(me: &Thread) {
 /// `SYS_TIMER_ARM`: arms a timer on the endpoint in `slot` (needs SEND); returns the timer id.
 pub fn sys_timer_arm(t: &Thread, slot: usize, delay_ms: u64, cookie: u64) -> Result<u64, IpcError> {
     arm(t, endpoint(t, slot, Rights::SEND)?, delay_ms, cookie)
-}
-
-/// Ktest-only: timers armed and not yet sent.
-#[cfg(ktest)]
-pub(crate) fn armed_len() -> usize {
-    ARMED.lock().len()
 }
 
 /// Ktest-only: forgets every armed timer, so none outlives its test and holds a deadline
@@ -253,7 +267,7 @@ mod test {
         assert_eq!(m.tag, 0x55, "the arming thread's tag");
         assert!(m.reply.is_none() && m.data.is_empty() && m.caps.is_empty());
         assert!(sent >= due && sent - due <= 2, "due {due} sent {sent}");
-        assert_eq!(armed_len(), 0);
+        assert_eq!(armed_count(), 0);
     }
 
     #[ktest]
@@ -301,7 +315,7 @@ mod test {
             arm(&t, ep.clone(), MAX_DELAY_MS + 1, 1),
             Err(IpcError::Invalid)
         );
-        assert_eq!(armed_len(), 0, "a refused arm leaves nothing behind");
+        assert_eq!(armed_count(), 0, "a refused arm leaves nothing behind");
 
         // A slot without SEND is EPERM; an empty slot is EBADF.
         let recv_only = t
@@ -339,7 +353,7 @@ mod test {
             let m = recv_within(&ep, &t, 200);
             assert_eq!((m.words[0], m.words[3]), (cookie as u64, id));
         }
-        assert_eq!(armed_len(), 0);
+        assert_eq!(armed_count(), 0);
         // The allowance is back once they have fired.
         arm(&t, ep.clone(), 1, 5).unwrap();
         assert_eq!(recv_within(&ep, &t, 100).words[0], 5);
@@ -359,7 +373,7 @@ mod test {
         while now() - start < 10 {
             Task::yield_now();
         }
-        assert_eq!(armed_len(), 1, "still pending");
+        assert_eq!(armed_count(), 1, "still pending");
         assert_eq!(ep.queue.lock().len(), Endpoint::QUEUE_LEN);
 
         // One receive frees a slot; the timer lands within 3 ticks.
@@ -374,7 +388,7 @@ mod test {
             waited
         );
         assert!(waited <= 3, "waited {waited}");
-        assert_eq!(armed_len(), 0);
+        assert_eq!(armed_count(), 0);
 
         let mut last = None;
         for _ in 0..Endpoint::QUEUE_LEN {

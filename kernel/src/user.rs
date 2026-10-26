@@ -812,6 +812,63 @@ mod test {
         assert_eq!(join(&we), Exit::Code(0));
     }
 
+    /// A `futex_waiter` image whose data frame is shared with a clone, so a futex lookup on `DATA`
+    /// must copy it. The clone is returned to keep the frame shared.
+    fn shared_data_image() -> (Image, Arc<VmSpace>) {
+        let img = new_image(user_image!("futex_waiter"), PageFlags::RW);
+        let spare = Agent::new_root(1, 64);
+        let clone =
+            cow_clone(&img.space, abi::IMAGE_BASE..DATA + PAGE_SIZE, &*spare).expect("cow_clone");
+        (img, Arc::new(clone))
+    }
+
+    #[ktest]
+    fn futex_cow_budget_is_enomem() {
+        let (img, _clone) = shared_data_image();
+        // Its payer is its agent, which has no budget for the copy.
+        let t = Thread::new(Agent::new_root(1, 0));
+        let err = futex::wake(&t, &img.space, DATA, 1).unwrap_err();
+        assert_eq!(err, futex::FutexError::Budget);
+        assert_eq!(err.errno(), 12);
+        assert_eq!(
+            crate::syscall::Errno::from(err),
+            crate::syscall::Errno::ENOMEM
+        );
+        assert_eq!(t.agent().mem_used_pages(), 0);
+    }
+
+    #[ktest]
+    fn futex_cow_bad_addresses_are_fault() {
+        let (img, _clone) = shared_data_image();
+        let t = Thread::new(Agent::new_root(1, 64));
+        for va in [
+            abi::USER_TOP - 4,
+            ostd::mm::MAX_USERSPACE_VADDR - 4,
+            abi::IMAGE_BASE - PAGE_SIZE,
+        ] {
+            assert_eq!(
+                futex::wake(&t, &img.space, va, 1),
+                Err(futex::FutexError::Fault),
+                "address {va:#x}"
+            );
+        }
+    }
+
+    #[ktest]
+    fn futex_cow_no_memory_maps_through_from() {
+        use crate::{agent::AgentError, cap::CapError, futex::FutexError};
+        // OSTD 0.19.0 cannot make a frame allocation fail, so the path from a real break that
+        // finds the allocator empty is covered by this mapping and by inspection (D-05).
+        let no_memory = FutexError::from(AgentError::NoMemory);
+        assert_eq!(no_memory, FutexError::NoMemory);
+        assert_eq!(no_memory.errno(), 12);
+        assert_eq!(FutexError::from(AgentError::Budget), FutexError::Budget);
+        assert_eq!(
+            FutexError::from(AgentError::Cap(CapError::Full)),
+            FutexError::Fault
+        );
+    }
+
     #[ktest]
     fn interrupt_aborts_futex_wait() {
         let img = image_over(

@@ -149,6 +149,9 @@ pub struct CSpace {
     slots: Vec<Option<Cap>>,
     /// Indices of `None` slots in `slots`.
     free: Vec<usize>,
+    /// Set when the owning agent retires: no capability may enter again, so a retired agent cannot
+    /// be refilled into a reference cycle.
+    closed: bool,
 }
 
 impl Default for CSpace {
@@ -165,12 +168,16 @@ impl CSpace {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            closed: false,
         }
     }
 
     /// Lowest-free reuse is not guaranteed. POSIX lowest-fd semantics belong to the fd table in
-    /// the vfs/procmgr phases, not to the CSpace.
+    /// the vfs/procmgr phases, not to the CSpace. `Full` once the space is closed.
     pub fn insert(&mut self, cap: Cap) -> Result<usize, CapError> {
+        if self.closed {
+            return Err(CapError::Full);
+        }
         if let Some(i) = self.free.pop() {
             self.slots[i] = Some(cap);
             return Ok(i);
@@ -198,9 +205,29 @@ impl CSpace {
         caps.iter().map(|c| self.insert(c.clone())).collect()
     }
 
-    /// Slots a further `insert` can still use.
+    /// Slots a further `insert` can still use: none once the space is closed.
     pub fn room(&self) -> usize {
+        if self.closed {
+            return 0;
+        }
         self.free.len() + (Self::MAX_SLOTS - self.slots.len())
+    }
+
+    /// Occupied slots.
+    pub fn live(&self) -> usize {
+        self.slots.len() - self.free.len()
+    }
+
+    /// Takes every capability out, leaving the space empty. The caller drops them after it has
+    /// released whatever lock guards this space: dropping one can drop a Space or an Agent.
+    pub fn drain(&mut self) -> Vec<Cap> {
+        self.free.clear();
+        self.slots.drain(..).flatten().collect()
+    }
+
+    /// Refuses every later `insert`.
+    pub fn close(&mut self) {
+        self.closed = true;
     }
 
     pub fn remove(&mut self, slot: usize) -> Result<Cap, CapError> {

@@ -19,6 +19,7 @@ use ostd::{
 };
 
 use crate::{
+    agent::AgentError,
     thread::{BlockError, Thread},
     vm::handle_cow_fault,
 };
@@ -32,8 +33,10 @@ pub enum FutexError {
     Inval,
     Interrupted,
     TimedOut,
-    /// Breaking copy-on-write exceeded the agent's memory budget.
+    /// Breaking copy-on-write exceeded the payer's memory budget.
     Budget,
+    /// Breaking copy-on-write found the frame allocator empty.
+    NoMemory,
 }
 
 impl FutexError {
@@ -44,7 +47,20 @@ impl FutexError {
             Self::Inval => 22,
             Self::Interrupted => 4,
             Self::TimedOut => 110,
-            Self::Budget => 12,
+            Self::Budget | Self::NoMemory => 12,
+        }
+    }
+}
+
+impl From<AgentError> for FutexError {
+    fn from(e: AgentError) -> Self {
+        match e {
+            AgentError::Budget => Self::Budget,
+            AgentError::NoMemory => Self::NoMemory,
+            // A copy-on-write break touches no capability table.
+            AgentError::Cap(_) => Self::Fault,
+            // The process is gone, so its budget is as good as spent.
+            AgentError::Retired => Self::Budget,
         }
     }
 }
@@ -81,18 +97,28 @@ fn lookup(space: &VmSpace, t: &Thread, va: Vaddr) -> Result<(UFrame, usize), Fut
     if !va.is_multiple_of(4) {
         return Err(FutexError::Inval);
     }
-    // The address is user-supplied; the cursors below unwrap on a range outside user space.
+    // The address is user-supplied: a range outside user space is a fault before any cursor.
     if !is_in_user_space(va, 4) {
         return Err(FutexError::Fault);
     }
-    handle_cow_fault(space, &*t.payer(), va).map_err(|_| FutexError::Budget)?;
+    handle_cow_fault(space, &*t.payer(), va)?;
     let page = va & !(PAGE_SIZE - 1);
     let guard = disable_preempt();
-    let mut c = space.cursor(&guard, &(page..page + PAGE_SIZE)).unwrap();
-    match c.query().unwrap().1 {
+    let mut c = space
+        .cursor(&guard, &(page..page + PAGE_SIZE))
+        .map_err(|_| FutexError::Fault)?;
+    let Ok((_, item)) = c.query() else {
+        return Err(FutexError::Fault);
+    };
+    match item {
         Some(VmQueriedItem::MappedRam { frame, .. }) => Ok(((*frame).clone(), va - page)),
         _ => Err(FutexError::Fault),
     }
+}
+
+/// Keys in the wait table, for the leak checks: a bucket lives only while it has a waiter.
+pub(crate) fn table_len() -> usize {
+    TABLE.lock().len()
 }
 
 fn pop(tab: &mut BTreeMap<usize, Bucket>, key: usize, n: usize) -> Vec<Arc<Waiter>> {

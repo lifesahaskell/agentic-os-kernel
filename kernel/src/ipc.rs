@@ -11,17 +11,18 @@ use alloc::{
 use core::{
     fmt,
     mem::offset_of,
-    sync::atomic::{AtomicU32, Ordering},
+    ops::Deref,
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 use abi::{IpcArgs, LABEL_CANCEL, LABEL_KERNEL_BASE, MAX_IPC_CAPS};
 use ostd::{
-    mm::VmSpace,
+    mm::{PAGE_SIZE, VmSpace},
     sync::{SpinLock, WaitQueue},
 };
 
 use crate::{
-    agent::{Agent, Credential},
+    agent::{Agent, Credential, Payer},
     cap::{Cap, CapError, Object, Rights},
     syscall::{Errno, Handle, UserPtr, UserSlice},
     thread::{BlockError, Thread},
@@ -29,6 +30,58 @@ use crate::{
 };
 
 pub mod timer;
+
+/// Pages charged for staged bytes, returned when the last holder of the charge drops.
+struct StagingCharge {
+    payer: Arc<dyn Payer>,
+    pages: usize,
+}
+
+impl Drop for StagingCharge {
+    fn drop(&mut self) {
+        self.payer.uncharge_pages(self.pages);
+    }
+}
+
+/// Bytes copied into kernel memory for a message or an answer. Bytes a ring-3 caller staged
+/// carry the charge for their pages, so a client cannot pin kernel heap for free; it is returned
+/// once, when the last copy is dropped. Bytes the kernel makes itself carry no charge.
+#[derive(Clone, Default)]
+pub struct Staged {
+    bytes: Vec<u8>,
+    /// Held for its `Drop`, which uncharges.
+    _charge: Option<Arc<StagingCharge>>,
+}
+
+impl Deref for Staged {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl From<Vec<u8>> for Staged {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            _charge: None,
+        }
+    }
+}
+
+impl fmt::Debug for Staged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Staged({} bytes)", self.bytes.len())
+    }
+}
+
+impl Staged {
+    /// The bytes as an owned `Vec`, uncharged; the charge ends with the last `Staged` copy.
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.bytes.clone()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -38,7 +91,7 @@ pub struct Message {
     pub tag: u64,
     pub words: [u64; 4],
     /// The bytes of the sender's `send_buf`, copied at send time.
-    pub data: Vec<u8>,
+    pub data: Staged,
     /// Chosen by the sender and opaque to the kernel, unlike `sender`.
     pub label: u64,
     /// Attenuated copies taken from the sender's capability space at send time; the receiver
@@ -67,8 +120,17 @@ enum ReplyState {
 /// rights).
 pub struct Answer {
     pub words: [u64; 4],
-    pub data: Vec<u8>,
+    pub data: Staged,
     pub caps: Vec<(usize, Rights)>,
+}
+
+/// Reply waits that exist, parked in a reply table or in flight: raised by `ReplyWait::new`,
+/// lowered when one is dropped.
+static LIVE_REPLY_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+/// Reply waits that exist now, for the leak checks.
+pub(crate) fn live_reply_waits() -> usize {
+    LIVE_REPLY_WAITS.load(Ordering::Acquire)
 }
 
 /// The rendezvous between a `call`er blocked for its answer and the server that replies.
@@ -78,8 +140,15 @@ pub struct ReplyWait {
     wq: WaitQueue,
 }
 
+impl Drop for ReplyWait {
+    fn drop(&mut self) {
+        LIVE_REPLY_WAITS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl ReplyWait {
     fn new(caller: Weak<Thread>) -> Arc<Self> {
+        LIVE_REPLY_WAITS.fetch_add(1, Ordering::AcqRel);
         Arc::new(Self {
             state: SpinLock::new(ReplyState::Queued),
             caller,
@@ -95,13 +164,13 @@ impl ReplyWait {
 
     pub fn reply_with(&self, words: [u64; 4], data: Vec<u8>) {
         // Nothing to install, so the one failure (no room) cannot happen.
-        let _ = self.deliver(words, data, &[]);
+        let _ = self.deliver(words, data.into(), &[]);
     }
 
     /// `reply_with` plus `caps`, installed in the caller's agent: all of them or none (`NoRoom`,
     /// nothing delivered, the caller keeps waiting). A caller that no longer exists, or a wait that
     /// is already done or failed, gets nothing: the payload is dropped.
-    fn deliver(&self, words: [u64; 4], data: Vec<u8>, caps: &[Cap]) -> Result<(), IpcError> {
+    fn deliver(&self, words: [u64; 4], data: Staged, caps: &[Cap]) -> Result<(), IpcError> {
         let Some(caller) = self.caller.upgrade() else {
             return Ok(());
         };
@@ -297,7 +366,7 @@ impl Endpoint {
         data: Vec<u8>,
     ) -> Result<([u64; 4], Vec<u8>), IpcError> {
         let a = self.call_caps(from, label, words, data, Vec::new())?;
-        Ok((a.words, a.data))
+        Ok((a.words, a.data.to_vec()))
     }
 
     /// `call_bulk` that also carries `caps` (already derived from the caller's space) and
@@ -307,9 +376,10 @@ impl Endpoint {
         from: &Thread,
         label: u64,
         words: [u64; 4],
-        data: Vec<u8>,
+        data: impl Into<Staged>,
         caps: Vec<Cap>,
     ) -> Result<Answer, IpcError> {
+        let data = data.into();
         self.call_via(from, |reply| {
             self.push(from, label, words, data, caps, Some(reply))
         })
@@ -392,7 +462,7 @@ impl Endpoint {
         from: &Thread,
         label: u64,
         words: [u64; 4],
-        data: Vec<u8>,
+        data: impl Into<Staged>,
         caps: Vec<Cap>,
         reply: Option<Arc<ReplyWait>>,
     ) -> Result<(), IpcError> {
@@ -405,7 +475,7 @@ impl Endpoint {
             tid: from.tid(),
             tag: from.tag(),
             words,
-            data,
+            data: data.into(),
             label,
             caps,
             reply,
@@ -429,7 +499,7 @@ impl Endpoint {
             tid: 0,
             tag,
             words,
-            data: Vec::new(),
+            data: Staged::default(),
             label,
             caps: Vec::new(),
             reply: None,
@@ -464,7 +534,7 @@ impl Endpoint {
                 tid: from.tid(),
                 tag: from.tag(),
                 words,
-                data: Vec::new(),
+                data: Staged::default(),
                 label,
                 caps: Vec::new(),
                 reply,
@@ -589,7 +659,7 @@ fn cancel_message(me: &Thread) -> Message {
         tid: 0,
         tag: 0,
         words: [0; 4],
-        data: Vec::new(),
+        data: Staged::default(),
         label: LABEL_CANCEL,
         caps: Vec::new(),
         reply: None,
@@ -676,14 +746,23 @@ fn user_slice(addr: u64, len: u64) -> Result<UserSlice, Errno> {
 }
 
 /// Copies the caller's bytes into kernel memory, in the caller's own context.
-// shortcut: staging memory is not charged to the sender's agent, so a client can pin
-// MAX_IPC_BYTES * QUEUE_LEN of kernel heap per endpoint; Phase 2 resource accounting charges it.
-fn read_bytes(space: &VmSpace, src: UserSlice) -> Result<Vec<u8>, Errno> {
-    let mut buf = vec![0u8; src.len()];
-    if !buf.is_empty() {
-        copy_from_user(space, &mut buf, src)?;
+/// The pages are charged to `payer` before the allocation, so a refusal is ENOMEM with nothing
+/// allocated; the returned `Staged` gives them back when the last copy drops. Zero bytes charge
+/// nothing.
+fn read_bytes(space: &VmSpace, src: UserSlice, payer: Arc<dyn Payer>) -> Result<Staged, Errno> {
+    if src.is_empty() {
+        return Ok(Staged::default());
     }
-    Ok(buf)
+    let pages = src.len().div_ceil(PAGE_SIZE);
+    payer.charge_pages(pages)?;
+    // From here the charge is owned by `charge`, so every exit returns it.
+    let charge = Arc::new(StagingCharge { payer, pages });
+    let mut bytes = vec![0u8; src.len()];
+    copy_from_user(space, &mut bytes, src)?;
+    Ok(Staged {
+        bytes,
+        _charge: Some(charge),
+    })
 }
 
 /// Writes the first `min(data.len(), dst.len())` bytes of `data` to `dst`, breaking
@@ -742,7 +821,7 @@ pub fn sys_call(
         user_slice(a.send_buf, a.send_len)?,
         user_slice(a.recv_buf, a.recv_len)?,
     );
-    let data = read_bytes(space, send)?;
+    let data = read_bytes(space, send, t.payer())?;
     let caps = derive_caps(t, &arg_caps(&a))?;
     let r = ep.call_caps(t, a.label, a.words, data, caps)?;
     let delivered = write_bytes(t, space, recv, &r.data)
@@ -825,7 +904,7 @@ pub fn sys_recv_args(
 /// `send_buf` and the capabilities named in `a.caps`, copied and derived in the server's context.
 /// A bad buffer, a bad capability or a full caller space leaves the handle usable.
 fn answer(t: &Thread, space: &VmSpace, a: &IpcArgs) -> Result<(), Errno> {
-    let data = read_bytes(space, user_slice(a.send_buf, a.send_len)?)?;
+    let data = read_bytes(space, user_slice(a.send_buf, a.send_len)?, t.payer())?;
     let caps = derive_caps(t, &arg_caps(a))?;
     let w = t
         .replies
@@ -1007,7 +1086,7 @@ mod test {
             (D + 1..=D + 3).contains(&elapsed),
             "parked elapsed {elapsed}"
         );
-        assert_eq!(crate::thread::pending_deadlines(), 0);
+        assert_eq!(crate::thread::deadline_count(), 0);
     }
 
     #[ktest]
@@ -1020,12 +1099,12 @@ mod test {
         sys_send(&client, 0, [5, 0, 0, 0]).unwrap();
         let m = ep.recv_until(&server, far()).unwrap();
         assert_eq!(m.words[0], 5);
-        assert_eq!(crate::thread::pending_deadlines(), 0);
+        assert_eq!(crate::thread::deadline_count(), 0);
 
         sys_send(&client, 0, [6, 0, 0, 0]).unwrap();
         let (m, handle) = ep.recv_parked_until(&server, far()).unwrap();
         assert_eq!((m.words[0], handle), (6, 0));
-        assert_eq!(crate::thread::pending_deadlines(), 0);
+        assert_eq!(crate::thread::deadline_count(), 0);
 
         // Sent while the receiver is blocked, well inside the deadline.
         let result: Arc<SpinLock<Option<Result<Message, IpcError>>>> =
@@ -1040,7 +1119,7 @@ mod test {
             Task::yield_now();
         }
         assert_eq!(result.lock().take().unwrap().unwrap().words[0], 7);
-        assert_eq!(crate::thread::pending_deadlines(), 0);
+        assert_eq!(crate::thread::deadline_count(), 0);
     }
 
     #[ktest]
@@ -1770,5 +1849,181 @@ mod test {
         println!("aok: null-ipc tsc_freq={} Hz", ostd::arch::tsc_freq());
         assert_eq!(n, 10_000);
         assert!(median > 0);
+    }
+
+    /// Pages one `bulk` request occupies: 3 * 4096 + 123 bytes.
+    const BULK_PAGES: usize = 4;
+
+    /// A ring-3 `bulk` client of a root agent with `budget` pages, run straight in the loaded
+    /// image (no clone, so it takes no copy-on-write breaks of its own). Returns once its one call
+    /// is queued on the endpoint, unanswered, or its run has ended.
+    struct BulkCall {
+        ep: Arc<Endpoint>,
+        client: Arc<Agent>,
+        server: Arc<Thread>,
+        exit: crate::user::testkit::ExitSlot,
+    }
+
+    fn bulk_call(budget: usize) -> BulkCall {
+        let ep = Endpoint::new();
+        let server = Thread::new(agent_with(&ep));
+        let client = Agent::new_root(1, budget);
+        let cap = Cap::new(Object::Endpoint(ep.clone()), Rights::SEND);
+        assert_eq!(client.cspace.lock().insert(cap).unwrap(), 0);
+        let img = load_image(user_image!("bulk")).unwrap();
+        let exit = spawn_image(&Thread::new(client.clone()), &img, 0);
+        let mut spins = 0usize;
+        while ep.queued() == 0 && exit.lock().is_none() {
+            spins += 1;
+            assert!(spins < 1_000_000, "the client neither called nor exited");
+            Task::yield_now();
+        }
+        BulkCall {
+            ep,
+            client,
+            server,
+            exit,
+        }
+    }
+
+    #[ktest]
+    fn staging_charges_the_sender_until_consumed() {
+        let call = bulk_call(16);
+        assert_eq!(call.ep.queued(), 1);
+        let queued = call.client.mem_used_pages();
+        assert!(queued >= BULK_PAGES, "the queued request is not charged");
+
+        let m = call.ep.recv(&call.server).unwrap();
+        assert_eq!(
+            call.client.mem_used_pages(),
+            queued,
+            "received is not freed"
+        );
+        let reply = m.reply.clone().unwrap();
+        drop(m);
+        assert_eq!(
+            call.client.mem_used_pages(),
+            queued - BULK_PAGES,
+            "consumed and dropped, the pages are back"
+        );
+        // Nothing is answered with: the client's own check of the reply fails, which this test
+        // does not look at.
+        reply.reply([0; 4]);
+        join(&call.exit);
+    }
+
+    #[ktest]
+    fn staging_over_budget_is_enomem() {
+        // Room for three of the four pages the request needs.
+        let call = bulk_call(BULK_PAGES - 1);
+        assert_eq!(call.ep.queued(), 0, "the over-budget request was queued");
+        assert_eq!(join(&call.exit), Exit::Code(0x1_0000 | 12));
+        assert_eq!(call.client.mem_used_pages(), 0);
+    }
+
+    #[ktest]
+    fn staging_clone_uncharges_once() {
+        let call = bulk_call(16);
+        let queued = call.client.mem_used_pages();
+        let m = call.ep.recv(&call.server).unwrap();
+        let (a, b) = (m.clone(), m);
+        drop(a);
+        assert_eq!(
+            call.client.mem_used_pages(),
+            queued,
+            "the last clone is alive"
+        );
+        let reply = b.reply.clone();
+        drop(b);
+        assert_eq!(
+            call.client.mem_used_pages(),
+            queued - BULK_PAGES,
+            "uncharged once, after the last clone"
+        );
+        reply.unwrap().reply([0; 4]);
+        join(&call.exit);
+    }
+
+    #[ktest]
+    fn staging_kernel_built_messages_are_uncharged() {
+        let ep = Endpoint::new();
+        let agent = Agent::new_root(1, 0);
+        let t = Thread::new(agent.clone());
+        // Queued bytes from kernel code: an agent with no budget at all sends them, and
+        // receiving and dropping them refunds nothing, so the count cannot underflow.
+        ep.push(
+            &t,
+            1,
+            [0; 4],
+            vec![7u8; 2 * PAGE_SIZE + 1],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(agent.mem_used_pages(), 0);
+        let m = ep.recv(&t).unwrap();
+        assert_eq!(m.data.len(), 2 * PAGE_SIZE + 1);
+        drop(m);
+        assert_eq!(agent.mem_used_pages(), 0);
+
+        // A note and a kernel message carry no bytes at all.
+        ep.push_note(&t, abi::LABEL_KERNEL_BASE, [0; 4], None)
+            .unwrap();
+        assert!(ep.recv(&t).unwrap().data.is_empty());
+    }
+
+    #[ktest]
+    fn staging_kernel_cow_writes_enter_the_process_ledger() {
+        use crate::space::Space;
+
+        let parent = load_image(user_image!("bulk")).unwrap();
+        let owner = Agent::new_root(1, 64);
+        let space = Space::from_clone(
+            &parent.space,
+            abi::IMAGE_BASE..abi::USER_STACK_TOP,
+            owner.clone(),
+        )
+        .expect("from_clone");
+        let t = Thread::new(owner.clone());
+        t.set_process(space.clone());
+        let nodes = owner.mem_used_pages();
+        assert!(nodes > 0, "the clone's page-table nodes are charged (D-07)");
+
+        // Three distinct copy-on-write pages in the writable part of the image.
+        let pages: Vec<usize> = (0..3).map(|i| parent.text.end + i * PAGE_SIZE).collect();
+        space.vm().activate();
+        write_bytes(
+            &t,
+            space.vm(),
+            user_slice(pages[0] as u64, 8).unwrap(),
+            &[1; 8],
+        )
+        .unwrap();
+        assert_eq!(
+            owner.mem_used_pages(),
+            nodes + 1,
+            "write_bytes breaks one page"
+        );
+        write_len(&t, space.vm(), UserPtr::new(pages[1]).unwrap(), 5).unwrap();
+        assert_eq!(
+            owner.mem_used_pages(),
+            nodes + 2,
+            "write_args breaks one page"
+        );
+        assert_eq!(crate::futex::wake(&t, space.vm(), pages[2], 1), Ok(0));
+        assert_eq!(
+            owner.mem_used_pages(),
+            nodes + 3,
+            "a futex lookup breaks one page"
+        );
+
+        parent.space.activate();
+        drop(t);
+        drop(space);
+        assert_eq!(
+            owner.mem_used_pages(),
+            0,
+            "teardown refunds copies and nodes"
+        );
     }
 }

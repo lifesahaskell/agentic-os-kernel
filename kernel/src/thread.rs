@@ -59,12 +59,6 @@ fn arm_deadline_timer() {
     });
 }
 
-/// Ktest-only: how many deadline waiters are registered. A wait that ended leaves none behind.
-#[cfg(ktest)]
-pub(crate) fn pending_deadlines() -> usize {
-    DEADLINES.lock().len()
-}
-
 /// Ktest-only hook for forcing a wake-versus-interrupt interleaving inside `block_until`: the
 /// closure runs on the blocking thread when execution reaches the numbered point (1: waker
 /// published; 2: condition false, about to sleep; 3: wait over, waker not yet cleared).
@@ -100,6 +94,25 @@ pub(crate) static FPU_SWAP_DISABLED: core::sync::atomic::AtomicBool =
 /// The next thread id. Never reused, so a tid names one thread for the life of the kernel.
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
+/// Threads that exist: raised by `new_tagged`, lowered when one is dropped.
+static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Threads that exist now, for the leak checks.
+pub(crate) fn live_threads() -> usize {
+    LIVE_THREADS.load(Ordering::Acquire)
+}
+
+/// Deadline waiters registered now. A wait that ended leaves none behind.
+pub(crate) fn deadline_count() -> usize {
+    DEADLINES.lock().len()
+}
+
+/// 1 when `FPU_OWNER` holds a context, 0 otherwise. The slot keeps the last user thread's context
+/// until another thread runs, so it is bounded by 1, not zero.
+pub(crate) fn fpu_owner_count() -> usize {
+    usize::from(FPU_OWNER.lock().is_some())
+}
+
 pub struct Thread {
     /// This thread's own `Arc`, so a wait that outlives a borrow can name it weakly.
     me: Weak<Thread>,
@@ -126,6 +139,12 @@ pub struct Thread {
     state: SpinLock<State, LocalIrqDisabled>,
 }
 
+impl Drop for Thread {
+    fn drop(&mut self) {
+        LIVE_THREADS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl Thread {
     pub fn new(agent: Arc<Agent>) -> Arc<Self> {
         Self::new_tagged(agent, 0)
@@ -134,6 +153,7 @@ impl Thread {
     /// A thread whose messages carry `tag`. This is the kernel half of `thread_create` until
     /// Phase 2 adds Thread capabilities.
     pub fn new_tagged(agent: Arc<Agent>, tag: u64) -> Arc<Self> {
+        LIVE_THREADS.fetch_add(1, Ordering::AcqRel);
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             agent,
