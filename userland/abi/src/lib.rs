@@ -8,6 +8,8 @@
 pub const SYS_SCHED_YIELD: usize = 24;
 pub const SYS_EXIT: usize = 60;
 pub const SYS_FUTEX: usize = 202;
+/// The `SYS_FUTEX` operation (`a[1]`) that sleeps while the word at `a[0]` still holds `a[2]`.
+pub const FUTEX_WAIT: usize = 0;
 pub const SYS_CALL: usize = 0x100;
 pub const SYS_RECV: usize = 0x101;
 pub const SYS_REPLY: usize = 0x102;

@@ -466,7 +466,9 @@ mod test {
         cap::{Cap, Object, Rights},
         futex,
         ipc::{Endpoint, Message, sys_recv},
-        user::testkit::{join, recv_note, spawn_image, spawn_image_in, wait_blocked},
+        space::{SpaceError, thread_interrupt},
+        syscall::Errno,
+        user::testkit::{join, join_thread, recv_note, spawn_image, spawn_image_in, wait_blocked},
         vm::cow_clone,
     };
 
@@ -694,6 +696,91 @@ mod test {
         let _guard = Uncorrupt;
         crate::thread::CORRUPT_FRAME.store(2, core::sync::atomic::Ordering::Relaxed);
         assert_eq!(run_sigframe(), Exit::Code(20));
+    }
+
+    /// A `sigreturn` mode 4 thread in a space of its own, and a caller whose capability space
+    /// holds a Thread capability (SIGNAL) for it, as `SYS_THREAD_INTERRUPT` needs.
+    fn mode4_rig() -> (Arc<Space>, Arc<Thread>, Arc<Thread>, usize, Image) {
+        crate::sched::install_space_switch();
+        let img = load_image(user_image!("sigreturn")).unwrap();
+        let owner = Agent::new_root(1, 0);
+        let space = Space::new(img.space.clone(), owner.clone());
+        let th = Thread::new(owner);
+        space.register(&th).unwrap();
+        let start = ThreadStart {
+            rip: img.entry as u64,
+            rsp: USER_STACK_TOP as u64,
+            arg: 4,
+            fs_base: 0,
+            clear_tid: 0,
+        };
+        spawn_thread(&space, th.clone(), start);
+        let holder = Agent::new_root(2, 0);
+        let slot = holder
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Thread(th.downgrade()), Rights::SIGNAL))
+            .unwrap();
+        (space, th, Thread::new(holder), slot, img)
+    }
+
+    /// Interrupts `th` `n` times, waiting for each handler to start before the next.
+    fn nest(th: &Arc<Thread>, caller: &Thread, slot: usize, handler: usize, n: usize) {
+        for i in 1..=n {
+            thread_interrupt(caller, slot, handler).unwrap();
+            let mut spins = 0usize;
+            while th.frame_depth() < i {
+                spins += 1;
+                assert!(spins < 1000, "redirect {i} never reached its handler");
+                Task::yield_now();
+            }
+        }
+    }
+
+    #[ktest]
+    fn sigreturn_nests_to_depth_8_then_eagain() {
+        let (space, th, caller, slot, img) = mode4_rig();
+        nest(&th, &caller, slot, img.handler, crate::thread::MAX_FRAMES);
+        assert_eq!(th.frame_depth(), crate::thread::MAX_FRAMES);
+
+        let full = thread_interrupt(&caller, slot, img.handler).err();
+        assert_eq!(full, Some(SpaceError::Limit));
+        assert_eq!(Errno::from(SpaceError::Limit), Errno::EAGAIN);
+        assert_eq!(th.frame_depth(), crate::thread::MAX_FRAMES, "the refusal pushed nothing");
+
+        space.kill();
+        assert_eq!(join_thread(&th), Exit::Killed);
+    }
+
+    /// A blocked call interrupted and then returned from sees `EINTR` in `rax`: the frame saved
+    /// the syscall result, and `SYS_SIGRETURN` gives it back.
+    #[ktest]
+    fn sigreturn_after_a_blocked_call_returns_eintr() {
+        let img = load_image(user_image!("sigreturn")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 0));
+        let exit = spawn_image(&t, &img, 2);
+        wait_blocked(&t, &exit);
+        t.interrupt(img.handler);
+        assert_eq!(join(&exit), Exit::Code(abi::errno::EINTR as usize));
+        assert_eq!(t.frame_depth(), 0);
+    }
+
+    #[ktest]
+    fn sigreturn_frames_dropped_at_kill() {
+        let (space, th, caller, slot, img) = mode4_rig();
+        nest(&th, &caller, slot, img.handler, 3);
+        assert_eq!(th.frame_depth(), 3);
+
+        space.kill();
+        assert_eq!(join_thread(&th), Exit::Killed);
+        // `retire` runs after the exit is recorded; the reap that follows empties the space.
+        let mut spins = 0usize;
+        while space.live_threads() != 0 {
+            spins += 1;
+            assert!(spins < 1_000_000, "the thread was never reaped");
+            Task::yield_now();
+        }
+        assert_eq!(th.frame_depth(), 0, "a dead thread holds no frames");
     }
 
     /// A data frame whose first byte is `first`.
