@@ -1,11 +1,14 @@
 //! Capability space: rights-masked handles, attenuating derive, and per-grant revocation through
 //! forwarders (EROS/Coyotos style, see docs/architecture/option-b-microkernel.md section 2.2).
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 
 use ostd::sync::SpinLock;
 
-use crate::{agent::Agent, ipc::Endpoint};
+use crate::{agent::Agent, ipc::Endpoint, space::Space, thread::Thread};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rights(u32);
@@ -16,7 +19,11 @@ impl Rights {
     pub const RECV: Self = Self(2);
     /// May derive or grant copies of this capability.
     pub const GRANT: Self = Self(4);
-    pub const ALL: Self = Self(7);
+    /// May start threads in the Space this capability names.
+    pub const CREATE: Self = Self(8);
+    /// May interrupt the Thread this capability names.
+    pub const SIGNAL: Self = Self(16);
+    pub const ALL: Self = Self(31);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -40,6 +47,10 @@ impl Rights {
 pub enum Object {
     Endpoint(Arc<Endpoint>),
     Agent(Arc<Agent>),
+    /// A process: an address space and the agent that owns it. The capability keeps it alive.
+    Space(Arc<Space>),
+    /// A thread, held weakly: a Thread capability never keeps a thread or its agent alive (OD-14).
+    Thread(Weak<Thread>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -229,6 +240,30 @@ mod test {
             c.grant_revocable(Rights::SEND).err(),
             Some(CapError::Rights)
         );
+    }
+
+    #[ktest]
+    fn rights_include_create_and_signal() {
+        let all = Rights::from_bits(31);
+        for r in [
+            Rights::SEND,
+            Rights::RECV,
+            Rights::GRANT,
+            Rights::CREATE,
+            Rights::SIGNAL,
+        ] {
+            assert!(all.contains(r), "{r:?}");
+        }
+        assert_eq!(all, Rights::ALL);
+        assert_eq!(Rights::from_bits(32), Rights::NONE, "bit 5 is undefined");
+
+        // A Space capability derived with only SIGNAL can no longer create.
+        let space = Space::new(Arc::new(ostd::mm::VmSpace::new()), Agent::new_root(1, 0));
+        let c = Cap::new(Object::Space(space), Rights::ALL);
+        let d = c.derive(Rights::SIGNAL).unwrap();
+        assert_eq!(d.rights(), Rights::SIGNAL);
+        assert_eq!(d.resolve(Rights::CREATE).err(), Some(CapError::Rights));
+        assert!(d.resolve(Rights::SIGNAL).is_ok());
     }
 
     #[ktest]

@@ -12,6 +12,7 @@ pub mod cap;
 pub mod futex;
 pub mod ipc;
 pub mod sched;
+pub mod space;
 pub mod syscall;
 pub mod thread;
 pub mod user;

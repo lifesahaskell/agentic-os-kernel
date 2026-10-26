@@ -8,8 +8,9 @@
 use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
-    IpcArgs, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_RECV, SYS_REPLY,
-    SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_TIMER_ARM, Timespec, USER_TOP, errno,
+    IpcArgs, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SPACE_SELF, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_RECV,
+    SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_THREAD_CREATE, SYS_THREAD_INTERRUPT,
+    SYS_TIMER_ARM, THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP, errno,
 };
 use ostd::{mm::VmSpace, task::Task, timer::Jiffies};
 
@@ -18,8 +19,9 @@ use crate::{
     cap::CapError,
     futex::{self, FutexError},
     ipc::{self, IpcError},
+    space::{self, SpaceError, Target, ThreadStart},
     thread::Thread,
-    vm::copy_from_user,
+    vm::{copy_from_user, copy_to_user},
 };
 
 /// A positive errno value; `dispatch` returns it negated.
@@ -28,6 +30,7 @@ pub struct Errno(pub isize);
 
 impl Errno {
     pub const EPERM: Errno = Errno(errno::EPERM);
+    pub const ESRCH: Errno = Errno(errno::ESRCH);
     pub const EINTR: Errno = Errno(errno::EINTR);
     pub const EBADF: Errno = Errno(errno::EBADF);
     pub const EAGAIN: Errno = Errno(errno::EAGAIN);
@@ -75,6 +78,19 @@ impl From<AgentError> for Errno {
             AgentError::Budget => Errno::ENOMEM,
             AgentError::NoMemory => Errno::ENOMEM,
             AgentError::Cap(c) => c.into(),
+        }
+    }
+}
+
+impl From<SpaceError> for Errno {
+    fn from(e: SpaceError) -> Self {
+        match e {
+            SpaceError::Cap(c) => c.into(),
+            SpaceError::WrongType | SpaceError::Invalid => Errno::EINVAL,
+            SpaceError::Dead => Errno::ESRCH,
+            SpaceError::Limit => Errno::EAGAIN,
+            SpaceError::NoRoom => Errno::EMFILE,
+            SpaceError::Fault => Errno::EFAULT,
         }
     }
 }
@@ -230,6 +246,16 @@ pub enum Syscall {
         delay_ms: u64,
         cookie: u64,
     },
+    /// Starts a thread in a space; the `ThreadCtx` at `ctx` says where.
+    ThreadCreate {
+        target: Target,
+        ctx: UserPtr<ThreadCtx>,
+        tag: u64,
+    },
+    ThreadInterrupt {
+        thread: Handle,
+        entry: usize,
+    },
 }
 
 const FUTEX_WAIT: usize = 0;
@@ -306,6 +332,20 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
             delay_ms: a[1] as u64,
             cookie: a[2] as u64,
         },
+        SYS_THREAD_CREATE => Syscall::ThreadCreate {
+            target: if a[0] as u64 == SPACE_SELF {
+                Target::SelfSpace
+            } else {
+                Target::Slot(Handle::new(a[0])?.index())
+            },
+            ctx: UserPtr::new(a[1])?,
+            tag: a[2] as u64,
+        },
+        // The entry address is range-checked by `space::thread_interrupt`, after the slot resolves.
+        SYS_THREAD_INTERRUPT => Syscall::ThreadInterrupt {
+            thread: Handle::new(a[0])?,
+            entry: a[1],
+        },
         _ => return Err(Errno::ENOSYS),
     })
 }
@@ -372,6 +412,40 @@ fn futex_wait(
     )?)
 }
 
+/// `thread_create`: reads the `ThreadCtx`, starts the thread, and writes its id back into
+/// `ctx.tid` before it runs. A failed write-back starts nothing. Returns the Thread capability's
+/// slot.
+fn thread_create(
+    t: &Thread,
+    space: &VmSpace,
+    target: Target,
+    ctx: UserPtr<ThreadCtx>,
+    tag: u64,
+) -> Result<usize, Errno> {
+    let mut raw = [0u8; size_of::<ThreadCtx>()];
+    copy_from_user(
+        space,
+        &mut raw,
+        UserSlice::new(ctx.addr(), size_of::<ThreadCtx>())?,
+    )?;
+    let c = ThreadCtx::from_bytes(&raw);
+    let start = ThreadStart {
+        rip: c.rip,
+        rsp: c.rsp,
+        arg: c.arg,
+        fs_base: c.fs_base,
+        clear_tid: c.clear_tid,
+    };
+    let publish = |tid: u64| {
+        // `ctx` was range-checked for the whole block, so this slice is in range too.
+        let dst = UserSlice::new(ctx.addr() + THREAD_CTX_TID_OFFSET, size_of::<u64>())
+            .map_err(|_| SpaceError::Fault)?;
+        copy_to_user(space, t.agent(), dst, &tid.to_le_bytes()).map_err(|_| SpaceError::Fault)
+    };
+    let (slot, _thread) = space::thread_create(t, target, start, tag, publish)?;
+    Ok(slot)
+}
+
 /// Runs `call` for thread `t`, whose address space `space` is active.
 pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
     match call {
@@ -423,6 +497,14 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
         } => ret(ipc::timer::sys_timer_arm(t, ep.index(), delay_ms, cookie)
             .map(|id| id as usize)
             .map_err(Errno::from)),
+        Syscall::ThreadCreate { target, ctx, tag } => {
+            ret(thread_create(t, space, target, ctx, tag))
+        }
+        Syscall::ThreadInterrupt { thread, entry } => {
+            ret(space::thread_interrupt(t, thread.index(), entry)
+                .map(|()| 0)
+                .map_err(Errno::from))
+        }
     }
 }
 
@@ -582,6 +664,41 @@ mod test {
             })
         );
         assert_eq!(
+            decode(SYS_THREAD_CREATE, [3, 0x1000, 0x77, 0, 0, 0]),
+            Ok(Syscall::ThreadCreate {
+                target: Target::Slot(3),
+                ctx: UserPtr::new(0x1000).unwrap(),
+                tag: 0x77,
+            })
+        );
+        assert_eq!(
+            decode(SYS_THREAD_CREATE, [SPACE_SELF as usize, 0x1000, 0, 0, 0, 0]),
+            Ok(Syscall::ThreadCreate {
+                target: Target::SelfSpace,
+                ctx: UserPtr::new(0x1000).unwrap(),
+                tag: 0,
+            })
+        );
+        assert_eq!(
+            err(SYS_THREAD_CREATE, [Handle::LIMIT, 0x1000, 0, 0, 0, 0]),
+            Some(Errno::EBADF)
+        );
+        assert_eq!(
+            err(SYS_THREAD_CREATE, [0, USER_TOP - 40, 0, 0, 0, 0]),
+            Some(Errno::EFAULT)
+        );
+        assert_eq!(
+            decode(SYS_THREAD_INTERRUPT, [4, 0x40_0000, 0, 0, 0, 0]),
+            Ok(Syscall::ThreadInterrupt {
+                thread: Handle::new(4).unwrap(),
+                entry: 0x40_0000,
+            })
+        );
+        assert_eq!(
+            err(SYS_THREAD_INTERRUPT, [Handle::LIMIT, 0x40_0000, 0, 0, 0, 0]),
+            Some(Errno::EBADF)
+        );
+        assert_eq!(
             decode(SYS_FUTEX, [0x1000, 4 | 128, 2, 5, 0x2000, 9]),
             Ok(Syscall::FutexRequeue {
                 addr: UserPtr::new(0x1000).unwrap(),
@@ -647,8 +764,9 @@ mod test {
         }
     }
 
-    const KNOWN: [isize; 11] = [
+    const KNOWN: [isize; 12] = [
         errno::EPERM,
+        errno::ESRCH,
         errno::EINTR,
         errno::EBADF,
         errno::EAGAIN,
@@ -702,7 +820,7 @@ mod test {
 
         // Each decode and copy error path once, with its exact errno.
         let z = [0usize; 6];
-        let targeted: [(usize, [usize; 6], isize); 16] = [
+        let targeted: [(usize, [usize; 6], isize); 21] = [
             (0xFFFF, z, errno::ENOSYS),
             (SYS_FUTEX, [mapped, 99, 0, 0, 0, 0], errno::ENOSYS),
             // The timeout pointer is address 1, which is unmapped.
@@ -728,6 +846,37 @@ mod test {
             // A timer delay of 0 is refused, and an empty slot is EBADF whatever the delay.
             (SYS_TIMER_ARM, [0, 0, 7, 0, 0, 0], errno::EINVAL),
             (SYS_TIMER_ARM, [5, 10, 7, 0, 0, 0], errno::EBADF),
+            // A ThreadCtx outside user space is EFAULT at decode.
+            (
+                SYS_THREAD_CREATE,
+                [SPACE_SELF as usize, KERNEL_HALF, 0, 0, 0, 0],
+                errno::EFAULT,
+            ),
+            // The stack page is zeroed: rip 0 is not a user address, refused before the target is
+            // looked at.
+            (
+                SYS_THREAD_CREATE,
+                [SPACE_SELF as usize, mapped + 128, 0, 0, 0, 0],
+                errno::EINVAL,
+            ),
+            // An empty slot is EBADF, whatever the entry.
+            (
+                SYS_THREAD_INTERRUPT,
+                [5, 0x40_0000, 0, 0, 0, 0],
+                errno::EBADF,
+            ),
+            // Slot 0 holds an Endpoint with SEND only: the rights check is the first refusal, and
+            // an entry outside user space is refused before the slot is looked at.
+            (
+                SYS_THREAD_INTERRUPT,
+                [0, 0x40_0000, 0, 0, 0, 0],
+                errno::EPERM,
+            ),
+            (
+                SYS_THREAD_INTERRUPT,
+                [0, KERNEL_HALF, 0, 0, 0, 0],
+                errno::EINVAL,
+            ),
         ];
         for (i, (nr, a, want)) in targeted.into_iter().enumerate() {
             assert_eq!(
@@ -756,6 +905,9 @@ mod test {
         crate::vm::copy_to_user(space, t.agent(), ts_at, &[0u8; 16]).unwrap();
 
         let mut rng = Rng(0x9E3779B97F4A7C15);
+        // No Space capability and no Space-bearing thread exist in this setup, so a random
+        // `thread_create` or `thread_interrupt` can only be refused. The success paths are the
+        // ktests in `space`.
         let numbers = [
             SYS_EXIT,
             SYS_SCHED_YIELD,
@@ -765,6 +917,8 @@ mod test {
             SYS_REPLY,
             SYS_REPLY_RECV,
             SYS_TIMER_ARM,
+            SYS_THREAD_CREATE,
+            SYS_THREAD_INTERRUPT,
         ];
         let (mut enosys, mut efault, mut einval, mut ebadf, mut eintr) = (0, 0, 0, 0, 0);
         for i in 0..ITERATIONS {

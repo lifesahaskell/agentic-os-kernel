@@ -15,10 +15,24 @@ pub const SYS_REPLY_RECV: usize = 0x103;
 /// `timer_arm(ep, delay_ms, cookie)`: after `delay_ms` the kernel sends one `LABEL_TIMER` message
 /// to the endpoint in slot `ep` (needs SEND) and the call returns the timer id.
 pub const SYS_TIMER_ARM: usize = 0x106;
+/// `thread_create(space, ctx, tag)`: starts a thread in the space named by `space`, a slot holding
+/// a Space capability with CREATE, or `SPACE_SELF` for the caller's own space. `ctx` points at a
+/// `ThreadCtx`; the kernel writes the new thread's id back into `ctx.tid` before the thread runs.
+/// `tag` is stamped on the thread's messages; with `SPACE_SELF` it must be 0 and the caller's tag
+/// is inherited. Returns the slot of a new Thread capability (SIGNAL).
+pub const SYS_THREAD_CREATE: usize = 0x104;
+/// `thread_interrupt(thread, entry)`: redirects the thread named by a Thread capability with
+/// SIGNAL to `entry`, aborting a blocking IPC with `EINTR`. `ESRCH` once the thread has exited.
+pub const SYS_THREAD_INTERRUPT: usize = 0x105;
+
+/// `thread_create`'s `space` argument for "the caller's own space". No slot can hold this value:
+/// slots are below `CSpace::MAX_SLOTS`.
+pub const SPACE_SELF: u64 = u64::MAX;
 
 /// Linux errno values. A syscall returns `-errno` in `rax` on failure.
 pub mod errno {
     pub const EPERM: isize = 1;
+    pub const ESRCH: isize = 3;
     pub const EINTR: isize = 4;
     pub const EBADF: isize = 9;
     pub const EAGAIN: isize = 11;
@@ -115,6 +129,59 @@ impl IpcArgs {
             tid: next(),
             tag: next(),
             reply: next(),
+        }
+    }
+}
+
+/// The block `thread_create` reads from the pointer in `rsi`: where the new thread starts. The
+/// kernel writes `tid` back, so the creator can name the thread before it runs. `clear_tid` must
+/// be 0 for now.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ThreadCtx {
+    pub rip: u64,
+    pub rsp: u64,
+    /// Arrives in `rdi`.
+    pub arg: u64,
+    pub fs_base: u64,
+    pub clear_tid: u64,
+    /// Output only: the new thread's id. Input is ignored.
+    pub tid: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<ThreadCtx>() == 48);
+
+/// Byte offset of `ThreadCtx::tid`, where the kernel writes the new thread's id.
+pub const THREAD_CTX_TID_OFFSET: usize = 40;
+
+impl ThreadCtx {
+    /// The wire form: six little-endian u64 in field order, which is the `repr(C)` layout.
+    pub fn to_bytes(&self) -> [u8; 48] {
+        let q = [
+            self.rip,
+            self.rsp,
+            self.arg,
+            self.fs_base,
+            self.clear_tid,
+            self.tid,
+        ];
+        let mut out = [0u8; 48];
+        for (chunk, v) in out.as_chunks_mut::<8>().0.iter_mut().zip(q) {
+            *chunk = v.to_le_bytes();
+        }
+        out
+    }
+
+    pub fn from_bytes(b: &[u8; 48]) -> Self {
+        let mut q = b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c));
+        let mut next = || q.next().unwrap();
+        Self {
+            rip: next(),
+            rsp: next(),
+            arg: next(),
+            fs_base: next(),
+            clear_tid: next(),
+            tid: next(),
         }
     }
 }
