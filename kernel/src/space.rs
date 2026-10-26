@@ -270,7 +270,7 @@ mod test {
         sched::install_space_switch,
         user::{
             Image, load_image, map_stack, map_test_page, spawn_thread,
-            testkit::{self, join, join_thread, spawn_image},
+            testkit::{self, join, join_thread, recv_note, spawn_image},
             user_image,
         },
         vm::cow_clone,
@@ -917,5 +917,76 @@ mod test {
         let note = e.recv(&me).unwrap();
         assert_note_shape(&note, NOTE_EXIT);
         assert_eq!(note.words, [NOTE_KIND_CODE, 7, 0, 0]);
+    }
+
+    #[ktest]
+    fn note_fault_then_exit_from_one_sibling() {
+        let owner = Agent::new_root(5, 0);
+        // Read-only, not copy-on-write: the sibling's store is a fault, not a page copy.
+        let parent = sibling_parent(PageFlags::R);
+        let e = Endpoint::new();
+        let me = receiver();
+
+        // S0 exits first, so S1's notes are the only ones left to read.
+        let (_s0, t0) = start_sibling(&parent, &owner, Some(&e), 0x10, 0);
+        let m = recv_note(&e, &me);
+        assert_note_shape(&m, NOTE_EXIT);
+        assert_eq!(m.words, [NOTE_KIND_CODE, 7, 0, 0]);
+        assert_eq!((m.tid, m.tag), (t0.tid(), 0x10));
+        assert_eq!(join_thread(&t0), Exit::Code(7));
+
+        let (_s1, t1) = start_sibling(&parent, &owner, Some(&e), 0x11, 1);
+        let m = recv_note(&e, &me);
+        assert_note_shape(&m, NOTE_FAULT);
+        assert_eq!(m.sender, owner.credential());
+        assert_eq!((m.tid, m.tag), (t1.tid(), 0x11));
+        assert_eq!(m.words[..2], [14, TEST_DATA as u64]);
+        let rip = m.words[2] as usize;
+        assert!(
+            parent.text.contains(&rip),
+            "fault rip {rip:#x} outside the image text"
+        );
+        assert_eq!(m.words[3] & 0b110, 0b110, "write fault from user mode");
+        assert!(t1.exit_status().is_none(), "S1 waits for the verdict");
+
+        // Any non-zero verdict kills; the exit note then names the fault.
+        m.reply
+            .as_ref()
+            .expect("a fault note is a call")
+            .reply([1, 0, 0, 0]);
+        let m = recv_note(&e, &me);
+        assert_note_shape(&m, NOTE_EXIT);
+        assert_eq!(m.words, [NOTE_KIND_FAULT, TEST_DATA as u64, 0, 0]);
+        assert_eq!((m.tid, m.tag), (t1.tid(), 0x11));
+        assert_eq!(join_thread(&t1), Exit::Fault(TEST_DATA));
+        assert_eq!(e.queued(), 0, "three notes in all");
+    }
+
+    #[ktest]
+    fn note_fault_interrupted_before_receive_resumes_redirect() {
+        let owner = Agent::new_root(5, 0);
+        let parent = sibling_parent(PageFlags::R);
+        let e = Endpoint::new();
+        let me = receiver();
+
+        let (_s, t) = start_sibling(&parent, &owner, Some(&e), 0x11, 1);
+        wait_queued(&e, 1);
+
+        // Nobody has received the fault note, so the interrupt withdraws it and the thread runs
+        // the redirect: the handler exits with the faulting pc.
+        t.interrupt(parent.handler);
+        let Exit::Code(pc) = join_thread(&t) else {
+            panic!("the interrupted fault did not end in the redirect handler");
+        };
+        assert!(
+            parent.text.contains(&pc),
+            "pc {pc:#x} outside the image text"
+        );
+
+        // The only note left is the exit note: the fault note was taken out, not left queued.
+        let m = recv_note(&e, &me);
+        assert_note_shape(&m, NOTE_EXIT);
+        assert_eq!(m.words, [NOTE_KIND_CODE, pc as u64, 0, 0]);
+        assert_eq!(e.queued(), 0, "the withdrawn fault note is gone");
     }
 }

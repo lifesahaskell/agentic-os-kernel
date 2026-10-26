@@ -148,24 +148,35 @@ pub fn map_test_page(space: &VmSpace, frame: UFrame, flags: PageFlags) {
     c.map(frame, PageProperty::new_user(flags, CachePolicy::Writeback));
 }
 
-/// Runs `img` on `thread` from its entry point with `arg` in `rdi` and the stack at the top of
-/// the mapped stack region.
-pub fn start(thread: &Thread, img: &Image, arg: u64) -> Exit {
+/// The registers for running `img` from its entry point with `arg` in `rdi` and the stack at the
+/// top of the mapped stack region.
+fn entry_ctx(img: &Image, arg: u64) -> UserContext {
     let mut ctx = UserContext::default();
     ctx.set_rip(img.entry);
     ctx.set_rsp(USER_STACK_TOP);
     ctx.set_rdi(arg as usize);
-    start_ctx(thread, &img.space, ctx)
+    ctx
+}
+
+/// Runs `img` on `thread` from its entry point with `arg` in `rdi` and the stack at the top of
+/// the mapped stack region.
+pub fn start(thread: &Thread, img: &Image, arg: u64) -> Exit {
+    start_ctx(thread, &img.space, entry_ctx(img, arg))
 }
 
 /// Runs `ctx` on `thread` in a new process that wraps `vm` and is owned by the thread's agent.
 fn start_ctx(thread: &Thread, vm: &Arc<VmSpace>, ctx: UserContext) -> Exit {
     let space = Space::new(vm.clone(), thread.agent().clone());
+    run_registered(thread, &space, ctx)
+}
+
+/// Runs `ctx` on `thread` as a thread of `space`, from registering it to reaping it.
+fn run_registered(thread: &Thread, space: &Arc<Space>, ctx: UserContext) -> Exit {
     thread.clear_exit();
     space
         .register(thread)
-        .expect("a new space has room for its first thread");
-    let exit = run_ctx(thread, &space, ctx);
+        .expect("the space has room for this thread");
+    let exit = run_ctx(thread, space, ctx);
     // Recorded, then announced while the space still counts the thread, then reaped.
     thread.set_exit(exit);
     space.note_exit(thread, exit);
@@ -347,10 +358,14 @@ pub(crate) mod testkit {
     use ostd::{
         sync::SpinLock,
         task::{Task, TaskOptions},
+        timer::Jiffies,
     };
 
     use super::*;
-    use crate::sched::install_space_switch;
+    use crate::{
+        ipc::{Endpoint, Message},
+        sched::install_space_switch,
+    };
 
     pub type ExitSlot = Arc<SpinLock<Option<Exit>>>;
 
@@ -364,6 +379,28 @@ pub(crate) mod testkit {
             .spawn()
             .unwrap();
         exit
+    }
+
+    /// Like `spawn_image`, but `t` runs as the first thread of `space`, so a notify capability set
+    /// on `space` is the one its faults and its exit go to. `img` supplies the entry point only;
+    /// `space` must map it.
+    pub fn spawn_image_in(t: &Arc<Thread>, space: &Arc<Space>, img: &Image, arg: u64) -> ExitSlot {
+        install_space_switch();
+        let exit: ExitSlot = Arc::new(SpinLock::new(None));
+        let (t2, space, e) = (t.clone(), space.clone(), exit.clone());
+        let ctx = entry_ctx(img, arg);
+        TaskOptions::new(move || *e.lock() = Some(run_registered(&t2, &space, ctx)))
+            .data(t.clone())
+            .spawn()
+            .unwrap();
+        exit
+    }
+
+    /// The next message on `ep`. A note that never comes ends the test with a panic, not a hang.
+    pub fn recv_note(ep: &Endpoint, me: &Thread) -> Message {
+        let deadline = Jiffies::elapsed().as_u64() + 1000;
+        ep.recv_until(me, Some(deadline))
+            .expect("no note arrived within the wait")
     }
 
     pub fn join(e: &ExitSlot) -> Exit {
@@ -406,13 +443,15 @@ mod test {
         timer::{Jiffies, register_callback_on_cpu},
     };
 
+    use abi::NOTE_FAULT;
+
     use super::*;
     use crate::{
         agent::Agent,
         cap::Cap,
         futex,
-        ipc::{Endpoint, Message, sys_recv, sys_set_exception_handler},
-        user::testkit::{join, spawn_image, wait_blocked},
+        ipc::{Endpoint, Message, sys_recv},
+        user::testkit::{join, recv_note, spawn_image, spawn_image_in, wait_blocked},
         vm::cow_clone,
     };
 
@@ -572,9 +611,9 @@ mod test {
         Arc::new(space)
     }
 
-    /// A handler thread holding RECV on an endpoint, and a client thread whose exceptions go
-    /// there.
-    fn handler_pair() -> (Arc<Thread>, Arc<Thread>) {
+    /// A server thread holding RECV on an endpoint, and a client thread whose cspace is `{0: SEND
+    /// on it}`.
+    fn endpoint_pair() -> (Arc<Thread>, Arc<Thread>) {
         let server = Agent::new_root(42, 16);
         let slot = server
             .cspace
@@ -582,19 +621,46 @@ mod test {
             .insert(Cap::new(Object::Endpoint(Endpoint::new()), Rights::ALL))
             .unwrap();
         let client = server.spawn_child(&[(slot, Rights::SEND)], 4, 1).unwrap();
-        let client = Thread::new(client);
-        sys_set_exception_handler(&client, slot).unwrap();
-        (Thread::new(server), client)
+        (Thread::new(server), Thread::new(client))
+    }
+
+    /// Everything a fault-note test needs: `client` runs as the first thread of `space`, over
+    /// `img`'s address space, and the space's notes go to `ep`, which the kernel thread `server`
+    /// reads.
+    struct NotifyRig {
+        server: Arc<Thread>,
+        client: Arc<Thread>,
+        space: Arc<Space>,
+        ep: Arc<Endpoint>,
+    }
+
+    /// The client carries tag `TAG`, so a test can tell the note names it.
+    const TAG: u64 = 0x2a;
+
+    fn notify_rig(img: &Image) -> NotifyRig {
+        let agent = Agent::new_root(42, 4);
+        let ep = Endpoint::new();
+        let space = Space::new(img.space.clone(), agent.clone());
+        space.set_notify_cap(Cap::new(Object::Endpoint(ep.clone()), Rights::SEND));
+        NotifyRig {
+            server: Thread::new(Agent::new_root(99, 0)),
+            client: Thread::new_tagged(agent, TAG),
+            space,
+            ep,
+        }
     }
 
     #[ktest]
-    fn fault_message_carries_vector_addr_rip_and_credential() {
-        let (server, client) = handler_pair();
+    fn fault_note_carries_vector_addr_rip_tid_and_tag() {
         let img = new_image(user_image!("cow_writer"), PageFlags::R);
-        let exit = spawn_image(&client, &img, 0);
+        let r = notify_rig(&img);
+        let exit = spawn_image_in(&r.client, &r.space, &img, 0);
 
-        let m = sys_recv(&server, 0).unwrap();
-        assert_eq!(m.sender, client.agent().credential());
+        let m = recv_note(&r.ep, &r.server);
+        assert_eq!(m.label, NOTE_FAULT);
+        assert_eq!(m.sender, r.client.agent().credential());
+        assert_eq!((m.tid, m.tag), (r.client.tid(), TAG));
+        assert!(m.caps.is_empty() && m.data.is_empty());
         assert_eq!(m.words[..2], [14, DATA as u64]);
         let rip = m.words[2] as usize;
         assert!(
@@ -603,62 +669,70 @@ mod test {
         );
         assert_eq!(m.words[3] & 0b110, 0b110, "write fault from user mode");
 
-        // Redirecting is the SIGSEGV path: the handler runs with the faulting pc in rdi.
-        client.interrupt(img.handler);
+        // Redirecting is the SIGSEGV path: interrupt to the handler, then answer 0. The thread
+        // runs the handler with the faulting pc in rdi.
+        r.client.interrupt(img.handler);
+        m.reply
+            .as_ref()
+            .expect("a fault note is a call")
+            .reply([0; 4]);
         assert_eq!(join(&exit), Exit::Code(rip));
     }
 
     #[ktest]
     fn pager_maps_the_page_and_resumes() {
-        let (server, client) = handler_pair();
         let img = image_over(user_image!("cow_writer"), None);
-        let exit = spawn_image(&client, &img, 0);
+        let r = notify_rig(&img);
+        let exit = spawn_image_in(&r.client, &r.space, &img, 0);
 
-        let m = sys_recv(&server, 0).unwrap();
+        let m = recv_note(&r.ep, &r.server);
         assert_eq!(m.words[1], DATA as u64);
         map_test_page(
             &img.space,
             FrameAllocOptions::new().alloc_frame().unwrap().into(),
             PageFlags::RW,
         );
-        client.reply_exception(ExcReply::Resume);
+        m.reply.as_ref().unwrap().reply([0; 4]);
 
         assert_eq!(join(&exit), Exit::Code(0));
         assert_eq!(data_byte(&img.space), 0x42);
     }
 
     #[ktest]
-    fn kill_reply_makes_the_fault_fatal() {
-        let (server, client) = handler_pair();
-        let img = image_over(user_image!("cow_writer"), None);
-        let exit = spawn_image(&client, &img, 0);
-        sys_recv(&server, 0).unwrap();
-        client.reply_exception(ExcReply::Kill);
-        assert_eq!(join(&exit), Exit::Fault(DATA));
+    fn kill_verdict_makes_the_fault_fatal() {
+        // Zero resumes; every other verdict kills.
+        for verdict in [1, 7] {
+            let img = image_over(user_image!("cow_writer"), None);
+            let r = notify_rig(&img);
+            let exit = spawn_image_in(&r.client, &r.space, &img, 0);
+            let m = recv_note(&r.ep, &r.server);
+            m.reply.as_ref().unwrap().reply([verdict, 0, 0, 0]);
+            assert_eq!(join(&exit), Exit::Fault(DATA), "verdict {verdict}");
+        }
     }
 
     #[ktest]
-    fn revoked_or_missing_handler_is_fatal() {
+    fn revoked_or_missing_notify_is_fatal() {
         let img = load_image(user_image!("ud2")).unwrap();
 
+        // No notify endpoint at all.
         let none = Thread::new(Agent::new_root(1, 0));
         assert_eq!(start(&none, &img, 0), Exit::Exception(6));
 
+        // A forwarded capability, revoked before the fault: the fault is fatal and nothing is queued.
         let agent = Agent::new_root(1, 0);
-        agent
-            .cspace
-            .lock()
-            .insert(Cap::new(Object::Endpoint(Endpoint::new()), Rights::ALL))
+        let ep = Endpoint::new();
+        let (grant, fwd) = Cap::new(Object::Endpoint(ep.clone()), Rights::ALL)
+            .grant_revocable(Rights::SEND)
             .unwrap();
-        let (grant, fwd) = {
-            let cs = agent.cspace.lock();
-            cs.get(0).unwrap().grant_revocable(Rights::SEND).unwrap()
-        };
-        let slot = agent.cspace.lock().insert(grant).unwrap();
-        let t = Thread::new(agent);
-        sys_set_exception_handler(&t, slot).unwrap();
+        let space = Space::new(img.space.clone(), agent.clone());
+        space.set_notify_cap(grant);
         fwd.revoke();
-        assert_eq!(start(&t, &img, 0), Exit::Exception(6));
+        assert!(space.notify_ep().is_none());
+        let t = Thread::new(agent);
+        let exit = run_registered(&t, &space, entry_ctx(&img, 0));
+        assert_eq!(exit, Exit::Exception(6));
+        assert_eq!(ep.queued(), 0, "no note was queued");
     }
 
     #[ktest]
@@ -784,7 +858,7 @@ mod test {
 
     #[ktest]
     fn tracer_runs_rust_ring3_image() {
-        let (server, client) = handler_pair();
+        let (server, client) = endpoint_pair();
         let img = load_image(user_image!("tracer")).unwrap();
         // The kernel-side server answers one call: reply[0] = words[0] + 1, reply[1] = label.
         let seen: Arc<SpinLock<Option<Message>>> = Arc::new(SpinLock::new(None));
@@ -810,7 +884,7 @@ mod test {
 
     #[ktest]
     fn badsys_gets_errno_from_ring3() {
-        let (_server, client) = handler_pair();
+        let (_server, client) = endpoint_pair();
         let img = load_image(user_image!("badsys")).unwrap();
         // Every case fails before the endpoint is used, so no server is needed. Exit code 0 means
         // each hostile syscall came back as the expected errno.
