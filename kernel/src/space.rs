@@ -2396,4 +2396,20 @@ mod test {
         assert_counts_flat("retire", before_counts, ITERATIONS);
         assert_probe_flat("retire", before, crate::probe::settled(), f);
     }
+
+    #[ktest]
+    fn lifecycle_arch_prctl_round_trip() {
+        install_space_switch();
+        let a = Agent::new_root(1, 0);
+        // Two programs at once, so each one's yields switch to the other and the saved and loaded
+        // FS base is what keeps the two values apart.
+        let (img1, img2) = (
+            load_image(user_image!("lifecycle")).unwrap(),
+            load_image(user_image!("lifecycle")).unwrap(),
+        );
+        let e1 = spawn_image(&Thread::new(a.clone()), &img1, 1 | (1 << 8));
+        let e2 = spawn_image(&Thread::new(a.clone()), &img2, 1 | (2 << 8));
+        assert_eq!(join(&e1), Exit::Code(0));
+        assert_eq!(join(&e2), Exit::Code(0));
+    }
 }
