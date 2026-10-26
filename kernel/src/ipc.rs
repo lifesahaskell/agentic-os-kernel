@@ -1771,4 +1771,180 @@ mod test {
         assert_eq!(n, 10_000);
         assert!(median > 0);
     }
+
+    /// Pages one `bulk` request occupies: 3 * 4096 + 123 bytes.
+    const BULK_PAGES: usize = 4;
+
+    /// A ring-3 `bulk` client of a root agent with `budget` pages, run straight in the loaded
+    /// image (no clone, so it takes no copy-on-write breaks of its own). Returns once its one call
+    /// is queued on the endpoint, unanswered, or its run has ended.
+    struct BulkCall {
+        ep: Arc<Endpoint>,
+        client: Arc<Agent>,
+        server: Arc<Thread>,
+        exit: crate::user::testkit::ExitSlot,
+    }
+
+    fn bulk_call(budget: usize) -> BulkCall {
+        let ep = Endpoint::new();
+        let server = Thread::new(agent_with(&ep));
+        let client = Agent::new_root(1, budget);
+        let cap = Cap::new(Object::Endpoint(ep.clone()), Rights::SEND);
+        assert_eq!(client.cspace.lock().insert(cap).unwrap(), 0);
+        let img = load_image(user_image!("bulk")).unwrap();
+        let exit = spawn_image(&Thread::new(client.clone()), &img, 0);
+        let mut spins = 0usize;
+        while ep.queued() == 0 && exit.lock().is_none() {
+            spins += 1;
+            assert!(spins < 1_000_000, "the client neither called nor exited");
+            Task::yield_now();
+        }
+        BulkCall {
+            ep,
+            client,
+            server,
+            exit,
+        }
+    }
+
+    #[ktest]
+    fn staging_charges_the_sender_until_consumed() {
+        let call = bulk_call(16);
+        assert_eq!(call.ep.queued(), 1);
+        let queued = call.client.mem_used_pages();
+        assert!(queued >= BULK_PAGES, "the queued request is not charged");
+
+        let m = call.ep.recv(&call.server).unwrap();
+        assert_eq!(
+            call.client.mem_used_pages(),
+            queued,
+            "received is not freed"
+        );
+        let reply = m.reply.clone().unwrap();
+        drop(m);
+        assert_eq!(
+            call.client.mem_used_pages(),
+            queued - BULK_PAGES,
+            "consumed and dropped, the pages are back"
+        );
+        // Nothing is answered with: the client's own check of the reply fails, which this test
+        // does not look at.
+        reply.reply([0; 4]);
+        join(&call.exit);
+    }
+
+    #[ktest]
+    fn staging_over_budget_is_enomem() {
+        // Room for three of the four pages the request needs.
+        let call = bulk_call(BULK_PAGES - 1);
+        assert_eq!(call.ep.queued(), 0, "the over-budget request was queued");
+        assert_eq!(join(&call.exit), Exit::Code(0x1_0000 | 12));
+        assert_eq!(call.client.mem_used_pages(), 0);
+    }
+
+    #[ktest]
+    fn staging_clone_uncharges_once() {
+        let call = bulk_call(16);
+        let queued = call.client.mem_used_pages();
+        let m = call.ep.recv(&call.server).unwrap();
+        let (a, b) = (m.clone(), m);
+        drop(a);
+        assert_eq!(
+            call.client.mem_used_pages(),
+            queued,
+            "the last clone is alive"
+        );
+        let reply = b.reply.clone();
+        drop(b);
+        assert_eq!(
+            call.client.mem_used_pages(),
+            queued - BULK_PAGES,
+            "uncharged once, after the last clone"
+        );
+        reply.unwrap().reply([0; 4]);
+        join(&call.exit);
+    }
+
+    #[ktest]
+    fn staging_kernel_built_messages_are_uncharged() {
+        let ep = Endpoint::new();
+        let agent = Agent::new_root(1, 0);
+        let t = Thread::new(agent.clone());
+        // Queued bytes from kernel code: an agent with no budget at all sends them, and
+        // receiving and dropping them refunds nothing, so the count cannot underflow.
+        ep.push(
+            &t,
+            1,
+            [0; 4],
+            vec![7u8; 2 * PAGE_SIZE + 1],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(agent.mem_used_pages(), 0);
+        let m = ep.recv(&t).unwrap();
+        assert_eq!(m.data.len(), 2 * PAGE_SIZE + 1);
+        drop(m);
+        assert_eq!(agent.mem_used_pages(), 0);
+
+        // A note and a kernel message carry no bytes at all.
+        ep.push_note(&t, abi::LABEL_KERNEL_BASE, [0; 4], None)
+            .unwrap();
+        assert!(ep.recv(&t).unwrap().data.is_empty());
+    }
+
+    #[ktest]
+    fn staging_kernel_cow_writes_enter_the_process_ledger() {
+        use crate::space::Space;
+
+        let parent = load_image(user_image!("bulk")).unwrap();
+        let owner = Agent::new_root(1, 64);
+        let space = Space::from_clone(
+            &parent.space,
+            abi::IMAGE_BASE..abi::USER_STACK_TOP,
+            owner.clone(),
+        )
+        .expect("from_clone");
+        let t = Thread::new(owner.clone());
+        t.set_process(space.clone());
+        let nodes = owner.mem_used_pages();
+        assert!(nodes > 0, "the clone's page-table nodes are charged (D-07)");
+
+        // Three distinct copy-on-write pages in the writable part of the image.
+        let pages: Vec<usize> = (0..3).map(|i| parent.text.end + i * PAGE_SIZE).collect();
+        space.vm().activate();
+        write_bytes(
+            &t,
+            space.vm(),
+            user_slice(pages[0] as u64, 8).unwrap(),
+            &[1; 8],
+        )
+        .unwrap();
+        assert_eq!(
+            owner.mem_used_pages(),
+            nodes + 1,
+            "write_bytes breaks one page"
+        );
+        write_len(&t, space.vm(), UserPtr::new(pages[1]).unwrap(), 5).unwrap();
+        assert_eq!(
+            owner.mem_used_pages(),
+            nodes + 2,
+            "write_args breaks one page"
+        );
+        assert_eq!(crate::futex::wake(&t, space.vm(), pages[2], 1), Ok(0));
+        assert_eq!(
+            owner.mem_used_pages(),
+            nodes + 3,
+            "a futex lookup breaks one page"
+        );
+
+        parent.space.activate();
+        drop(t);
+        drop(space);
+        assert_eq!(
+            owner.mem_used_pages(),
+            0,
+            "teardown refunds copies and nodes"
+        );
+    }
 }
