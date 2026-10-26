@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 pub mod fpu;
+pub mod ledger;
 pub mod raw;
 pub mod rt;
 

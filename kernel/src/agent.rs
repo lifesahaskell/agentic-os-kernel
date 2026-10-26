@@ -182,10 +182,25 @@ impl Agent {
 
 #[cfg(ktest)]
 mod test {
-    use ostd::prelude::*;
+    use alloc::vec::Vec;
+
+    use ostd::{
+        prelude::*,
+        sync::SpinLock,
+        task::{Task, TaskOptions},
+    };
 
     use super::*;
-    use crate::{cap::Object, ipc::Endpoint};
+    use crate::{
+        cap::Object,
+        ipc::Endpoint,
+        thread::Thread,
+        user::{
+            Exit, load_image,
+            testkit::{join, spawn_image},
+            user_image,
+        },
+    };
 
     #[ktest]
     fn child_gets_attenuated_subset_and_carved_budget() {
@@ -253,5 +268,84 @@ mod test {
             child.spawn_child(&[(0, Rights::SEND)], 0, 0).err(),
             Some(AgentError::Cap(CapError::Rights))
         );
+    }
+
+    /// What kernel client calls returned, in order: (client tag, reply `words[0]`).
+    type Answers = Arc<SpinLock<Vec<(u64, u64)>>>;
+
+    /// Spawns a kernel task that calls `ep` once per label as `t`, logging each reply.
+    fn spawn_calls(ep: &Arc<Endpoint>, t: &Arc<Thread>, labels: &[u64], log: &Answers) {
+        let (ep, t, labels, log) = (ep.clone(), t.clone(), labels.to_vec(), log.clone());
+        TaskOptions::new(move || {
+            for label in labels {
+                let words = ep.call(&t, label, [0; 4]).unwrap();
+                log.lock().push((t.tag(), words[0]));
+            }
+        })
+        .spawn()
+        .unwrap();
+    }
+
+    fn wait_answers(log: &Answers, n: usize) {
+        while log.lock().len() < n {
+            Task::yield_now();
+        }
+    }
+
+    /// AGNT-05: a ring-3 server keyed on the kernel-stamped tag answers the fifth request of one
+    /// tag in a window with EAGAIN (limit 4) and still serves a second tag.
+    #[ktest]
+    fn request_ledger_limit_answers_eagain_per_tag() {
+        let ep = Endpoint::new();
+        let server_agent = Agent::new_root(42, 64);
+        let slot = server_agent
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Endpoint(ep.clone()), Rights::ALL))
+            .unwrap();
+        assert_eq!(slot, 0);
+        let client_agent = Agent::new_root(43, 8);
+        let img = load_image(user_image!("ledger_srv")).unwrap();
+        let exit = spawn_image(&Thread::new(server_agent), &img, 0);
+
+        let (a, b) = (
+            Thread::new_tagged(client_agent.clone(), 0xA),
+            Thread::new_tagged(client_agent, 0xB),
+        );
+        let log: Answers = Arc::new(SpinLock::new(Vec::new()));
+        let eagain = (-abi::errno::EAGAIN) as u64;
+
+        spawn_calls(&ep, &a, &[1; 5], &log);
+        wait_answers(&log, 5);
+        assert_eq!(
+            *log.lock(),
+            [(0xA, 0), (0xA, 0), (0xA, 0), (0xA, 0), (0xA, eagain)]
+        );
+
+        // The second tag is served in full after the first was refused.
+        spawn_calls(&ep, &b, &[1; 4], &log);
+        wait_answers(&log, 9);
+        assert!(log.lock()[5..].iter().all(|&r| r == (0xB, 0)));
+
+        // The first tag stays refused within the window.
+        spawn_calls(&ep, &a, &[1], &log);
+        wait_answers(&log, 10);
+        assert_eq!(log.lock()[9], (0xA, eagain));
+
+        // The stop label is answered and ends the server.
+        spawn_calls(&ep, &b, &[0xFFFF], &log);
+        assert_eq!(join(&exit), Exit::Code(0));
+        wait_answers(&log, 11);
+        assert_eq!(log.lock()[10], (0xB, 0));
+    }
+
+    /// The ledger's window, recycling and table-full behaviour, run in ring 3 against synthetic
+    /// times: `ledger_srv` exits 0 only if every check holds, or with the number of the first
+    /// check that failed.
+    #[ktest]
+    fn request_ledger_self_test() {
+        let img = load_image(user_image!("ledger_srv")).unwrap();
+        let t = Thread::new(Agent::new_root(44, 8));
+        assert_eq!(join(&spawn_image(&t, &img, 1)), Exit::Code(0));
     }
 }

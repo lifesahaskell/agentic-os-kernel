@@ -16,6 +16,10 @@ The protection boundary knows what an agent is: authority is exactly the set of 
 handles an agent holds, and the kernel stamps its identity on every message, while unmodified
 POSIX programs still run.
 
+CPU budgets are enforced by the kernel for an agent's own threads. Kernel CPU budgets do not
+cover server-side work done on an agent's behalf; servers bound that work with a per-client
+request ledger ([ADR 0003](../docs/architecture/adr/0003-server-cpu-exemption.md)).
+
 ## Requirements
 
 ### Validated
@@ -29,7 +33,7 @@ the boot-time budget check pass in QEMU/KVM). Evidence:
 - ✓ Rights-checked IPC endpoints that stamp the sender's credential — B2
 - ✓ Thread interrupt (aborts blocked IPC with EINTR) and redirect (the kernel half of signals) — B2
 - ✓ Lazy copy-on-write address-space clone; the faulting agent pays for the copied page — B2
-- ✓ CPU budget per agent, carved from the parent and enforced by a custom scheduler — B2
+- ✓ CPU budget per agent, carved from the parent and enforced by a custom scheduler on the agent's own threads, not on server-side work done for it (ADR 0003) — B2
 - ✓ Per-task address-space switch on every context switch — B2
 - ✓ Exceptions delivered as messages to a handler endpoint — B2
 - ✓ Futex wait/wake/requeue across address spaces, keyed by physical address — B2
@@ -106,6 +110,7 @@ turns them into numbered requirements.
 | Drop formal POSIX certification, measure adherence with free suites (2026-10-23) | Certification cost and publication limits outweigh benefit for a research artifact | — Pending |
 | Per-grant forwarders for revocation | Matches per-delegation revocation; EROS/Coyotos precedent | ✓ Good (B2 tests) |
 | uid/gid is a server-side attribute, never kernel authority | Namespace answers "can you name it"; mode bits answer "may you" | — Pending |
+| Server CPU for a client is exempt from the client's kernel budget; bounded by a per-client request ledger (ADR 0003) | The kernel charges the running agent, so a server pays for its clients' requests; a ledger keyed on the kernel-stamped tag caps each client with `EAGAIN` and needs no kernel change | — Pending |
 | This GSD roadmap covers B3 only | B4 and B5 depend on B3 outcomes (layer cost, libc choice, adherence tier) | — Pending |
 | Contained `unsafe` is acceptable; Redox re-score only after safe and contained-unsafe routes fail (2026-10-24) | Avoid abandoning the OSTD base over one low-level need such as FPU state; the cost is paid in a ledger and a hardening pass | — Pending |
 | Solo, no deadline recorded as an explicit constraint | Scoping section 9 left schedule open; roadmap needs a stated assumption | — Pending |
