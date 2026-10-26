@@ -267,6 +267,175 @@ mod test {
         assert_eq!(child.cpu_used_ticks(), 2, "kernel tasks are never charged");
     }
 
+    fn idle_task() -> Arc<Task> {
+        Arc::new(TaskOptions::new(|| {}).data(Idle).build().unwrap())
+    }
+
+    /// A thread task whose agent has used its whole quota in the period containing `now`.
+    fn spent_thread_task(now: u64) -> Arc<Task> {
+        let root = Agent::new_root(1, 0);
+        let child = root.spawn_child(&[], 0, 2).unwrap();
+        child.charge_tick(now);
+        child.charge_tick(now);
+        assert!(!child.has_cpu(now));
+        task(Some(Thread::new(child)))
+    }
+
+    fn fresh_thread_task() -> Arc<Task> {
+        task(Some(Thread::new(Agent::new_root(1, 0))))
+    }
+
+    fn rq_of(
+        current: Option<&Arc<Task>>,
+        queue: &[&Arc<Task>],
+        idle: Option<&Arc<Task>>,
+    ) -> RunQueue {
+        RunQueue {
+            current: current.cloned(),
+            queue: queue.iter().map(|t| (*t).clone()).collect(),
+            idle: idle.cloned(),
+        }
+    }
+
+    #[ktest]
+    fn sched_idle_is_picked_only_when_nothing_is_eligible() {
+        let now = 5 * CPU_PERIOD_TICKS;
+        let root = Agent::new_root(1, 0);
+        let child = root.spawn_child(&[], 0, 2).unwrap();
+        let worker = task(Some(Thread::new(child.clone())));
+        let idle = idle_task();
+        let mut rq = rq_of(None, &[&worker], Some(&idle));
+
+        assert!(is(rq.pick(now), &worker), "an eligible thread beats idle");
+        assert!(rq.idle.is_some(), "idle stays in its slot");
+
+        child.charge_tick(now);
+        child.charge_tick(now);
+        assert!(!child.has_cpu(now));
+        assert!(is(rq.pick(now), &idle), "nothing eligible, so idle runs");
+        assert!(is(rq.current(), &idle), "the picked idle is current");
+        assert!(rq.idle.is_none());
+        assert_eq!(rq.queue.len(), 1);
+        assert!(
+            rq.queue.iter().all(|t| !is_idle(t)),
+            "queue never holds idle"
+        );
+        assert!(
+            is(rq.queue.front(), &worker),
+            "the displaced thread is queued"
+        );
+        assert!(
+            rq.pick(now).is_none(),
+            "idle is current and nothing else is eligible"
+        );
+
+        let next_period = now + CPU_PERIOD_TICKS;
+        assert!(rq.update(UpdateFlags::Tick, next_period));
+        assert!(
+            is(rq.pick(next_period), &worker),
+            "budget renewed, thread resumes"
+        );
+        assert!(is(rq.idle.as_ref(), &idle), "idle is back in its slot");
+        assert!(rq.queue.is_empty());
+    }
+
+    #[ktest]
+    fn sched_update_current_truth_table() {
+        let now = 5 * CPU_PERIOD_TICKS;
+        let (idle, a, b) = (idle_task(), fresh_thread_task(), fresh_thread_task());
+        let spent = spent_thread_task(now);
+
+        // Tick, idle current, eligible queued.
+        assert!(rq_of(Some(&idle), &[&a], None).update(UpdateFlags::Tick, now));
+        // Tick, idle current, empty queue.
+        assert!(!rq_of(Some(&idle), &[], None).update(UpdateFlags::Tick, now));
+        // Tick, idle current, only an out-of-budget thread queued.
+        assert!(!rq_of(Some(&idle), &[&spent], None).update(UpdateFlags::Tick, now));
+        // Tick, eligible current, only idle.
+        assert!(!rq_of(Some(&a), &[], Some(&idle)).update(UpdateFlags::Tick, now));
+        // Tick, out-of-budget current, only idle.
+        assert!(rq_of(Some(&spent), &[], Some(&idle)).update(UpdateFlags::Tick, now));
+        // Tick, eligible current, another eligible queued.
+        assert!(rq_of(Some(&a), &[&b], Some(&idle)).update(UpdateFlags::Tick, now));
+        // Yield, current, only idle.
+        assert!(!rq_of(Some(&a), &[], Some(&idle)).update(UpdateFlags::Yield, now));
+        // Blocking and exit flags, current, only idle.
+        assert!(rq_of(Some(&a), &[], Some(&idle)).update(UpdateFlags::Wait, now));
+        assert!(rq_of(Some(&a), &[], Some(&idle)).update(UpdateFlags::Exit, now));
+        // Blocking flag, no idle, empty queue.
+        assert!(!rq_of(Some(&a), &[], None).update(UpdateFlags::Wait, now));
+        // Tick, no current.
+        assert!(!rq_of(None, &[&a], Some(&idle)).update(UpdateFlags::Tick, now));
+    }
+
+    #[ktest]
+    fn sched_enqueue_requests_preempt_when_idle_runs() {
+        let now = 5 * CPU_PERIOD_TICKS;
+        let sched = BudgetScheduler::default();
+        assert_eq!(sched.enqueue(idle_task(), EnqueueFlags::Spawn), None);
+        assert!(sched.rq.lock().idle.is_some());
+        assert!(sched.rq.lock().queue.is_empty(), "idle is not queued");
+
+        assert!(sched.rq.lock().pick(now).is_some_and(|t| is_idle(t)));
+        assert_eq!(
+            sched.enqueue(fresh_thread_task(), EnqueueFlags::Wake),
+            Some(CpuId::bsp()),
+            "a wake while idle runs does not wait for the next tick"
+        );
+
+        let sched = BudgetScheduler::default();
+        let current = fresh_thread_task();
+        assert_eq!(sched.enqueue(current.clone(), EnqueueFlags::Spawn), None);
+        assert!(
+            sched
+                .rq
+                .lock()
+                .pick(now)
+                .is_some_and(|t| Arc::ptr_eq(t, &current))
+        );
+        assert_eq!(
+            sched.enqueue(fresh_thread_task(), EnqueueFlags::Wake),
+            None,
+            "a running thread is preempted by the tick, not by the wake"
+        );
+    }
+
+    #[ktest]
+    fn sched_idle_is_never_counted_as_others() {
+        let now = 5 * CPU_PERIOD_TICKS;
+        let idle = idle_task();
+        let (a, b) = (fresh_thread_task(), fresh_thread_task());
+        let mut rq = rq_of(None, &[], Some(&idle));
+
+        assert!(is(rq.pick(now), &idle));
+        assert!(
+            !rq.update(UpdateFlags::Yield, now),
+            "idle alone has no others"
+        );
+        assert!(!rq.update(UpdateFlags::Tick, now));
+
+        rq.queue.extend([a.clone(), b.clone()]);
+        assert!(rq.update(UpdateFlags::Tick, now));
+        assert!(is(rq.pick(now), &a));
+        assert!(
+            is(rq.idle.as_ref(), &idle),
+            "switched away, idle is back in the slot"
+        );
+        assert_eq!(rq.queue.len(), 1, "only the other thread task is queued");
+
+        // Yield rotates the two eligible threads; idle never takes part while one is eligible.
+        assert!(rq.update(UpdateFlags::Yield, now));
+        assert!(is(rq.pick(now), &b));
+        assert!(
+            rq.update(UpdateFlags::Yield, now),
+            "a is queued and eligible"
+        );
+        assert!(is(rq.pick(now), &a));
+        assert_eq!(rq.queue.len(), 1);
+        assert!(rq.queue.iter().all(|t| !is_idle(t)));
+        assert!(rq.idle.is_some());
+    }
+
     #[ktest]
     fn each_task_resumes_in_its_own_address_space() {
         // Both images sit at the same addresses, so a thread resumed under the other space's page
