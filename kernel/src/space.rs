@@ -21,7 +21,7 @@ use core::{
 
 use ostd::{
     mm::{PAGE_SIZE, Vaddr, VmSpace},
-    sync::SpinLock,
+    sync::{Mutex, SpinLock},
     task::disable_preempt,
 };
 
@@ -33,6 +33,11 @@ use crate::{
     user::{self, Exit, Image},
     vm::{CloneError, cow_clone},
 };
+
+mod mmap;
+
+pub use mmap::MAX_MAPS_PER_SPACE;
+use mmap::Maps;
 
 /// Most live threads one space holds. The 65th `thread_create` is refused (`Limit`).
 pub const MAX_THREADS_PER_SPACE: usize = 64;
@@ -72,6 +77,10 @@ pub struct Space {
     /// `owner.leave_space()`, and the owner retires when the last one goes (D-02). Never true for
     /// an adopted space (OD-19): the caller keeps that memory and the agent's life is its own.
     counted: bool,
+    /// The mapping records and the break (see `mmap.rs`). Orders every `mmap`, `munmap`,
+    /// `mprotect` and `brk` against teardown, which holds it across unmap and uncharge. Taken
+    /// before any `disable_preempt` guard and outside the `threads` lock.
+    mm: Mutex<Maps>,
 }
 
 /// Spaces that exist: raised by `build`, lowered when one is dropped.
@@ -147,6 +156,7 @@ impl Space {
             torn: AtomicBool::new(false),
             owns_vm,
             counted,
+            mm: Mutex::new(Maps::default()),
         })
     }
 
@@ -315,6 +325,9 @@ impl Space {
     fn teardown(&self) {
         drop(self.notify.lock().take());
         crate::ipc::timer::drop_space(&self.vm);
+        // Held through the unmap and the uncharge: a `mmap` in flight finishes first and is
+        // refunded with the rest, and one that starts later sees `dying` and charges nothing.
+        let mut mm = self.mm.lock();
         if self.owns_vm {
             let guard = disable_preempt();
             // `unmap` flushes and dispatches the TLB itself, and frees the frames once no CPU can
@@ -332,6 +345,8 @@ impl Space {
             let pages = self.charged_pages.swap(0, Ordering::AcqRel);
             self.owner.uncharge_pages(pages);
         }
+        mm.clear();
+        drop(mm);
         // Last: the owner may retire here, and retiring drains its capabilities.
         if self.counted {
             self.owner.leave_space();
@@ -1510,7 +1525,7 @@ mod test {
 
     /// Waits, yielding, until the last thread of `space` has been reaped. A thread's exit is
     /// visible a moment before its reap (see `thread_create_limit_is_64`).
-    fn wait_reaped(space: &Space) {
+    pub(super) fn wait_reaped(space: &Space) {
         let mut spins = 0usize;
         while space.live_threads() != 0 || !space.is_dying() {
             spins += 1;

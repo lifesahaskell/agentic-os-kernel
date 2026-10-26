@@ -5,6 +5,20 @@
 #![no_std]
 #![deny(unsafe_code)]
 
+/// `mmap(addr, len, prot, flags, fd, off)`: maps zeroed anonymous private memory into the caller's
+/// own space, charged to the agent that owns it. Only `MAP_ANONYMOUS | MAP_PRIVATE` is supported
+/// (`ENODEV` without `MAP_ANONYMOUS`, `ENOTSUP` for `MAP_SHARED`); `fd` is ignored. Every page is
+/// allocated and charged at the call, so a mapping the budget cannot pay for fails here with
+/// `ENOMEM` and maps nothing. Returns the address.
+pub const SYS_MMAP: usize = 9;
+/// `mprotect(addr, len, prot)`: changes the protection of pages in the caller's own space. Returns 0.
+pub const SYS_MPROTECT: usize = 10;
+/// `munmap(addr, len)`: unmaps pages from the caller's own space and refunds them. Returns 0, also
+/// over a range with nothing mapped.
+pub const SYS_MUNMAP: usize = 11;
+/// `brk(addr)`: the raw Linux call. Returns the new break, or the old one on any failure; 0 as
+/// `addr` asks for the current break.
+pub const SYS_BRK: usize = 12;
 pub const SYS_SCHED_YIELD: usize = 24;
 pub const SYS_EXIT: usize = 60;
 pub const SYS_FUTEX: usize = 202;
@@ -51,10 +65,12 @@ pub mod errno {
     pub const EAGAIN: isize = 11;
     pub const ENOMEM: isize = 12;
     pub const EFAULT: isize = 14;
+    pub const ENODEV: isize = 19;
     pub const EINVAL: isize = 22;
     pub const EMFILE: isize = 24;
     pub const ENOSYS: isize = 38;
     pub const EMSGSIZE: isize = 90;
+    pub const ENOTSUP: isize = 95;
     pub const ETIMEDOUT: isize = 110;
 }
 
@@ -291,3 +307,25 @@ pub const USER_STACK_PAGES: usize = 32;
 /// a test program needs shared or inspectable memory; `libsys::test_page` reads it. It sits above
 /// any image (`MAX_IMAGE_SIZE` is not reached by the test programs) and below the stack.
 pub const TEST_DATA: usize = 0x50_0000;
+
+/// `mmap` and `mprotect` protections, with the Linux values. `PROT_WRITE` and `PROT_EXEC` imply
+/// read on x86-64, as on Linux.
+pub const PROT_NONE: usize = 0;
+pub const PROT_READ: usize = 1;
+pub const PROT_WRITE: usize = 2;
+pub const PROT_EXEC: usize = 4;
+
+/// `mmap` flags, with the Linux values. Flag bits not listed here are ignored.
+pub const MAP_SHARED: usize = 1;
+pub const MAP_PRIVATE: usize = 2;
+/// Replaces whatever is mapped at the address.
+pub const MAP_FIXED: usize = 0x10;
+pub const MAP_ANONYMOUS: usize = 0x20;
+
+/// Where `mmap` places a mapping that names no address: the first free gap in
+/// `[MMAP_BASE, MMAP_TOP)`. The brk area grows up from the end of the image and stays below the
+/// stack, so `MMAP_BASE` is above both.
+pub const MMAP_BASE: usize = 0x1_0000_0000;
+pub const MMAP_TOP: usize = 0x7f00_0000_0000;
+/// The most `brk` can grow past the end of the image.
+pub const BRK_MAX: usize = 256 * 1024 * 1024;

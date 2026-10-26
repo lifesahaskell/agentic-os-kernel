@@ -9,12 +9,16 @@ use alloc::boxed::Box;
 use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
-    IpcArgs, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SPACE_SELF, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_RECV,
-    SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_SIGRETURN, SYS_SPACE_NOTIFY, SYS_THREAD_CREATE,
-    SYS_THREAD_INTERRUPT, SYS_TIMER_ARM, THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP,
-    errno,
+    IpcArgs, MAP_ANONYMOUS, MAP_SHARED, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SPACE_SELF, SYS_CALL,
+    SYS_EXIT, SYS_FUTEX, SYS_MMAP, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD,
+    SYS_SIGRETURN, SYS_SPACE_NOTIFY, SYS_THREAD_CREATE, SYS_THREAD_INTERRUPT, SYS_TIMER_ARM,
+    THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP, errno,
 };
-use ostd::{mm::VmSpace, task::Task, timer::Jiffies};
+use ostd::{
+    mm::{PAGE_SIZE, VmSpace},
+    task::Task,
+    timer::Jiffies,
+};
 
 use crate::{
     agent::AgentError,
@@ -38,10 +42,12 @@ impl Errno {
     pub const EAGAIN: Errno = Errno(errno::EAGAIN);
     pub const ENOMEM: Errno = Errno(errno::ENOMEM);
     pub const EFAULT: Errno = Errno(errno::EFAULT);
+    pub const ENODEV: Errno = Errno(errno::ENODEV);
     pub const EINVAL: Errno = Errno(errno::EINVAL);
     pub const EMFILE: Errno = Errno(errno::EMFILE);
     pub const ENOSYS: Errno = Errno(errno::ENOSYS);
     pub const EMSGSIZE: Errno = Errno(errno::EMSGSIZE);
+    pub const ENOTSUP: Errno = Errno(errno::ENOTSUP);
     pub const ETIMEDOUT: Errno = Errno(errno::ETIMEDOUT);
 }
 
@@ -279,6 +285,15 @@ pub enum Syscall {
     /// Ends a redirect handler: the arguments are ignored, because the context comes from the
     /// kernel-held frame stack and never from user memory.
     Sigreturn,
+    /// Anonymous private memory in the caller's own space. `addr` is a hint, or the place for
+    /// `MAP_FIXED`; the descriptor argument is not carried, because it is ignored.
+    Mmap {
+        addr: usize,
+        len: usize,
+        prot: usize,
+        flags: usize,
+        off: usize,
+    },
 }
 
 const FUTEX_WAIT: usize = 0;
@@ -378,7 +393,43 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
             ep: Handle::new(a[1])?,
         },
         SYS_SIGRETURN => Syscall::Sigreturn,
+        SYS_MMAP => decode_mmap(a)?,
         _ => return Err(Errno::ENOSYS),
+    })
+}
+
+/// The protection bits `mmap` and `mprotect` accept.
+const PROT_BITS: usize = abi::PROT_READ | abi::PROT_WRITE | abi::PROT_EXEC;
+
+/// `mmap`'s arguments, checked in one fixed order so a call with several faults always gets the
+/// same errno: `len` 0, unknown `prot` bits, the sharing mode, a missing `MAP_ANONYMOUS`, an
+/// unaligned offset, an unaligned `MAP_FIXED` address, then a length whose page round-up
+/// overflows. The descriptor in `a[4]` is ignored, as Linux ignores it for anonymous mappings.
+fn decode_mmap(a: [usize; 6]) -> Result<Syscall, Errno> {
+    let [addr, len, prot, flags, _fd, off] = a;
+    if len == 0 || prot & !PROT_BITS != 0 {
+        return Err(Errno::EINVAL);
+    }
+    match flags & (MAP_SHARED | abi::MAP_PRIVATE) {
+        0 => return Err(Errno::EINVAL),
+        abi::MAP_PRIVATE => {}
+        _ => return Err(Errno::ENOTSUP),
+    }
+    if flags & MAP_ANONYMOUS == 0 {
+        return Err(Errno::ENODEV);
+    }
+    if off % PAGE_SIZE != 0 || (flags & abi::MAP_FIXED != 0 && addr % PAGE_SIZE != 0) {
+        return Err(Errno::EINVAL);
+    }
+    if len.checked_next_multiple_of(PAGE_SIZE).is_none() {
+        return Err(Errno::ENOMEM);
+    }
+    Ok(Syscall::Mmap {
+        addr,
+        len,
+        prot,
+        flags,
+        off,
     })
 }
 
@@ -546,6 +597,18 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
             Some(f) => Outcome::Sigreturn(f),
             None => Outcome::Return(-Errno::EINVAL.0),
         },
+        // The self-memory calls are cap-less: they act on the caller's own process, whatever
+        // arguments it passes (OD-02). A thread with no process has no space to change.
+        Syscall::Mmap {
+            addr,
+            len,
+            prot,
+            flags,
+            off,
+        } => ret(match t.process() {
+            Some(p) => p.mmap(addr, len, prot, flags, off),
+            None => Err(Errno::ENOMEM),
+        }),
     }
 }
 
