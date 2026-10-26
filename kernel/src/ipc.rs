@@ -57,7 +57,9 @@ enum ReplyState {
     /// reply table (`recv_parked`), `None` when a kernel task took the message directly.
     Received(Option<(Weak<Thread>, u64)>),
     Replied(Answer),
-    /// The caller has the answer.
+    /// The server died holding the call (`ReplyWait::fail`); the caller takes the error.
+    Failed(IpcError),
+    /// The caller has the outcome, or was killed and no longer wants one.
     Done,
 }
 
@@ -97,21 +99,51 @@ impl ReplyWait {
     }
 
     /// `reply_with` plus `caps`, installed in the caller's agent: all of them or none (`NoRoom`,
-    /// nothing delivered, the caller keeps waiting). A caller that no longer exists gets nothing.
+    /// nothing delivered, the caller keeps waiting). A caller that no longer exists, or a wait that
+    /// is already done or failed, gets nothing: the payload is dropped.
     fn deliver(&self, words: [u64; 4], data: Vec<u8>, caps: &[Cap]) -> Result<(), IpcError> {
         let Some(caller) = self.caller.upgrade() else {
             return Ok(());
         };
+        if self.is_settled() {
+            return Ok(());
+        }
         let caps = install_caps(caller.agent(), caps)?;
-        *self.state.lock() = ReplyState::Replied(Answer { words, data, caps });
+        let mut s = self.state.lock();
+        if matches!(*s, ReplyState::Done | ReplyState::Failed(_)) {
+            // Settled between the check and the install: take the capabilities back.
+            drop(s);
+            uninstall(caller.agent(), &caps);
+            return Ok(());
+        }
+        *s = ReplyState::Replied(Answer { words, data, caps });
+        drop(s);
         self.wq.wake_all();
         Ok(())
     }
 
-    fn take_answer(&self) -> Option<Answer> {
+    /// Whether nobody will take another answer: the caller is done, or the server failed it.
+    fn is_settled(&self) -> bool {
+        matches!(*self.state.lock(), ReplyState::Done | ReplyState::Failed(_))
+    }
+
+    /// Ends the wait with `err`, for a server that dies holding the call, and wakes the caller.
+    /// A wait that already has an answer, or is done, is left as it is.
+    pub(crate) fn fail(&self, err: IpcError) {
+        let mut s = self.state.lock();
+        if matches!(*s, ReplyState::Queued | ReplyState::Received(_)) {
+            *s = ReplyState::Failed(err);
+            drop(s);
+            self.wq.wake_all();
+        }
+    }
+
+    /// What the caller waits for: the answer, or the error the server's death left.
+    fn take_outcome(&self) -> Option<Result<Answer, IpcError>> {
         let mut s = self.state.lock();
         match core::mem::replace(&mut *s, ReplyState::Done) {
-            ReplyState::Replied(a) => Some(a),
+            ReplyState::Replied(a) => Some(Ok(a)),
+            ReplyState::Failed(e) => Some(Err(e)),
             other => {
                 *s = other;
                 None
@@ -164,6 +196,14 @@ impl ReplyTable {
         let generation = NEXT_REPLY_GEN.fetch_add(1, Ordering::Relaxed);
         self.slots[index] = Some((generation, w));
         Some((generation as u64) << 32 | index as u64)
+    }
+
+    /// Takes every parked call out, for a thread that is exiting: each is failed, not answered.
+    pub(crate) fn drain(&mut self) -> Vec<Arc<ReplyWait>> {
+        self.slots
+            .iter_mut()
+            .filter_map(|s| s.take().map(|(_, w)| w))
+            .collect()
     }
 
     /// Ktest-only: how many calls are parked.
@@ -300,8 +340,8 @@ impl Endpoint {
     ) -> Result<Answer, IpcError> {
         let reply = ReplyWait::new(from.downgrade());
         enqueue(reply.clone())?;
-        match from.block_until(&reply.wq, || reply.take_answer(), None) {
-            Ok(answer) => Ok(answer),
+        match from.block_until(&reply.wq, || reply.take_outcome(), None) {
+            Ok(outcome) => outcome,
             Err(e) => self.abandon(from, &reply, e),
         }
     }
@@ -322,15 +362,27 @@ impl Endpoint {
                 return Err(why.into());
             }
             ReplyState::Received(server) => server.clone(),
-            ReplyState::Replied(_) | ReplyState::Done => None,
+            ReplyState::Replied(_) | ReplyState::Failed(_) | ReplyState::Done => None,
         };
         drop(q);
         if let Some((server, handle)) = server.and_then(|(t, h)| Some((t.upgrade()?, h))) {
             server.push_cancel(handle);
         }
-        // shortcut: a server that never answers, or whose thread is gone, strands this caller
-        // (accepted, T-01-26); only the Phase 2 kill path frees it.
-        Ok(from.block_until_committed(&reply.wq, || reply.take_answer()))
+        // Uninterruptible: the server holds the request and must be heard from. Only two things
+        // end the wait early: the server's thread exiting (`retire` fails the call: `Dead`) and
+        // this caller being killed.
+        match from.block_until_committed(&reply.wq, || reply.take_outcome()) {
+            Some(outcome) => outcome,
+            None => {
+                // Killed. Mark the wait done so a late reply is dropped, and take back whatever
+                // answer arrived at the same moment.
+                let before = core::mem::replace(&mut *reply.state.lock(), ReplyState::Done);
+                if let ReplyState::Replied(a) = before {
+                    uninstall(from.agent(), &a.caps);
+                }
+                Err(IpcError::Interrupted)
+            }
+        }
     }
 
     /// `send` and `call` with every field chosen: the ring-3 entry, so it refuses the kernel's

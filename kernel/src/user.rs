@@ -187,6 +187,7 @@ fn run_registered(thread: &Thread, space: &Arc<Space>, ctx: UserContext) -> Exit
     // Recorded, then announced while the space still counts the thread, then reaped.
     thread.set_exit(exit);
     space.note_exit(thread, exit);
+    thread.retire();
     space.reap(thread.tid());
     exit
 }
@@ -206,6 +207,7 @@ pub fn spawn_thread(space: &Arc<Space>, th: Arc<Thread>, start: ThreadStart) {
         // joiner that sees the exit may therefore still see the thread registered for an instant.
         t.set_exit(exit);
         space.note_exit(&t, exit);
+        t.retire();
         space.reap(t.tid());
     })
     .data(th)
@@ -295,11 +297,21 @@ fn run_ctx(thread: &Thread, process: &Arc<Space>, ctx: UserContext) -> Exit {
     space.activate();
     let mut um = UserMode::new(ctx);
     loop {
+        // Before every entry to ring 3, and so after every syscall, fault and kernel event: a
+        // killed thread never runs user code again.
+        if thread.is_killed() {
+            return Exit::Killed;
+        }
         let reason = um.execute(thread);
         // Ring 3 may have moved FS (OSTD turns on FSGSBASE): keep it for the next entry.
         let mut fs = FsBase::default();
         fs.save();
         thread.set_fs_base(fs.addr());
+        // Killed while in ring 3: whatever brought it back (a kernel event, a syscall it issued
+        // as the kill landed) is not served.
+        if thread.is_killed() {
+            return Exit::Killed;
+        }
         let ctx = um.context_mut();
         match reason {
             ReturnReason::UserSyscall => {

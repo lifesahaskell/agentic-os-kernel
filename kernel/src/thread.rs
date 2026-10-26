@@ -22,7 +22,7 @@ use ostd::{
 
 use crate::{
     agent::{Agent, Payer},
-    ipc::ReplyTable,
+    ipc::{IpcError, ReplyTable},
     space::Space,
     user::Exit,
 };
@@ -30,7 +30,7 @@ use crate::{
 /// Why `Thread::block_until` gave up.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BlockError {
-    /// A redirect is pending (`Thread::interrupt`).
+    /// A redirect is pending (`Thread::interrupt`), or the thread was killed.
     Interrupted,
     /// The deadline tick was reached.
     TimedOut,
@@ -119,6 +119,9 @@ pub struct Thread {
     fs_base: AtomicUsize,
     /// How the thread's run ended; `None` while it can still run.
     exited: SpinLock<Option<Exit>, LocalIrqDisabled>,
+    /// Set by `kill`, never cleared: every blocking wait gives up and ring 3 is never entered
+    /// again.
+    killed: AtomicBool,
     // IRQ-safe: a timer callback may interrupt the thread.
     state: SpinLock<State, LocalIrqDisabled>,
 }
@@ -141,6 +144,7 @@ impl Thread {
             fpu: Arc::new(SpinLock::new(FpuContext::default())),
             fs_base: AtomicUsize::new(0),
             exited: SpinLock::new(None),
+            killed: AtomicBool::new(false),
             state: SpinLock::new(State {
                 redirect: None,
                 blocked: None,
@@ -237,6 +241,40 @@ impl Thread {
         }
     }
 
+    /// Kills the thread: every wait it is in, or enters, gives up (`Interrupted`, even an
+    /// uninterruptible one), and `run_ctx` ends its run as `Exit::Killed` before it next enters
+    /// ring 3. Nothing is redirected. The flag is set before the blocked waker is read, and a wait
+    /// publishes its waker before it reads the flag, so a kill either finds the waker or is seen
+    /// by the wait's cancel check.
+    pub fn kill(&self) {
+        self.killed.store(true, Ordering::SeqCst);
+        let waker = self.state.lock().blocked.clone();
+        if let Some(w) = waker {
+            w.wake_up();
+        }
+    }
+
+    pub fn is_killed(&self) -> bool {
+        self.killed.load(Ordering::SeqCst)
+    }
+
+    /// The thread's last act, run on its way out of the space: every call parked in its reply
+    /// table is failed with `Dead` (the callers wake instead of waiting for an answer that cannot
+    /// come), pending Cancels are dropped, and the FPU is released if the CPU still holds this
+    /// thread's state.
+    pub fn retire(&self) {
+        // Taken out under the lock, failed after it: `fail` wakes the caller.
+        let parked = self.replies.lock().drain();
+        for w in parked {
+            w.fail(IpcError::Dead);
+        }
+        self.cancels.lock().clear();
+        let mut owner = FPU_OWNER.lock();
+        if owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, &self.fpu)) {
+            *owner = None;
+        }
+    }
+
     /// Queues a Cancel for the call parked under `handle` and wakes this thread if it is blocked,
     /// so a receive in progress delivers it. Unlike `interrupt`, nothing is redirected.
     pub(crate) fn push_cancel(&self, handle: u64) {
@@ -279,13 +317,14 @@ impl Thread {
     }
 
     /// `block_until` that no interrupt can abort and with no deadline: for a caller whose request
-    /// the server already holds, which must see the answer (Cancel-then-wait). Only returns once
-    /// `cond` yields.
-    pub fn block_until_committed<R>(&self, wq: &WaitQueue, cond: impl FnMut() -> Option<R>) -> R {
-        match self.block(wq, cond, None, false) {
-            Ok(r) => r,
-            Err(_) => unreachable!("an uninterruptible wait without a deadline cannot give up"),
-        }
+    /// the server already holds, which must see the answer (Cancel-then-wait). Returns once `cond`
+    /// yields, or `None` when the thread is killed: a kill is the one thing that ends it early.
+    pub fn block_until_committed<R>(
+        &self,
+        wq: &WaitQueue,
+        cond: impl FnMut() -> Option<R>,
+    ) -> Option<R> {
+        self.block(wq, cond, None, false).ok()
     }
 
     fn block<R>(
@@ -314,7 +353,10 @@ impl Thread {
                 r
             },
             || {
-                if !interruptible {
+                if self.is_killed() {
+                    // In every mode: a kill is not an interrupt a committed wait may ignore.
+                    Err(BlockError::Interrupted)
+                } else if !interruptible {
                     Ok(())
                 } else if self.state.lock().redirect.is_some() {
                     Err(BlockError::Interrupted)
@@ -336,7 +378,7 @@ impl Thread {
 
 impl UserModeHooks for Thread {
     fn has_kernel_event(&self) -> bool {
-        self.state.lock().redirect.is_some()
+        self.is_killed() || self.state.lock().redirect.is_some()
     }
 
     /// Hands the CPU's FPU/SSE registers to this thread: if another thread owns them, save its

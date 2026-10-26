@@ -35,8 +35,9 @@ pub const MAX_THREADS_PER_SPACE: usize = 64;
 
 /// A process: an address space, the agent that owns it, and its threads.
 ///
-/// Teardown (D-01, process level): when the last thread is reaped, the space unmaps the memory it
-/// owns, drops the notify capability, and uncharges every page it charged to its owner. The
+/// Teardown (D-01, process level): when the last thread is reaped (or at `kill`, when none is
+/// live), the space unmaps the memory it owns, drops the notify capability, and uncharges every
+/// page it charged to its owner. The
 /// `Space` itself stays as a tombstone until its last capability drops (OD-14): `dying` is set and
 /// `register` answers `Dead`.
 ///
@@ -56,8 +57,11 @@ pub struct Space {
     notify: SpinLock<Option<Cap>>,
     /// Pages charged to `owner` through this space (see `impl Payer`), refunded at teardown.
     charged_pages: AtomicUsize,
-    /// Set once, by whoever wins the swap and tears the space down. Never cleared.
+    /// Set once the space is going away, by a kill or by the last thread leaving; `register`
+    /// refuses from then on. Never cleared. Set under the `threads` lock.
     dying: AtomicBool,
+    /// Set by whoever wins the swap and runs `teardown`, so it runs once.
+    torn: AtomicBool,
     /// Whether teardown unmaps `vm`. False when the caller keeps the memory (`adopt`).
     owns_vm: bool,
 }
@@ -71,6 +75,7 @@ impl Space {
             notify: SpinLock::new(None),
             charged_pages: AtomicUsize::new(charged),
             dying: AtomicBool::new(false),
+            torn: AtomicBool::new(false),
             owns_vm,
         })
     }
@@ -131,8 +136,26 @@ impl Space {
     }
 
     /// Kills the process from outside (OD-15; a kernel API, ring 3 gets it with procmgr).
+    ///
+    /// `dying` is set under the `threads` lock, so `register` refuses from then on, and every live
+    /// thread is killed: each leaves its waits, ends as `Exit::Killed` (a note goes out like any
+    /// exit), retires and is reaped, and the last reap tears the space down. A space with no live
+    /// thread is torn down here. Returns without waiting for any of it.
     pub fn kill(&self) {
-        todo!("Space::kill")
+        let (victims, no_thread_left) = {
+            let threads = self.threads.lock();
+            self.dying.store(true, Ordering::Release);
+            let victims: Vec<Arc<Thread>> =
+                threads.iter().filter_map(|(_, w)| w.upgrade()).collect();
+            let none = victims.is_empty();
+            (victims, none && !self.torn.swap(true, Ordering::AcqRel))
+        };
+        for t in &victims {
+            t.kill();
+        }
+        if no_thread_left {
+            self.teardown();
+        }
     }
 
     /// Takes back a registration that never ran. Does not tear the space down.
@@ -147,14 +170,17 @@ impl Space {
             threads.retain(|(t, _)| *t != tid);
             let empty = !threads.iter().any(|(_, w)| w.strong_count() > 0);
             // Set under the lock `register` takes, so no registration slips in after the decision.
-            empty && !self.dying.swap(true, Ordering::AcqRel)
+            if empty {
+                self.dying.store(true, Ordering::Release);
+            }
+            empty && !self.torn.swap(true, Ordering::AcqRel)
         };
         if last {
             self.teardown();
         }
     }
 
-    /// The work of teardown. The caller won the `dying` swap, so it runs once. In order: take the
+    /// The work of teardown. The caller won the `torn` swap, so it runs once. In order: take the
     /// notify capability (nothing is sent after the process is gone), unmap what the space owns,
     /// refund what it charged. A space that does not own its `vm` unmaps nothing and refunds
     /// nothing: the pages it charged are still mapped, by the caller.
@@ -259,9 +285,9 @@ impl Payer for Space {
 
 impl Drop for Space {
     /// A space that never started a thread still frees what it holds when its last reference
-    /// drops. `dying` makes this a no-op after a real teardown.
+    /// drops. `torn` makes this a no-op after a real teardown.
     fn drop(&mut self) {
-        if !self.dying.swap(true, Ordering::AcqRel) {
+        if !self.torn.swap(true, Ordering::AcqRel) {
             self.teardown();
         }
     }
