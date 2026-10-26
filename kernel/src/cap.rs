@@ -1,11 +1,14 @@
 //! Capability space: rights-masked handles, attenuating derive, and per-grant revocation through
 //! forwarders (EROS/Coyotos style, see docs/architecture/option-b-microkernel.md section 2.2).
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 
 use ostd::sync::SpinLock;
 
-use crate::{agent::Agent, ipc::Endpoint};
+use crate::{agent::Agent, ipc::Endpoint, space::Space, thread::Thread};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rights(u32);
@@ -16,7 +19,11 @@ impl Rights {
     pub const RECV: Self = Self(2);
     /// May derive or grant copies of this capability.
     pub const GRANT: Self = Self(4);
-    pub const ALL: Self = Self(7);
+    /// May start threads in the Space this capability names.
+    pub const CREATE: Self = Self(8);
+    /// May interrupt the Thread this capability names.
+    pub const SIGNAL: Self = Self(16);
+    pub const ALL: Self = Self(31);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -40,6 +47,10 @@ impl Rights {
 pub enum Object {
     Endpoint(Arc<Endpoint>),
     Agent(Arc<Agent>),
+    /// A process: an address space and the agent that owns it. The capability keeps it alive.
+    Space(Arc<Space>),
+    /// A thread, held weakly: a Thread capability never keeps a thread or its agent alive (OD-14).
+    Thread(Weak<Thread>),
 }
 
 #[derive(Debug, PartialEq, Eq)]

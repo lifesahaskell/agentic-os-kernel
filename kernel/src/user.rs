@@ -10,23 +10,24 @@ use abi::{
 use alloc::sync::Arc;
 
 use ostd::{
-    arch::cpu::context::{CpuException, PageFaultErrorCode, UserContext},
+    arch::cpu::context::{CpuException, FsBase, PageFaultErrorCode, UserContext},
     mm::{
         CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, UFrame, Vaddr, VmIo,
         VmSpace,
     },
-    task::disable_preempt,
+    task::{TaskOptions, disable_preempt},
     user::{ReturnReason, UserMode},
 };
 
 use crate::{
     cap::{Object, Rights},
+    space::{Space, ThreadStart},
     syscall::{self, Outcome},
     thread::{ExcReply, Thread},
     vm::handle_cow_fault,
 };
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
     Code(usize),
     /// A fault that is not copy-on-write.
@@ -154,7 +155,40 @@ pub fn start(thread: &Thread, img: &Image, arg: u64) -> Exit {
     ctx.set_rip(img.entry);
     ctx.set_rsp(USER_STACK_TOP);
     ctx.set_rdi(arg as usize);
-    run_ctx(thread, &img.space, ctx)
+    start_ctx(thread, &img.space, ctx)
+}
+
+/// Runs `ctx` on `thread` in a new process that wraps `vm` and is owned by the thread's agent.
+fn start_ctx(thread: &Thread, vm: &Arc<VmSpace>, ctx: UserContext) -> Exit {
+    let space = Space::new(vm.clone(), thread.agent().clone());
+    thread.clear_exit();
+    space
+        .register(thread)
+        .expect("a new space has room for its first thread");
+    let exit = run_ctx(thread, &space, ctx);
+    space.reap(thread.tid());
+    thread.set_exit(exit);
+    exit
+}
+
+/// Starts a thread that `space::thread_create` made: it runs `start` in `space` on its own task
+/// and, when its run ends, leaves the space's thread list and records its exit.
+pub fn spawn_thread(space: &Arc<Space>, th: Arc<Thread>, start: ThreadStart) {
+    let mut ctx = UserContext::default();
+    ctx.set_rip(start.rip as usize);
+    ctx.set_rsp(start.rsp as usize);
+    ctx.set_rdi(start.arg as usize);
+    th.set_fs_base(start.fs_base as usize);
+    let (space, t) = (space.clone(), th.clone());
+    TaskOptions::new(move || {
+        let exit = run_ctx(&t, &space, ctx);
+        // Unregistered first, so whoever sees the exit also sees the thread gone from the space.
+        space.reap(t.tid());
+        t.set_exit(exit);
+    })
+    .data(th)
+    .spawn()
+    .expect("spawning a thread task");
 }
 
 /// The bytes of `userland/out/<name>.bin`, built by `userland/build.sh` before `cargo osdk`.
@@ -239,12 +273,17 @@ fn deliver(thread: &Thread, exc: CpuException, rip: usize) -> Option<Exit> {
     }
 }
 
-fn run_ctx(thread: &Thread, space: &Arc<VmSpace>, ctx: UserContext) -> Exit {
-    thread.set_space(space.clone());
+fn run_ctx(thread: &Thread, process: &Arc<Space>, ctx: UserContext) -> Exit {
+    thread.set_process(process.clone());
+    let space = process.vm();
     space.activate();
     let mut um = UserMode::new(ctx);
     loop {
         let reason = um.execute(thread);
+        // Ring 3 may have moved FS (OSTD turns on FSGSBASE): keep it for the next entry.
+        let mut fs = FsBase::default();
+        fs.save();
+        thread.set_fs_base(fs.addr());
         let ctx = um.context_mut();
         match reason {
             ReturnReason::UserSyscall => {
@@ -326,6 +365,17 @@ pub(crate) mod testkit {
     pub fn join(e: &ExitSlot) -> Exit {
         loop {
             if let Some(x) = e.lock().take() {
+                return x;
+            }
+            Task::yield_now();
+        }
+    }
+
+    /// Waits, yielding, until `t`'s run has ended, and returns how. For a thread whose task
+    /// `space::thread_create` spawned, so there is no `ExitSlot` to join.
+    pub fn join_thread(t: &Arc<Thread>) -> Exit {
+        loop {
+            if let Some(x) = t.exit_status() {
                 return x;
             }
             Task::yield_now();
@@ -455,7 +505,7 @@ mod test {
         ctx.set_rip(img.entry);
         ctx.set_rsp(sp);
         ctx.set_rdi(0);
-        run_ctx(thread, &img.space, ctx)
+        start_ctx(thread, &img.space, ctx)
     }
 
     /// CR-01: `_start` aligns `rsp` and `call`s, and the call's return-address push is an 8-byte

@@ -9,10 +9,10 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use ostd::{
-    arch::cpu::context::FpuContext,
+    arch::cpu::context::{FpuContext, FsBase},
     irq::DisabledLocalIrqGuard,
     mm::{Vaddr, VmSpace},
     sync::{LocalIrqDisabled, SpinLock, WaitQueue, Waiter, Waker},
@@ -20,7 +20,7 @@ use ostd::{
     user::UserModeHooks,
 };
 
-use crate::{agent::Agent, cap::Cap, ipc::ReplyTable};
+use crate::{agent::Agent, cap::Cap, ipc::ReplyTable, space::Space, user::Exit};
 
 /// Why `Thread::block_until` gave up.
 #[derive(Debug, PartialEq, Eq)]
@@ -86,6 +86,9 @@ struct State {
     blocked: Option<Arc<Waker>>,
     /// The address space the thread runs in, loaded on every switch to its task.
     space: Option<Arc<VmSpace>>,
+    /// The process this thread runs in. `space` is its `vm`, kept separately so the scheduler hook
+    /// and the futex code never see the process.
+    process: Option<Arc<Space>>,
     /// The handler's answer to the exception message this thread is waiting on.
     exc_reply: Option<ExcReply>,
 }
@@ -119,6 +122,10 @@ pub struct Thread {
     pub(crate) cancels: SpinLock<VecDeque<u64>>,
     /// This thread's saved FPU/SSE state; live in the CPU only while `FPU_OWNER` points here.
     fpu: SharedFpu,
+    /// The user-mode FS base: saved after every return from ring 3, loaded before every entry.
+    fs_base: AtomicUsize,
+    /// How the thread's run ended; `None` while it can still run.
+    exited: SpinLock<Option<Exit>, LocalIrqDisabled>,
     // IRQ-safe: a timer callback may interrupt the thread.
     state: SpinLock<State, LocalIrqDisabled>,
     /// Where this thread's user exceptions are sent. Kept as the capability, not the endpoint,
@@ -143,10 +150,13 @@ impl Thread {
             replies: SpinLock::new(ReplyTable::default()),
             cancels: SpinLock::new(VecDeque::new()),
             fpu: Arc::new(SpinLock::new(FpuContext::default())),
+            fs_base: AtomicUsize::new(0),
+            exited: SpinLock::new(None),
             state: SpinLock::new(State {
                 redirect: None,
                 blocked: None,
                 space: None,
+                process: None,
                 exc_reply: None,
             }),
             exc_handler: SpinLock::new(None),
@@ -173,6 +183,42 @@ impl Thread {
     pub fn set_space(&self, space: Arc<VmSpace>) {
         // Bound so the old space, if any, drops after the IRQ-disabled lock is released.
         let _old = self.state.lock().space.replace(space);
+    }
+
+    /// Attaches the thread to `process` and its address space. For a thread that runs ring-3 code;
+    /// `set_space` is for kernel-only threads that have no process.
+    pub fn set_process(&self, process: Arc<Space>) {
+        let vm = process.vm().clone();
+        let _old = {
+            let mut s = self.state.lock();
+            (s.process.replace(process), s.space.replace(vm))
+        };
+    }
+
+    pub fn process(&self) -> Option<Arc<Space>> {
+        self.state.lock().process.clone()
+    }
+
+    pub fn set_fs_base(&self, base: usize) {
+        self.fs_base.store(base, Ordering::Relaxed);
+    }
+
+    pub fn fs_base(&self) -> usize {
+        self.fs_base.load(Ordering::Relaxed)
+    }
+
+    /// Records how the thread's run ended.
+    pub fn set_exit(&self, exit: Exit) {
+        *self.exited.lock() = Some(exit);
+    }
+
+    /// Forgets a previous run's exit, for a thread that is started again.
+    pub fn clear_exit(&self) {
+        *self.exited.lock() = None;
+    }
+
+    pub fn exit_status(&self) -> Option<Exit> {
+        *self.exited.lock()
     }
 
     pub fn set_exception_handler(&self, cap: Cap) {
@@ -324,6 +370,8 @@ impl UserModeHooks for Thread {
     /// Hands the CPU's FPU/SSE registers to this thread: if another thread owns them, save its
     /// state and load ours. Kernel code is soft-float, so nothing else touches them in between.
     fn pre_user_run(&self, _guard: &DisabledLocalIrqGuard) {
+        // Before the FPU early returns: every entry to ring 3 carries this thread's own FS base.
+        FsBase::new(self.fs_base()).load();
         #[cfg(ktest)]
         if FPU_SWAP_DISABLED.load(core::sync::atomic::Ordering::Relaxed) {
             return;
