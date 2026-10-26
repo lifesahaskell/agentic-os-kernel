@@ -121,6 +121,29 @@ fn wake_all(ws: &[Arc<Waiter>]) {
 
 /// Blocks while `*va == expected`, until woken or interrupted.
 pub fn wait(t: &Thread, space: &VmSpace, va: Vaddr, expected: u32) -> Result<(), FutexError> {
+    wait_until(t, space, va, expected, None)
+}
+
+/// The zero-timeout wait: reads the word once and never blocks. `Again` if it differs from
+/// `expected`, otherwise `TimedOut`, because a wait that cannot sleep has already run out.
+pub fn probe(t: &Thread, space: &VmSpace, va: Vaddr, expected: u32) -> Result<(), FutexError> {
+    let (frame, off) = lookup(space, t, va)?;
+    let v: u32 = frame.read_val(off).map_err(|_| FutexError::Fault)?;
+    if v != expected {
+        return Err(FutexError::Again);
+    }
+    Err(FutexError::TimedOut)
+}
+
+/// `wait` that also gives up with `TimedOut` once the absolute `Jiffies` tick `deadline` is
+/// reached. A wake that races the deadline (or an interrupt) wins, as in `wait`.
+pub fn wait_until(
+    t: &Thread,
+    space: &VmSpace,
+    va: Vaddr,
+    expected: u32,
+    deadline: Option<u64>,
+) -> Result<(), FutexError> {
     let (frame, off) = lookup(space, t, va)?;
     let key = frame.paddr() + off;
     let w = Arc::new(Waiter {
@@ -146,13 +169,13 @@ pub fn wait(t: &Thread, space: &VmSpace, va: Vaddr, expected: u32) -> Result<(),
     let blocked = t.block_until(
         &w.wq,
         || w.woken.load(Ordering::Acquire).then_some(()),
-        None,
+        deadline,
     );
     match blocked {
         Ok(()) => Ok(()),
         Err(e) => {
             let mut tab = TABLE.lock();
-            // A wake that raced the interrupt wins, so it is not lost.
+            // A wake that raced the interrupt or the deadline wins, so it is not lost.
             if w.woken.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -228,4 +251,68 @@ pub fn requeue(
     };
     wake_all(&woken);
     Ok((woken.len(), moved))
+}
+
+#[cfg(ktest)]
+mod test {
+    use abi::{USER_STACK_PAGES, USER_STACK_TOP};
+    use ostd::{mm::PAGE_SIZE, prelude::*, timer::Jiffies};
+
+    use super::*;
+    use crate::{
+        agent::Agent,
+        user::{
+            Exit, load_image,
+            testkit::{join, spawn_image},
+            user_image,
+        },
+    };
+
+    /// OD-09: a wait of D ticks ends in [D+1, D+3] ticks on `-smp 1` with nothing else runnable.
+    #[ktest]
+    fn timeout_futex_expires_within_tolerance() {
+        const D: u64 = 10;
+        let img = load_image(user_image!("tracer")).unwrap();
+        // A zeroed stack word: it holds 0, so waiting for 0 blocks.
+        let word = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE + 0x100;
+        let t = Thread::new(Agent::new_root(1, 64));
+        img.space.activate();
+        t.set_space(img.space.clone());
+
+        // Warm-up, not measured: the first timed wait registers the deadline callback and runs
+        // every path cold. Under QEMU TCG that first run measured 15 ticks for D = 10 (the
+        // translator compiles each block on first use); warm runs measured 11 or 12.
+        let now = Jiffies::elapsed().as_u64();
+        assert_eq!(
+            wait_until(&t, &img.space, word, 0, Some(now + 3)),
+            Err(FutexError::TimedOut)
+        );
+
+        let start = Jiffies::elapsed().as_u64();
+        let r = wait_until(&t, &img.space, word, 0, Some(start + D + 1));
+        let elapsed = Jiffies::elapsed().as_u64() - start;
+        println!(
+            "aok: timeout_futex kernel D={} elapsed={} ticks",
+            D, elapsed
+        );
+
+        assert_eq!(r, Err(FutexError::TimedOut));
+        assert!((D + 1..=D + 3).contains(&elapsed), "elapsed {elapsed}");
+        assert_eq!(wake(&t, &img.space, word, 10), Ok(0), "waiter was removed");
+    }
+
+    #[ktest]
+    fn timeout_futex_ring3_never_early() {
+        let img = load_image(user_image!("timeout")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 64));
+
+        let start = Jiffies::elapsed().as_u64();
+        let exit = spawn_image(&t, &img, 0);
+        let code = join(&exit);
+        let elapsed = Jiffies::elapsed().as_u64() - start;
+        println!("aok: timeout_futex ring3 20 ms elapsed={} ticks", elapsed);
+
+        assert_eq!(code, Exit::Code(0));
+        assert!((20..=40).contains(&elapsed), "elapsed {elapsed}");
+    }
 }

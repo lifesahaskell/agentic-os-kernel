@@ -9,9 +9,9 @@ use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
     IpcArgs, MAX_IPC_BYTES, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV,
-    SYS_SCHED_YIELD, USER_TOP, errno,
+    SYS_SCHED_YIELD, Timespec, USER_TOP, errno,
 };
-use ostd::{mm::VmSpace, task::Task};
+use ostd::{mm::VmSpace, task::Task, timer::Jiffies};
 
 use crate::{
     agent::AgentError,
@@ -19,6 +19,7 @@ use crate::{
     futex::{self, FutexError},
     ipc::{self, IpcError},
     thread::Thread,
+    vm::copy_from_user,
 };
 
 /// A positive errno value; `dispatch` returns it negated.
@@ -188,6 +189,8 @@ pub enum Syscall {
     FutexWait {
         addr: UserPtr<u32>,
         val: u32,
+        /// A relative timeout; `None` waits until woken or interrupted.
+        timeout: Option<UserPtr<Timespec>>,
     },
     FutexWake {
         addr: UserPtr<u32>,
@@ -235,12 +238,16 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
             let (val, val2, val3) = (a[2], a[3], a[5]);
             let n = val as u32 as usize;
             match a[1] & !FUTEX_PRIVATE_FLAG {
-                // shortcut: no timeouts; add one with a timer callback when pthread_cond_timedwait
-                // needs it.
-                FUTEX_WAIT if val2 != 0 => return Err(Errno::ENOSYS),
+                // `a[3]` is a relative timeout as in futex(2); null waits forever. The pointer is
+                // read in dispatch, so an unmapped one is EFAULT from the copy.
                 FUTEX_WAIT => Syscall::FutexWait {
                     addr: UserPtr::new(a[0])?,
                     val: val as u32,
+                    timeout: if val2 == 0 {
+                        None
+                    } else {
+                        Some(UserPtr::new(val2)?)
+                    },
                 },
                 FUTEX_WAKE => Syscall::FutexWake {
                     addr: UserPtr::new(a[0])?,
@@ -289,6 +296,50 @@ fn ret(r: Result<usize, Errno>) -> Outcome {
     })
 }
 
+/// Whole milliseconds in `ts`, rounded up, saturating. `EINVAL` for a negative `sec` or an `nsec`
+/// outside `[0, 1e9)`.
+fn timespec_ms(ts: Timespec) -> Result<u64, Errno> {
+    if ts.sec < 0 || !(0..1_000_000_000).contains(&ts.nsec) {
+        return Err(Errno::EINVAL);
+    }
+    Ok((ts.sec as u64)
+        .saturating_mul(1000)
+        .saturating_add((ts.nsec as u64).div_ceil(1_000_000)))
+}
+
+/// `FUTEX_WAIT`. With a timeout of `ms` the deadline is `now + ms + 1` ticks: the extra tick covers
+/// the part of the current tick already elapsed, so the wait is never early. A zero timeout reads
+/// the word and never blocks.
+fn futex_wait(
+    t: &Thread,
+    space: &VmSpace,
+    addr: UserPtr<u32>,
+    val: u32,
+    timeout: Option<UserPtr<Timespec>>,
+) -> Result<(), Errno> {
+    let Some(p) = timeout else {
+        return Ok(futex::wait(t, space, addr.addr(), val)?);
+    };
+    let mut raw = [0u8; size_of::<Timespec>()];
+    let src = UserSlice::new(p.addr(), size_of::<Timespec>())?;
+    copy_from_user(space, &mut raw, src)?;
+    let ms = timespec_ms(Timespec::from_bytes(&raw))?;
+    if ms == 0 {
+        return Ok(futex::probe(t, space, addr.addr(), val)?);
+    }
+    let deadline = Jiffies::elapsed()
+        .as_u64()
+        .saturating_add(ms)
+        .saturating_add(1);
+    Ok(futex::wait_until(
+        t,
+        space,
+        addr.addr(),
+        val,
+        Some(deadline),
+    )?)
+}
+
 /// Runs `call` for thread `t`, whose address space `space` is active.
 pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
     match call {
@@ -297,9 +348,9 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
             Task::yield_now();
             Outcome::Return(0)
         }
-        Syscall::FutexWait { addr, val } => ret(futex::wait(t, space, addr.addr(), val)
-            .map(|()| 0)
-            .map_err(Errno::from)),
+        Syscall::FutexWait { addr, val, timeout } => {
+            ret(futex_wait(t, space, addr, val, timeout).map(|()| 0))
+        }
         Syscall::FutexWake { addr, n } => {
             ret(futex::wake(t, space, addr.addr(), n).map_err(Errno::from))
         }
@@ -341,8 +392,62 @@ mod test {
             err(SYS_FUTEX, [0x1000, 99, 0, 0, 0, 0]),
             Some(Errno::ENOSYS)
         );
-        // A futex wait with a timeout is not implemented.
-        assert_eq!(err(SYS_FUTEX, [0x1000, 0, 0, 1, 0, 0]), Some(Errno::ENOSYS));
+        // A futex wait takes its timeout from a[3]: null is none, a pointer is read in dispatch.
+        assert_eq!(
+            decode(SYS_FUTEX, [0x1000, 0, 7, 0, 0, 0]),
+            Ok(Syscall::FutexWait {
+                addr: UserPtr::new(0x1000).unwrap(),
+                val: 7,
+                timeout: None,
+            })
+        );
+        assert_eq!(
+            decode(SYS_FUTEX, [0x1000, 0, 7, 0x2000, 0, 0]),
+            Ok(Syscall::FutexWait {
+                addr: UserPtr::new(0x1000).unwrap(),
+                val: 7,
+                timeout: Some(UserPtr::new(0x2000).unwrap()),
+            })
+        );
+        assert_eq!(
+            err(SYS_FUTEX, [0x1000, 0, 0, KERNEL_HALF, 0, 0]),
+            Some(Errno::EFAULT)
+        );
+        assert_eq!(
+            err(SYS_FUTEX, [0x1000, 0, 0, USER_TOP - 8, 0, 0]),
+            Some(Errno::EFAULT)
+        );
+        assert_eq!(timespec_ms(Timespec { sec: 0, nsec: 0 }), Ok(0));
+        assert_eq!(timespec_ms(Timespec { sec: 0, nsec: 1 }), Ok(1));
+        assert_eq!(
+            timespec_ms(Timespec {
+                sec: 1,
+                nsec: 1_000_001
+            }),
+            Ok(1002)
+        );
+        assert_eq!(
+            timespec_ms(Timespec {
+                sec: i64::MAX,
+                nsec: 999_999_999
+            }),
+            Ok(u64::MAX)
+        );
+        assert_eq!(
+            timespec_ms(Timespec { sec: -1, nsec: 0 }),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            timespec_ms(Timespec { sec: 0, nsec: -1 }),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            timespec_ms(Timespec {
+                sec: 0,
+                nsec: 1_000_000_000
+            }),
+            Err(Errno::EINVAL)
+        );
         assert_eq!(decode(SYS_EXIT, [7, 0, 0, 0, 0, 0]), Ok(Syscall::Exit(7)));
         assert_eq!(decode(SYS_SCHED_YIELD, z), Ok(Syscall::SchedYield));
 
@@ -517,10 +622,19 @@ mod test {
 
         // Each decode and copy error path once, with its exact errno.
         let z = [0usize; 6];
-        let targeted: [(usize, [usize; 6], isize); 11] = [
+        let targeted: [(usize, [usize; 6], isize); 13] = [
             (0xFFFF, z, errno::ENOSYS),
             (SYS_FUTEX, [mapped, 99, 0, 0, 0, 0], errno::ENOSYS),
-            (SYS_FUTEX, [mapped, 0, 0, 1, 0, 0], errno::ENOSYS),
+            // The timeout pointer is address 1, which is unmapped.
+            (SYS_FUTEX, [mapped, 0, 0, 1, 0, 0], errno::EFAULT),
+            // A zero Timespec (the stack page is zeroed) against a word holding 0: never blocks.
+            (
+                SYS_FUTEX,
+                [mapped, 0, 0, mapped + 64, 0, 0],
+                errno::ETIMEDOUT,
+            ),
+            // Same word, a different expected value: EAGAIN, still without blocking.
+            (SYS_FUTEX, [mapped, 0, 1, mapped + 64, 0, 0], errno::EAGAIN),
             (SYS_CALL, [0, KERNEL_HALF, 0, 0, 0, 0], errno::EFAULT),
             (SYS_CALL, [0, USER_TOP - 100, 0, 0, 0, 0], errno::EFAULT),
             (SYS_CALL, [0, 0x1000, 0, 0, 0, 0], errno::EFAULT),
@@ -540,6 +654,21 @@ mod test {
                 a
             );
         }
+
+        // An out-of-range nsec is EINVAL. The bytes are written first and zeroed again after, so
+        // the zero-Timespec cases above and the random cases below see the page they expect.
+        let ts_at = UserSlice::new(mapped + 64, size_of::<Timespec>()).unwrap();
+        let bad = Timespec {
+            sec: 0,
+            nsec: 1_000_000_000,
+        };
+        crate::vm::copy_to_user(space, t.agent(), ts_at, &bad.to_bytes()).unwrap();
+        assert_eq!(
+            step(&t, space, SYS_FUTEX, [mapped, 0, 0, mapped + 64, 0, 0]),
+            -errno::EINVAL,
+            "targeted nsec = 1e9"
+        );
+        crate::vm::copy_to_user(space, t.agent(), ts_at, &[0u8; 16]).unwrap();
 
         let mut rng = Rng(0x9E3779B97F4A7C15);
         let numbers = [

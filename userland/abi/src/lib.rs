@@ -116,6 +116,40 @@ impl IpcArgs {
     }
 }
 
+/// A relative timeout, as `FUTEX_WAIT` reads it from `a[3]`: `sec >= 0` and `0 <= nsec < 1e9`,
+/// otherwise the call is `EINVAL`. The kernel rounds up to whole 1 ms ticks.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Timespec {
+    pub sec: i64,
+    pub nsec: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<Timespec>() == 16);
+
+impl Timespec {
+    /// The wire form: two little-endian i64, which is the `repr(C)` layout.
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.sec.to_le_bytes());
+        out[8..].copy_from_slice(&self.nsec.to_le_bytes());
+        out
+    }
+
+    pub fn from_bytes(b: &[u8; 16]) -> Self {
+        let (s, n) = b.split_at(8);
+        Self {
+            sec: i64::from_le_bytes(s.try_into().unwrap()),
+            nsec: i64::from_le_bytes(n.try_into().unwrap()),
+        }
+    }
+}
+
+/// Longest timeout, in milliseconds, for a timed `recv`, a timed `reply_recv` and `SYS_TIMER_ARM`
+/// (ten minutes). A larger value is `EINVAL`. A futex timespec is not capped: its tick count
+/// saturates.
+pub const MAX_TIMEOUT_MS: u64 = 600_000;
+
 /// First address above user space on x86-64 (47-bit canonical lower half).
 pub const USER_TOP: usize = 0x0000_8000_0000_0000;
 /// Largest byte count the kernel copies for one syscall buffer.
