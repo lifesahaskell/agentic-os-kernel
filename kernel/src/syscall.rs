@@ -72,6 +72,7 @@ impl From<AgentError> for Errno {
     fn from(e: AgentError) -> Self {
         match e {
             AgentError::Budget => Errno::ENOMEM,
+            AgentError::NoMemory => Errno::ENOMEM,
             AgentError::Cap(c) => c.into(),
         }
     }

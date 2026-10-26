@@ -59,11 +59,25 @@ pub fn cow_clone(parent: &VmSpace, range: Range<Vaddr>) -> VmSpace {
 }
 
 /// Resolves a write fault at `addr` if it hit a copy-on-write page. Returns `Ok(false)` for any
-/// other fault (a real SIGSEGV). The copy is charged to `agent`.
+/// other fault (a real SIGSEGV), including an address outside the user half. The copy is charged
+/// to `agent`.
+///
+/// `addr` comes straight from a ring-3 fault and can be anything. Once it is below `USER_TOP` and
+/// `cursor_mut` accepted the page, the `query` and `jump` unwraps below cannot fail: the page is
+/// inside the user page table.
 pub fn handle_cow_fault(space: &VmSpace, agent: &Agent, addr: Vaddr) -> Result<bool, AgentError> {
+    // A ring-3 write fault can carry any address, and nothing at or above `USER_TOP` is a page of
+    // this space. This also keeps `page + PAGE_SIZE` from overflowing.
+    if addr >= abi::USER_TOP {
+        return Ok(false);
+    }
     let page = addr & !(PAGE_SIZE - 1);
     let guard = disable_preempt();
-    let mut c = space.cursor_mut(&guard, &(page..page + PAGE_SIZE)).unwrap();
+    // Defence in depth: OSTD rejects a range outside the user page table, and that stays a
+    // declined fault, not a panic.
+    let Ok(mut c) = space.cursor_mut(&guard, &(page..page + PAGE_SIZE)) else {
+        return Ok(false);
+    };
     let (mut prop, old) = match c.query().unwrap().1 {
         Some(VmQueriedItem::MappedRam { frame, prop }) if prop.flags.contains(COW) => {
             // Read before cloning: the count includes page-table mappings, so 1 means this
@@ -82,8 +96,12 @@ pub fn handle_cow_fault(space: &VmSpace, agent: &Agent, addr: Vaddr) -> Result<b
         return Ok(true);
     };
 
+    // Allocating first means a failed allocation charges nothing, and a refused charge frees the
+    // frame when `new` drops. No refund path is needed.
+    let new = FrameAllocOptions::new()
+        .alloc_frame()
+        .map_err(|_| AgentError::NoMemory)?;
     agent.charge_pages(1)?;
-    let new = FrameAllocOptions::new().alloc_frame().unwrap();
     new.writer().write(&mut old.reader());
     c.unmap(PAGE_SIZE);
     c.jump(page).unwrap();
@@ -264,5 +282,34 @@ mod test {
             Err(Errno::ENOMEM)
         );
         assert_eq!(byte(&child, DATA), 0xAA);
+        assert_eq!(poor.mem_used_pages(), 0);
+        assert_eq!(Errno::from(AgentError::NoMemory), Errno::ENOMEM);
+    }
+
+    #[ktest]
+    fn cow_fault_outside_user_half_is_declined() {
+        let agent = Agent::new_root(1, 4);
+        let space = space_with(1, 0xAA, PageFlags::RW);
+        // Control: the last user byte is unmapped and inside the user page table, so this
+        // declines at HEAD too. It comes first so a red failure is from the kernel-half cases.
+        assert_eq!(
+            handle_cow_fault(&space, &agent, abi::USER_TOP - 1),
+            Ok(false),
+            "addr {:#x}",
+            abi::USER_TOP - 1
+        );
+        for addr in [
+            0xffff_8000_0000_0000,
+            0xffff_ffff_ffff_f000,
+            usize::MAX,
+            abi::USER_TOP,
+        ] {
+            assert_eq!(
+                handle_cow_fault(&space, &agent, addr),
+                Ok(false),
+                "addr {addr:#x}"
+            );
+        }
+        assert_eq!(agent.mem_used_pages(), 0);
     }
 }
