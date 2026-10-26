@@ -18,12 +18,13 @@ pub mod user;
 pub mod vm;
 
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use ostd::{
     mm::{FrameAllocOptions, PageFlags},
     power::{ExitCode, poweroff},
     prelude::*,
-    sync::SpinLock,
+    sync::{SpinLock, WaitQueue},
     task::{Task, TaskOptions},
     timer::Jiffies,
 };
@@ -38,6 +39,34 @@ use crate::{
 fn kernel_main() {
     sched::install();
     TaskOptions::new(cpu_budget_check).spawn().unwrap();
+}
+
+/// Blocks the calling kernel task for `ticks` timer ticks, with every other task free to run or
+/// idle. A throwaway root-agent thread carries the wait, as `Thread::block_until` requires.
+fn sleep_ticks(ticks: u64) {
+    let wq = WaitQueue::new();
+    let deadline = Jiffies::elapsed().as_u64() + ticks;
+    let waiter = Thread::new(Agent::new_root(1, 0));
+    let _ = waiter.block_until(&wq, || None::<()>, Some(deadline));
+}
+
+/// With only this task and the idle task alive and this task blocked, the boot CPU must halt:
+/// idle returns from `halt_cpu` about once per tick. A spinning idle counts millions, an idle
+/// that never runs counts none (KERN-07).
+fn idle_halt_check() -> bool {
+    const N: u64 = 50;
+    let halts_before = sched::IDLE_HALTS.load(Ordering::Relaxed);
+    let start = Jiffies::elapsed().as_u64();
+    sleep_ticks(N);
+    let elapsed = Jiffies::elapsed().as_u64() - start;
+    let halts = sched::IDLE_HALTS.load(Ordering::Relaxed) - halts_before;
+    println!("aok: idle halts {} over {} ticks", halts, elapsed);
+    let ok = elapsed >= N && (N / 2..=4 * N).contains(&halts);
+    println!(
+        "aok: idle halt check {}",
+        if ok { "passed" } else { "FAILED" }
+    );
+    ok
 }
 
 /// Two agents each run a ring-3 image that holds a different 16-register xmm pattern in a bare
@@ -87,6 +116,8 @@ fn fpu_preemption_check() -> bool {
 /// the first task. A root agent and a child holding 2 of its 10 ticks per period each spin in
 /// their own address space, until both are redirected to exit.
 fn cpu_budget_check() {
+    // First, before any user image starts: only this task and idle exist.
+    let idle_ok = idle_halt_check();
     let fpu_ok = fpu_preemption_check();
     const RUN_TICKS: u64 = 300;
     const CHILD_QUOTA: u64 = 2;
@@ -114,10 +145,8 @@ fn cpu_budget_check() {
         (t, img, exit)
     });
 
-    // This task is never budgeted, so it is also the idle fallback when both agents are out.
-    while Jiffies::elapsed().as_u64() < start + RUN_TICKS {
-        Task::yield_now();
-    }
+    // Blocked, so the idle task (not this one) is the fallback when both agents are out.
+    sleep_ticks(RUN_TICKS);
     for (t, img, _) in &spinners {
         t.interrupt(img.handler);
     }
@@ -143,7 +172,7 @@ fn cpu_budget_check() {
         "aok: cpu budget check {}",
         if ok { "passed" } else { "FAILED" }
     );
-    poweroff(if ok && fpu_ok {
+    poweroff(if ok && fpu_ok && idle_ok {
         ExitCode::Success
     } else {
         ExitCode::Failure

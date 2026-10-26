@@ -11,6 +11,10 @@ echo "== unsafe_check self-test"
 python3 -I tools/unsafe_check.py --self-test
 echo "== unsafe_check"
 python3 -I tools/unsafe_check.py
+echo "== pin_check self-test"
+sh tools/pin_check.sh --self-test
+echo "== pin_check"
+sh tools/pin_check.sh
 
 cd kernel
 echo "== userland build, fmt, clippy; kernel fmt, clippy"
@@ -27,7 +31,7 @@ if [ "$kvm" = 1 ]; then
   # OSDK reuses the ktest bundle for run unless target/osdk is cleared first.
   ./osdk.sh sh -c 'rm -rf target/osdk && ../userland/build.sh && cargo osdk run' >"$log" 2>&1 || true
   cat "$log"
-  for want in "aok: fpu preemption check passed" "aok: cpu budget check passed"; do
+  for want in "aok: idle halt check passed" "aok: fpu preemption check passed" "aok: cpu budget check passed"; do
     grep -q "$want" "$log" || { echo "check: boot output lacks '$want'" >&2; exit 1; }
   done
   if grep -q FAILED "$log"; then echo "check: boot output contains FAILED" >&2; exit 1; fi
