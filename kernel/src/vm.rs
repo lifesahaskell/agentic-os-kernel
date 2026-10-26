@@ -96,8 +96,12 @@ pub fn handle_cow_fault(space: &VmSpace, agent: &Agent, addr: Vaddr) -> Result<b
         return Ok(true);
     };
 
+    // Allocating first means a failed allocation charges nothing, and a refused charge frees the
+    // frame when `new` drops. No refund path is needed.
+    let new = FrameAllocOptions::new()
+        .alloc_frame()
+        .map_err(|_| AgentError::NoMemory)?;
     agent.charge_pages(1)?;
-    let new = FrameAllocOptions::new().alloc_frame().unwrap();
     new.writer().write(&mut old.reader());
     c.unmap(PAGE_SIZE);
     c.jump(page).unwrap();
@@ -278,6 +282,8 @@ mod test {
             Err(Errno::ENOMEM)
         );
         assert_eq!(byte(&child, DATA), 0xAA);
+        assert_eq!(poor.mem_used_pages(), 0);
+        assert_eq!(Errno::from(AgentError::NoMemory), Errno::ENOMEM);
     }
 
     #[ktest]

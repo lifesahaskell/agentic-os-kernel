@@ -20,6 +20,8 @@ pub struct Credential {
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgentError {
     Budget,
+    /// A frame allocation failed: the machine is out of memory, not the agent's budget.
+    NoMemory,
     Cap(CapError),
 }
 

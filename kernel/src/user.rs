@@ -52,6 +52,8 @@ pub enum LoadError {
     Header,
     /// The header's addresses are inconsistent or exceed the limits.
     Layout,
+    /// A frame allocation failed.
+    NoMemory,
 }
 
 /// Maps a flat image (see `abi::IMAGE_MAGIC`) into a new space: every page of
@@ -87,7 +89,9 @@ pub fn load_image(bytes: &[u8]) -> Result<Image, LoadError> {
         .cursor_mut(&guard, &(IMAGE_BASE..image_end))
         .map_err(|_| LoadError::Layout)?;
     for va in (IMAGE_BASE..image_end).step_by(PAGE_SIZE) {
-        let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+        let frame = FrameAllocOptions::new()
+            .alloc_frame()
+            .map_err(|_| LoadError::NoMemory)?;
         let off = va - IMAGE_BASE;
         if off < bytes.len() {
             frame
@@ -123,7 +127,9 @@ pub fn map_stack(space: &VmSpace) -> Result<(), LoadError> {
         .cursor_mut(&guard, &stack)
         .map_err(|_| LoadError::Layout)?;
     for _ in 0..USER_STACK_PAGES {
-        let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+        let frame = FrameAllocOptions::new()
+            .alloc_frame()
+            .map_err(|_| LoadError::NoMemory)?;
         c.map(
             frame.into(),
             PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback),
@@ -270,6 +276,9 @@ fn run_ctx(thread: &Thread, space: &Arc<VmSpace>, ctx: UserContext) -> Exit {
                     };
                     match cow {
                         Some(Ok(true)) => {}
+                        // shortcut: Exit has no out-of-memory cause, so a CoW break the allocator
+                        // cannot serve also ends as Exit::Budget; split it when exit causes reach
+                        // procmgr.
                         Some(Err(_)) => return Exit::Budget,
                         _ => {
                             if let Some(exit) = deliver(thread, exc, ctx.rip()) {
@@ -430,6 +439,7 @@ mod test {
         let t = Thread::new(Agent::new_root(1, 0));
         assert_eq!(start(&t, &child, 0), Exit::Budget);
         assert_eq!(data_byte(&child.space), 0x11);
+        assert_eq!(t.agent().mem_used_pages(), 0);
     }
 
     #[ktest]
