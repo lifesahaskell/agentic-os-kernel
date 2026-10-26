@@ -1,7 +1,7 @@
 # Phase 2: Process objects, teardown and timers - Context
 
 **Gathered:** 2026-10-26
-**Status:** Ready for replanning. Ten plans exist (02-01..02-10) and were written before this file; replan with `/gsd-plan-phase 2` so they reflect D-05 below.
+**Status:** Planned. Eleven plans (02-01..02-11) reflect D-01 through D-09; 02-11 was added for D-06.
 
 <domain>
 ## Phase Boundary
@@ -58,6 +58,29 @@ file records which are now signed off and how. Read both.
   unwind) and one to 02-07 (the charge/uncharge accounting and the futex mapping). The three
   frame-allocation failure branches from 01-08 remain covered by inspection only, because OSTD
   0.19.0 has no failure injection. — **Reversibility:** reversible.
+
+### Decided after the 2026-10-26 research refresh (02-RESEARCH.md "Open decisions needing the user")
+
+- **D-06 (OD-08 amended):** The free-frame probe reads `osdk_frame_allocator::load_total_free_size()`
+  plus `osdk_heap_allocator::load_total_slab_size()`, added as direct `aok` dependencies. OD-08's
+  "no new crate" no longer holds for these two. Both were flagged SUS by the legitimacy check (low
+  downloads only; asterinas repo). The plan must include a Wave 0 spike proving `aok` builds with
+  them and shares the OSDK base crate's counters, and a `checkpoint:human-verify` on the two
+  crates. If the spike fails, fall back to counters plus probe-by-exhaustion and record that the
+  D-03 gate lost its independence from the teardown code. — **Reversibility:** reversible.
+- **D-07 (D-05 refined):** `cow_clone` charges the child's page-table node frames only, through a
+  `&dyn Payer` (root first, then 3 for the first page, then 1 per newly crossed 2 MiB, 1 GiB or
+  512 GiB window), so a tiny budget forces a mid-clone failure. The shared data frames stay charged
+  to the parent: a documented under-charge gap in 02-06. The existing ktest
+  `cow_clone_isolates_writes_and_charges_the_writer` stays as written. Error type `CloneError`
+  (Range, Unsupported(Vaddr), Budget). — **Reversibility:** reversible.
+- **D-08 (D-01 and D-02 refined):** A retiring child agent returns its carve to the parent only when
+  its own `children` count is zero, cascading upward as each descendant retires, so a grandparent's
+  carve is never double-spent. The retiring agent still drops its CSpace and stops accepting
+  Spaces at once. — **Reversibility:** reversible.
+- **D-09 (defaults, not discussed):** `Exit::Budget` is not split from NoMemory (user.rs:279); the
+  limitation is recorded in the SUMMARY. `FutexError::NoMemory` maps to `ENOMEM` (12), the same
+  number as today. — **Reversibility:** reversible.
 
 ### Accepted as assumed, not discussed
 

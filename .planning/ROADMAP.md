@@ -101,7 +101,7 @@ Plans:
 
 **Research:** spike required. `thread_create` from a syscall onto an OSTD `Task`, the scheduler protocol (reverse-engineered from source), idle task versus `pick_next`. Add scheduler-protocol ktests and pin OSTD and the toolchain, since each OSTD upgrade is a deliberate task.
 **Decisions due:** Saved-context stack holds FPU state (revisit only if OSTD cannot). Self-memory calls (`mmap`, `brk`, `mprotect`) are cap-less syscalls on the caller's own space, not routed through procmgr. Scope the kernel calls LIBC-04 needs (set-FS-base, thread create for musl start-up, exit-and-unmap) here so Phase 6 does not reopen the kernel; they are verified under LIBC-04.
-**Plans:** 10 plans
+**Plans:** 11 plans
 
 Plans:
 **Wave 1**
@@ -114,12 +114,13 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 - [ ] 02-05-PLAN.md — Exit and fault notes to the space endpoint naming tid and tag (W3)
+- [ ] 02-11-PLAN.md — Free-frame probe crates, A1 spike and settle protocol (D-06) (W3, parallel with 02-05)
 
 **Wave 4** *(blocked on Wave 3 completion)*
-- [ ] 02-06-PLAN.md — Teardown model sign-off (OD-04/07/08 checkpoint), process teardown and kill, 10,000x fork+exit loop (W4)
+- [ ] 02-06-PLAN.md — Teardown model sign-off (OD-04/07/08 checkpoint), process teardown and kill, 10,000x fork+exit loop, fallible cow_clone with node-frame charges (W4)
 
 **Wave 5** *(blocked on Wave 4 completion)*
-- [ ] 02-07-PLAN.md — Agent retirement, charged staging and CoW breaks, timer cleanup, counters and frame probe (W5)
+- [ ] 02-07-PLAN.md — Agent retirement with cascading carve return, charged staging and CoW breaks, futex errno mapping, timer cleanup, counters and probe gate (W5)
 
 **Wave 6** *(blocked on Wave 5 completion)*
 - [ ] 02-08-PLAN.md — Kernel-held saved-context stack and SYS_SIGRETURN (W6)
