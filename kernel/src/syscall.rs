@@ -5,11 +5,12 @@
 //! ABI: `rax` is the number, arguments are `rdi, rsi, rdx, r10, r8, r9`, and a failure returns
 //! `-errno` in `rax`. Numbers and errno values live in the `abi` crate.
 
+use alloc::boxed::Box;
 use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
     IpcArgs, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SPACE_SELF, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_RECV,
-    SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_SPACE_NOTIFY, SYS_THREAD_CREATE,
+    SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_SIGRETURN, SYS_SPACE_NOTIFY, SYS_THREAD_CREATE,
     SYS_THREAD_INTERRUPT, SYS_TIMER_ARM, THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP,
     errno,
 };
@@ -21,7 +22,7 @@ use crate::{
     futex::{self, FutexError},
     ipc::{self, IpcError},
     space::{self, SpaceError, Target, ThreadStart},
-    thread::Thread,
+    thread::{RedirectFrame, Thread},
     vm::{CloneError, copy_from_user, copy_to_user},
 };
 
@@ -275,6 +276,9 @@ pub enum Syscall {
         target: Target,
         ep: Handle,
     },
+    /// Ends a redirect handler: the arguments are ignored, because the context comes from the
+    /// kernel-held frame stack and never from user memory.
+    Sigreturn,
 }
 
 const FUTEX_WAIT: usize = 0;
@@ -373,6 +377,7 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
             },
             ep: Handle::new(a[1])?,
         },
+        SYS_SIGRETURN => Syscall::Sigreturn,
         _ => return Err(Errno::ENOSYS),
     })
 }
@@ -382,6 +387,8 @@ pub enum Outcome {
     /// The value for `rax`: non-negative on success, `-errno` on failure.
     Return(isize),
     Exit(u64),
+    /// `run_ctx` restores this frame in place of setting `rax`.
+    Sigreturn(Box<RedirectFrame>),
 }
 
 fn ret(r: Result<usize, Errno>) -> Outcome {
@@ -535,6 +542,10 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
         Syscall::SpaceNotify { target, ep } => ret(space::set_notify(t, target, ep.index())
             .map(|()| 0)
             .map_err(Errno::from)),
+        Syscall::Sigreturn => match t.pop_frame() {
+            Some(f) => Outcome::Sigreturn(f),
+            None => Outcome::Return(-Errno::EINVAL.0),
+        },
     }
 }
 
@@ -811,7 +822,7 @@ mod test {
             Err(e) => -e.0,
             Ok(call) => match dispatch(t, space, call) {
                 Outcome::Return(v) => v,
-                Outcome::Exit(_) => 0,
+                Outcome::Exit(_) | Outcome::Sigreturn(_) => 0,
             },
         }
     }

@@ -328,6 +328,9 @@ fn run_ctx(thread: &Thread, process: &Arc<Space>, ctx: UserContext) -> Exit {
                     Ok(call) => match syscall::dispatch(thread, space, call) {
                         Outcome::Return(v) => ctx.set_rax(v as usize),
                         Outcome::Exit(code) => return Exit::Code(code as usize),
+                        // The frame replaces the whole context, `rax` included: the interrupted
+                        // code resumes exactly as the redirect found it.
+                        Outcome::Sigreturn(f) => thread.restore_frame(ctx, f),
                     },
                 }
             }
@@ -358,11 +361,10 @@ fn run_ctx(thread: &Thread, process: &Arc<Space>, ctx: UserContext) -> Exit {
             },
             ReturnReason::KernelEvent => {}
         }
-        // Signal-style redirect: resume at the handler with the interrupted pc in rdi.
-        if let Some(handler) = thread.take_redirect() {
-            ctx.set_rdi(ctx.rip());
-            ctx.set_rip(handler);
-        }
+        // Signal-style redirect: the interrupted context goes on the thread's kernel-held frame
+        // stack and the thread resumes at the handler with the interrupted pc in rdi. Nothing is
+        // written to user memory; `SYS_SIGRETURN` pops the frame.
+        thread.apply_redirect(ctx);
     }
 }
 
@@ -615,6 +617,30 @@ mod test {
         };
         assert!(img.text.contains(&pc), "pc {pc:#x} outside the image text");
         assert!(alarm.lock().is_none());
+    }
+
+    /// `sigreturn` mode 1 spins until its handler runs; the handler returns through
+    /// `SYS_SIGRETURN`, so the loop resumes, sees the flag and exits 42.
+    #[ktest]
+    fn sigreturn_resumes_the_interrupted_loop() {
+        let img = load_image(user_image!("sigreturn")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 0));
+        let exit = spawn_image(&t, &img, 1);
+        for _ in 0..50 {
+            Task::yield_now();
+        }
+        t.interrupt(img.handler);
+        assert_eq!(join(&exit), Exit::Code(42));
+        assert_eq!(t.frame_depth(), 0);
+    }
+
+    #[ktest]
+    fn sigreturn_on_an_empty_stack_is_einval() {
+        let img = load_image(user_image!("sigreturn")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 0));
+        let exit = spawn_image(&t, &img, 3);
+        assert_eq!(join(&exit), Exit::Code(abi::errno::EINVAL as usize));
+        assert_eq!(t.frame_depth(), 0);
     }
 
     /// A data frame whose first byte is `first`.
