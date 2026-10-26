@@ -166,8 +166,10 @@ fn start_ctx(thread: &Thread, vm: &Arc<VmSpace>, ctx: UserContext) -> Exit {
         .register(thread)
         .expect("a new space has room for its first thread");
     let exit = run_ctx(thread, &space, ctx);
-    space.reap(thread.tid());
+    // Recorded, then announced while the space still counts the thread, then reaped.
     thread.set_exit(exit);
+    space.note_exit(thread, exit);
+    space.reap(thread.tid());
     exit
 }
 
@@ -182,9 +184,11 @@ pub fn spawn_thread(space: &Arc<Space>, th: Arc<Thread>, start: ThreadStart) {
     let (space, t) = (space.clone(), th.clone());
     TaskOptions::new(move || {
         let exit = run_ctx(&t, &space, ctx);
-        // Unregistered first, so whoever sees the exit also sees the thread gone from the space.
-        space.reap(t.tid());
+        // Record the exit, announce it while the space still counts the thread, then reap. A
+        // joiner that sees the exit may therefore still see the thread registered for an instant.
         t.set_exit(exit);
+        space.note_exit(&t, exit);
+        space.reap(t.tid());
     })
     .data(th)
     .spawn()

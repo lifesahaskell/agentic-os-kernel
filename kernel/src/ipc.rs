@@ -262,8 +262,36 @@ impl Endpoint {
         data: Vec<u8>,
         caps: Vec<Cap>,
     ) -> Result<Answer, IpcError> {
+        self.call_via(from, |reply| {
+            self.push(from, label, words, data, caps, Some(reply))
+        })
+    }
+
+    /// A note call: the kernel, on behalf of `from`, sends `label` and `words` (no data, no
+    /// capabilities) and `from` blocks for the verdict, the reply's words. It waits and is
+    /// interrupted exactly as `call_caps` does; only the enqueue step differs (`push_note`, so
+    /// the label is the kernel's and the queue bound is not applied).
+    pub(crate) fn call_note(
+        &self,
+        from: &Thread,
+        label: u64,
+        words: [u64; 4],
+    ) -> Result<[u64; 4], IpcError> {
+        let answer = self.call_via(from, |reply| {
+            self.push_note(from, label, words, Some(reply))
+        })?;
+        Ok(answer.words)
+    }
+
+    /// The wait shared by every call: `enqueue` puts the message, carrying the `ReplyWait` it is
+    /// given, into the queue; this then blocks for the answer and handles an interrupt.
+    fn call_via(
+        &self,
+        from: &Thread,
+        enqueue: impl FnOnce(Arc<ReplyWait>) -> Result<(), IpcError>,
+    ) -> Result<Answer, IpcError> {
         let reply = ReplyWait::new(from.downgrade());
-        self.push(from, label, words, data, caps, Some(reply.clone()))?;
+        enqueue(reply.clone())?;
         match from.block_until(&reply.wq, || reply.take_answer(), None) {
             Ok(answer) => Ok(answer),
             Err(e) => self.abandon(from, &reply, e),
@@ -297,7 +325,9 @@ impl Endpoint {
         Ok(from.block_until_committed(&reply.wq, || reply.take_answer()))
     }
 
-    fn push(
+    /// `send` and `call` with every field chosen: the ring-3 entry, so it refuses the kernel's
+    /// labels. `pub(crate)` so the note tests can show that `NOTE_*` are among them.
+    pub(crate) fn push(
         &self,
         from: &Thread,
         label: u64,
@@ -346,9 +376,51 @@ impl Endpoint {
         })
     }
 
+    /// Messages waiting in the queue.
+    #[cfg(ktest)]
+    pub(crate) fn queued(&self) -> usize {
+        self.queue.lock().len()
+    }
+
+    /// Queues a note: a kernel message on behalf of `from` that skips both the label-range check
+    /// (the label is the kernel's) and `QUEUE_LEN`. `sender`, `tid` and `tag` are `from`'s, stamped
+    /// as in `push`. A note carries no data and no capabilities. `reply` is `Some` for a `call_note`.
+    ///
+    /// The queue stays bounded without `QUEUE_LEN`, by the callers. A thread sends one exit note
+    /// in its life. A faulting thread is blocked on its own fault call, so it has at most one
+    /// fault note queued. A space holds at most `MAX_THREADS_PER_SPACE` threads. Task context
+    /// only. Never fails today; the `Result` is the shape the senders already handle.
+    pub(crate) fn push_note(
+        &self,
+        from: &Thread,
+        label: u64,
+        words: [u64; 4],
+        reply: Option<Arc<ReplyWait>>,
+    ) -> Result<(), IpcError> {
+        debug_assert!(label >= LABEL_KERNEL_BASE);
+        self.enqueue_bounded(
+            Message {
+                sender: from.agent().credential(),
+                tid: from.tid(),
+                tag: from.tag(),
+                words,
+                data: Vec::new(),
+                label,
+                caps: Vec::new(),
+                reply,
+            },
+            None,
+        )
+    }
+
     fn enqueue(&self, m: Message) -> Result<(), IpcError> {
+        self.enqueue_bounded(m, Some(Self::QUEUE_LEN))
+    }
+
+    /// Queues `m`; `Full` when `bound` is `Some(n)` and `n` messages are already queued.
+    fn enqueue_bounded(&self, m: Message, bound: Option<usize>) -> Result<(), IpcError> {
         let mut q = self.queue.lock();
-        if q.len() >= Self::QUEUE_LEN {
+        if bound.is_some_and(|n| q.len() >= n) {
             return Err(IpcError::Full);
         }
         q.push_back(m);

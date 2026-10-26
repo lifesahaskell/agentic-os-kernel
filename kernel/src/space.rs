@@ -5,7 +5,9 @@
 //! Every thread's credential is its space owner's, never its creator's: a thread started in
 //! another space does not run with the creator's authority (OD-11).
 
-use abi::USER_TOP;
+use abi::{
+    NOTE_EXIT, NOTE_KIND_BUDGET, NOTE_KIND_CODE, NOTE_KIND_EXCEPTION, NOTE_KIND_FAULT, USER_TOP,
+};
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
@@ -19,8 +21,9 @@ use ostd::{
 use crate::{
     agent::Agent,
     cap::{Cap, CapError, Object, Rights},
+    ipc::Endpoint,
     thread::Thread,
-    user,
+    user::{self, Exit},
 };
 
 /// Most live threads one space holds. The 65th `thread_create` is refused (`Limit`).
@@ -32,6 +35,9 @@ pub struct Space {
     /// `(tid, thread)` of every thread started in this space and not yet reaped. Weak, so a
     /// registered thread never outlives its own last reference because of this list.
     threads: SpinLock<Vec<(u64, Weak<Thread>)>>,
+    /// Where exit and fault notes for this space's threads go: an Endpoint capability, kept as the
+    /// capability and not the endpoint it names, so revoking it stops delivery (OD-06, OD-17).
+    notify: SpinLock<Option<Cap>>,
 }
 
 impl Space {
@@ -40,6 +46,7 @@ impl Space {
             vm,
             owner,
             threads: SpinLock::new(Vec::new()),
+            notify: SpinLock::new(None),
         })
     }
 
@@ -67,6 +74,41 @@ impl Space {
     /// Removes thread `tid` from the space.
     pub fn reap(&self, tid: u64) {
         self.threads.lock().retain(|(t, _)| *t != tid);
+    }
+
+    /// Sets the notify capability, replacing any earlier one. `cap` is stored as given; whether
+    /// it still resolves is decided at each use.
+    pub fn set_notify_cap(&self, cap: Cap) {
+        *self.notify.lock() = Some(cap);
+    }
+
+    /// The endpoint notes go to: `None` when none is set, when the capability was revoked, or
+    /// when it no longer resolves to an endpoint with SEND. Resolved at each use.
+    pub fn notify_ep(&self) -> Option<Arc<Endpoint>> {
+        let cap = self.notify.lock().clone()?;
+        match cap.resolve(Rights::SEND) {
+            Ok(Object::Endpoint(ep)) => Some(ep),
+            _ => None,
+        }
+    }
+
+    /// Tells the notify endpoint that `th` exited as `exit`: one `NOTE_EXIT` message stamped with
+    /// the thread's credential, tid and tag, words `[kind, value, 0, 0]`. Nothing is sent when no
+    /// endpoint resolves. The result is ignored: the exit has happened either way.
+    ///
+    /// Called after `set_exit` and before `reap`, so the note leaves while the space still counts
+    /// the thread. `NOTE_KIND_KILLED` has no `Exit` variant yet (plan 02-06).
+    pub fn note_exit(&self, th: &Thread, exit: Exit) {
+        let Some(ep) = self.notify_ep() else {
+            return;
+        };
+        let (kind, value) = match exit {
+            Exit::Code(c) => (NOTE_KIND_CODE, c as u64),
+            Exit::Fault(a) => (NOTE_KIND_FAULT, a as u64),
+            Exit::Budget => (NOTE_KIND_BUDGET, 0),
+            Exit::Exception(v) => (NOTE_KIND_EXCEPTION, v),
+        };
+        let _ = ep.push_note(th, NOTE_EXIT, [kind, value, 0, 0], None);
     }
 
     /// Threads registered and still referenced.
@@ -215,7 +257,7 @@ pub fn thread_interrupt(caller: &Thread, slot: usize, entry: usize) -> Result<()
 
 #[cfg(ktest)]
 mod test {
-    use abi::USER_STACK_TOP;
+    use abi::{IMAGE_BASE, NOTE_FAULT, TEST_DATA, USER_STACK_TOP};
     use ostd::{
         mm::{FrameAllocOptions, PageFlags, VmIo},
         prelude::*,
@@ -224,13 +266,14 @@ mod test {
 
     use super::*;
     use crate::{
-        ipc::Endpoint,
+        ipc::{IpcError, Message},
         sched::install_space_switch,
         user::{
-            Exit, Image, load_image, map_test_page,
+            Image, load_image, map_stack, map_test_page, spawn_thread,
             testkit::{self, join, join_thread, spawn_image},
             user_image,
         },
+        vm::cow_clone,
     };
 
     /// A space running the `spinner` image under `owner`, with the test page it reads.
@@ -721,5 +764,158 @@ mod test {
         for t in [&t1, &t2, &t3] {
             join_thread(&t.1);
         }
+    }
+
+    /// The `fault_sibling` image over a test page mapped with `data`.
+    fn sibling_parent(data: PageFlags) -> Image {
+        let img = load_image(user_image!("fault_sibling")).unwrap();
+        map_test_page(
+            &img.space,
+            FrameAllocOptions::new().alloc_frame().unwrap().into(),
+            data,
+        );
+        img
+    }
+
+    /// A sibling of `parent`: its own space over a copy-on-write clone of the image range with a
+    /// fresh stack, owned by `owner`, whose notes go to `ep` (a SEND capability) when given. One
+    /// thread tagged `tag` starts at the entry with `arg`.
+    fn start_sibling(
+        parent: &Image,
+        owner: &Arc<Agent>,
+        ep: Option<&Arc<Endpoint>>,
+        tag: u64,
+        arg: u64,
+    ) -> (Arc<Space>, Arc<Thread>) {
+        install_space_switch();
+        let vm = Arc::new(cow_clone(&parent.space, IMAGE_BASE..TEST_DATA + PAGE_SIZE));
+        map_stack(&vm).unwrap();
+        let space = Space::new(vm, owner.clone());
+        if let Some(ep) = ep {
+            space.set_notify_cap(Cap::new(Object::Endpoint(ep.clone()), Rights::SEND));
+        }
+        let th = Thread::new_tagged(owner.clone(), tag);
+        space.register(&th).unwrap();
+        let start = ThreadStart {
+            rip: parent.entry as u64,
+            rsp: USER_STACK_TOP as u64,
+            arg,
+            fs_base: 0,
+            clear_tid: 0,
+        };
+        spawn_thread(&space, th.clone(), start);
+        (space, th)
+    }
+
+    /// A kernel thread with no authority, to receive on an endpoint.
+    fn receiver() -> Arc<Thread> {
+        Thread::new(Agent::new_root(99, 0))
+    }
+
+    /// Waits, yielding, until `ep` holds `n` messages.
+    fn wait_queued(ep: &Endpoint, n: usize) {
+        let mut spins = 0usize;
+        while ep.queued() < n {
+            spins += 1;
+            assert!(spins < 1_000_000, "the notes never arrived");
+            Task::yield_now();
+        }
+    }
+
+    /// What every note must be: the kernel's label, no capability, no data, no reply to wait on.
+    fn assert_note_shape(m: &Message, label: u64) {
+        assert_eq!(m.label, label);
+        assert!(m.caps.is_empty(), "a note carries no capability");
+        assert!(m.data.is_empty(), "a note carries no data");
+    }
+
+    #[ktest]
+    fn note_exit_names_tid_and_tag_of_each_sibling() {
+        let owner = Agent::new_root(5, 0);
+        let parent = sibling_parent(PageFlags::RW);
+        let e = Endpoint::new();
+        let (_s0, t0) = start_sibling(&parent, &owner, Some(&e), 0x10, 0);
+        let (_s1, t1) = start_sibling(&parent, &owner, Some(&e), 0x11, 0);
+
+        let me = receiver();
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        for _ in 0..2 {
+            let m = e.recv(&me).unwrap();
+            assert_note_shape(&m, NOTE_EXIT);
+            assert_eq!(m.words, [NOTE_KIND_CODE, 7, 0, 0]);
+            assert_eq!(m.sender, owner.credential());
+            assert!(m.reply.is_none(), "an exit note is not a call");
+            seen.push((m.tid, m.tag));
+        }
+        seen.sort();
+        let mut want = [(t0.tid(), 0x10), (t1.tid(), 0x11)];
+        want.sort();
+        assert_eq!(seen, want);
+        assert_eq!(join_thread(&t0), Exit::Code(7));
+        assert_eq!(join_thread(&t1), Exit::Code(7));
+        assert_eq!(e.queued(), 0, "exactly two notes");
+    }
+
+    #[ktest]
+    fn note_exit_without_notify_is_dropped() {
+        let owner = Agent::new_root(5, 0);
+        let parent = sibling_parent(PageFlags::RW);
+        // An endpoint nothing points at, to show that nothing reaches it either.
+        let bystander = Endpoint::new();
+        let (s, t) = start_sibling(&parent, &owner, None, 0x10, 0);
+        assert!(s.notify_ep().is_none());
+
+        assert_eq!(join_thread(&t), Exit::Code(7));
+        while s.live_threads() != 0 {
+            Task::yield_now();
+        }
+        assert_eq!(bystander.queued(), 0);
+    }
+
+    #[ktest]
+    fn note_labels_are_reserved() {
+        let me = receiver();
+        let ep = Endpoint::new();
+        for label in [NOTE_EXIT, NOTE_FAULT] {
+            assert_eq!(
+                ep.push(&me, label, [0; 4], Vec::new(), Vec::new(), None),
+                Err(IpcError::Invalid),
+                "send path, label {label:#x}"
+            );
+            assert_eq!(
+                ep.call(&me, label, [0; 4]),
+                Err(IpcError::Invalid),
+                "call path, label {label:#x}"
+            );
+        }
+        assert_eq!(ep.queued(), 0, "nothing was queued");
+    }
+
+    #[ktest]
+    fn note_exit_bypasses_queue_len() {
+        let owner = Agent::new_root(5, 0);
+        let parent = sibling_parent(PageFlags::RW);
+        let e = Endpoint::new();
+        let me = receiver();
+        for i in 0..Endpoint::QUEUE_LEN {
+            e.send(&me, [i as u64, 0, 0, 0]).unwrap();
+        }
+        assert_eq!(e.send(&me, [0; 4]), Err(IpcError::Full));
+
+        let (_s, t) = start_sibling(&parent, &owner, Some(&e), 0x10, 0);
+        wait_queued(&e, Endpoint::QUEUE_LEN + 1);
+        assert_eq!(join_thread(&t), Exit::Code(7));
+        assert_eq!(
+            e.send(&me, [0; 4]),
+            Err(IpcError::Full),
+            "an ordinary send is still refused"
+        );
+
+        for i in 0..Endpoint::QUEUE_LEN {
+            assert_eq!(e.recv(&me).unwrap().words[0], i as u64);
+        }
+        let note = e.recv(&me).unwrap();
+        assert_note_shape(&note, NOTE_EXIT);
+        assert_eq!(note.words, [NOTE_KIND_CODE, 7, 0, 0]);
     }
 }
