@@ -10,9 +10,9 @@ use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
     IpcArgs, MAP_ANONYMOUS, MAP_SHARED, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SPACE_SELF, SYS_CALL,
-    SYS_EXIT, SYS_FUTEX, SYS_MMAP, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD,
-    SYS_SIGRETURN, SYS_SPACE_NOTIFY, SYS_THREAD_CREATE, SYS_THREAD_INTERRUPT, SYS_TIMER_ARM,
-    THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP, errno,
+    SYS_EXIT, SYS_FUTEX, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV,
+    SYS_SCHED_YIELD, SYS_SIGRETURN, SYS_SPACE_NOTIFY, SYS_THREAD_CREATE, SYS_THREAD_INTERRUPT,
+    SYS_TIMER_ARM, THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP, errno,
 };
 use ostd::{
     mm::{PAGE_SIZE, VmSpace},
@@ -294,6 +294,17 @@ pub enum Syscall {
         flags: usize,
         off: usize,
     },
+    /// Changes the protection of `[addr, addr + len)` in the caller's own space.
+    Mprotect {
+        addr: usize,
+        len: usize,
+        prot: usize,
+    },
+    /// Unmaps `[addr, addr + len)` from the caller's own space.
+    Munmap {
+        addr: usize,
+        len: usize,
+    },
 }
 
 const FUTEX_WAIT: usize = 0;
@@ -394,6 +405,25 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
         },
         SYS_SIGRETURN => Syscall::Sigreturn,
         SYS_MMAP => decode_mmap(a)?,
+        SYS_MPROTECT => {
+            if !a[0].is_multiple_of(PAGE_SIZE) || a[2] & !PROT_BITS != 0 {
+                return Err(Errno::EINVAL);
+            }
+            Syscall::Mprotect {
+                addr: a[0],
+                len: a[1],
+                prot: a[2],
+            }
+        }
+        SYS_MUNMAP => {
+            if !a[0].is_multiple_of(PAGE_SIZE) || a[1] == 0 {
+                return Err(Errno::EINVAL);
+            }
+            Syscall::Munmap {
+                addr: a[0],
+                len: a[1],
+            }
+        }
         _ => return Err(Errno::ENOSYS),
     })
 }
@@ -607,6 +637,14 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
             off,
         } => ret(match t.process() {
             Some(p) => p.mmap(addr, len, prot, flags, off),
+            None => Err(Errno::ENOMEM),
+        }),
+        Syscall::Mprotect { addr, len, prot } => ret(match t.process() {
+            Some(p) => p.mprotect(addr, len, prot).map(|()| 0),
+            None => Err(Errno::ENOMEM),
+        }),
+        Syscall::Munmap { addr, len } => ret(match t.process() {
+            Some(p) => p.munmap(addr, len).map(|_| 0),
             None => Err(Errno::ENOMEM),
         }),
     }

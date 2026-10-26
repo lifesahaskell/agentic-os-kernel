@@ -208,6 +208,16 @@ impl Space {
         Ok(start)
     }
 
+    /// `munmap(addr, len)`: returns the pages removed. Not built yet.
+    pub fn munmap(&self, _addr: Vaddr, _len: usize) -> Result<usize, Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// `mprotect(addr, len, prot)`. Not built yet.
+    pub fn mprotect(&self, _addr: Vaddr, _len: usize, _prot: usize) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
     /// Mapping records the space holds.
     pub fn map_count(&self) -> usize {
         self.mm.lock().recs.len()
@@ -218,13 +228,17 @@ impl Space {
 mod test {
     use abi::{MAP_ANONYMOUS, MAP_PRIVATE, USER_STACK_TOP, errno};
     use alloc::sync::Arc;
-    use ostd::prelude::*;
+    use ostd::{
+        mm::{VmWriter, io::util::HasVmReaderWriter, vm_space::VmQueriedItem},
+        prelude::*,
+    };
 
     use super::*;
     use crate::{
         agent::Agent,
         sched::install_space_switch,
         space::{Space, ThreadStart, test::wait_reaped},
+        syscall::UserSlice,
         thread::Thread,
         user::{Exit, Image, load_image, testkit::join_thread, user_image},
     };
@@ -247,21 +261,64 @@ mod test {
         first_mapped(vm, &range).is_some()
     }
 
-    #[ktest]
-    fn vmem_enomem_past_budget_from_ring3() {
-        let (a, s, img) = world("ring3", 6);
+    /// Runs the `mmap` bin in `s` with `mode` and returns how its thread exited.
+    fn run_ring3(a: &Arc<Agent>, s: &Arc<Space>, img: &Image, mode: u64) -> Exit {
         let th = Thread::new(a.clone());
         s.register(&th).unwrap();
         let start = ThreadStart {
             rip: img.entry as u64,
             rsp: USER_STACK_TOP as u64,
-            arg: 1,
+            arg: mode,
             fs_base: 0,
             clear_tid: 0,
         };
-        crate::user::spawn_thread(&s, th.clone(), start);
+        crate::user::spawn_thread(s, th.clone(), start);
+        join_thread(&th)
+    }
+
+    /// The property of the page at `va`, if it is mapped.
+    fn prop_at(vm: &VmSpace, va: Vaddr) -> Option<PageProperty> {
+        let guard = disable_preempt();
+        let mut c = vm.cursor(&guard, &(va..va + PAGE_SIZE)).ok()?;
+        match c.query() {
+            Ok((_, Some(VmQueriedItem::MappedRam { prop, .. }))) => Some(prop),
+            _ => None,
+        }
+    }
+
+    /// The first word of the frame behind `va`, read through the frame and not the page table.
+    fn frame_word(vm: &VmSpace, va: Vaddr) -> u32 {
+        let guard = disable_preempt();
+        let mut c = vm.cursor(&guard, &(va..va + PAGE_SIZE)).unwrap();
+        let Ok((_, Some(VmQueriedItem::MappedRam { frame, .. }))) = c.query() else {
+            panic!("no page at {va:#x}");
+        };
+        let mut b = [0u8; 4];
+        frame.reader().read(&mut VmWriter::from(&mut b[..]));
+        u32::from_le_bytes(b)
+    }
+
+    fn put(s: &Arc<Space>, a: &Arc<Agent>, va: Vaddr, w: u32) {
+        crate::vm::copy_to_user(
+            s.vm(),
+            a.as_ref(),
+            UserSlice::new(va, 4).unwrap(),
+            &w.to_le_bytes(),
+        )
+        .unwrap();
+    }
+
+    fn get(s: &Arc<Space>, va: Vaddr) -> Result<u32, Errno> {
+        let mut b = [0u8; 4];
+        crate::vm::copy_from_user(s.vm(), &mut b, UserSlice::new(va, 4).unwrap())?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    #[ktest]
+    fn vmem_enomem_past_budget_from_ring3() {
+        let (a, s, img) = world("ring3", 6);
         assert_eq!(
-            join_thread(&th),
+            run_ring3(&a, &s, &img, 1),
             Exit::Code(((errno::ENOMEM as usize) << 16) | 6)
         );
         wait_reaped(&s);
@@ -313,5 +370,120 @@ mod test {
         assert_eq!(s.mmap(0, PAGE_SIZE, RW, ANON, 0), Err(Errno::ENOMEM));
         assert_eq!(a.mem_used_pages(), used);
         assert_eq!(s.map_count(), 0);
+    }
+
+    const NONE: usize = PROT_NONE;
+    const FIXED_ANON: usize = ANON | MAP_FIXED;
+
+    #[ktest]
+    fn vmem_munmap_returns_pages_and_splits() {
+        let (a, s, _img) = world("munmap", 8);
+        let used = a.mem_used_pages();
+        let base = s.mmap(0, 4 * PAGE_SIZE, RW, ANON, 0).unwrap();
+        assert_eq!(a.mem_used_pages(), used + 4);
+        assert_eq!(s.munmap(base + PAGE_SIZE, 2 * PAGE_SIZE), Ok(2));
+        assert_eq!(a.mem_used_pages(), used + 2);
+        assert_eq!(s.charged(), used + 2);
+        assert_eq!(s.map_count(), 2);
+        assert!(!any_mapped(s.vm(), base + PAGE_SIZE..base + 3 * PAGE_SIZE));
+        assert!(any_mapped(s.vm(), base..base + PAGE_SIZE));
+        assert!(any_mapped(
+            s.vm(),
+            base + 3 * PAGE_SIZE..base + 4 * PAGE_SIZE
+        ));
+        // A hole is a success that changes nothing.
+        assert_eq!(s.munmap(base + PAGE_SIZE, 2 * PAGE_SIZE), Ok(0));
+        assert_eq!(a.mem_used_pages(), used + 2);
+        assert_eq!(s.munmap(base + 1, PAGE_SIZE), Err(Errno::EINVAL));
+        assert_eq!(s.munmap(base, 0), Err(Errno::EINVAL));
+        assert_eq!(a.mem_used_pages(), used + 2);
+    }
+
+    #[ktest]
+    fn vmem_prot_none_reserves_without_charge() {
+        let (a, s, _img) = world("none", 12);
+        let used = a.mem_used_pages();
+        let base = s.mmap(0, 8 * PAGE_SIZE, NONE, ANON, 0).unwrap();
+        assert_eq!(a.mem_used_pages(), used, "a reservation costs no pages");
+        assert!(!any_mapped(s.vm(), base..base + 8 * PAGE_SIZE));
+        assert_eq!(s.mprotect(base, 2 * PAGE_SIZE, RW), Ok(()));
+        assert_eq!(a.mem_used_pages(), used + 2);
+        assert_eq!(s.mprotect(base, 8 * PAGE_SIZE, RW), Ok(()));
+        assert_eq!(a.mem_used_pages(), used + 8, "six more, never eight");
+        assert_eq!(s.charged(), used + 8);
+    }
+
+    #[ktest]
+    fn vmem_mprotect_none_keeps_the_data() {
+        let (a, s, _img) = world("keep", 4);
+        let base = s.mmap(0, PAGE_SIZE, RW, ANON, 0).unwrap();
+        let used = a.mem_used_pages();
+        s.vm().activate();
+        put(&s, &a, base, 0x55aa_55aa);
+        assert_eq!(s.mprotect(base, PAGE_SIZE, NONE), Ok(()));
+        assert_eq!(get(&s, base), Err(Errno::EFAULT));
+        assert_eq!(s.mprotect(base, PAGE_SIZE, RW), Ok(()));
+        assert_eq!(get(&s, base), Ok(0x55aa_55aa));
+        assert_eq!(a.mem_used_pages(), used);
+    }
+
+    #[ktest]
+    fn vmem_mprotect_write_on_a_shared_frame_sets_cow() {
+        let (a, s, _img) = world("cow", 4);
+        let base = s.mmap(0, PAGE_SIZE, RW, ANON, 0).unwrap();
+        s.vm().activate();
+        put(&s, &a, base, 0x1111);
+        assert_eq!(s.mprotect(base, PAGE_SIZE, PROT_READ), Ok(()));
+        let payer = Agent::new_root(8, 16);
+        let child =
+            crate::vm::cow_clone(s.vm(), base..base + PAGE_SIZE, payer.as_ref()).expect("clone");
+        assert_eq!(s.mprotect(base, PAGE_SIZE, RW), Ok(()));
+        let flags = prop_at(s.vm(), base).unwrap().flags;
+        assert!(flags.contains(crate::vm::COW), "shared and writable: COW");
+        assert!(!flags.contains(PageFlags::W), "shared: not writable yet");
+        put(&s, &a, base, 0x2222);
+        assert_eq!(get(&s, base), Ok(0x2222));
+        assert_eq!(
+            frame_word(&child, base),
+            0x1111,
+            "the child's frame is untouched"
+        );
+    }
+
+    #[ktest]
+    fn vmem_mprotect_unmapped_range_is_enomem() {
+        let (a, s, _img) = world("hole", 4);
+        let base = s.mmap(0, PAGE_SIZE, RW, ANON, 0).unwrap();
+        let used = a.mem_used_pages();
+        assert_eq!(
+            s.mprotect(base, 2 * PAGE_SIZE, PROT_READ),
+            Err(Errno::ENOMEM)
+        );
+        let flags = prop_at(s.vm(), base).unwrap().flags;
+        assert!(flags.contains(PageFlags::W), "nothing changed");
+        assert_eq!(a.mem_used_pages(), used);
+        assert_eq!(s.map_count(), 1);
+    }
+
+    #[ktest]
+    fn vmem_map_fixed_replaces() {
+        let (a, s, _img) = world("fixed", 6);
+        let base = s.mmap(0, 2 * PAGE_SIZE, RW, ANON, 0).unwrap();
+        let used = a.mem_used_pages();
+        s.vm().activate();
+        put(&s, &a, base, 0xdead_beef);
+        assert_eq!(s.mmap(base, 2 * PAGE_SIZE, RW, FIXED_ANON, 0), Ok(base));
+        assert_eq!(a.mem_used_pages(), used, "net unchanged");
+        assert_eq!(s.map_count(), 1);
+        assert_eq!(get(&s, base), Ok(0));
+        assert_eq!(get(&s, base + PAGE_SIZE), Ok(0));
+    }
+
+    #[ktest]
+    fn vmem_ring3_protect_and_unmap() {
+        let (a, s, img) = world("ring3-prot", 8);
+        assert_eq!(run_ring3(&a, &s, &img, 2), Exit::Code(0));
+        wait_reaped(&s);
+        assert_eq!(a.mem_used_pages(), 0);
     }
 }
