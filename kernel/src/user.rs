@@ -36,6 +36,8 @@ pub enum Exit {
     Budget,
     /// A non-page-fault exception (x86 vector) that no handler took.
     Exception(u64),
+    /// Killed from outside (`Space::kill`), not by anything the thread did.
+    Killed,
 }
 
 /// A loaded flat image: the space holds the mapped image and the user stack.
@@ -45,6 +47,9 @@ pub struct Image {
     pub entry: Vaddr,
     pub handler: Vaddr,
     pub text: Range<Vaddr>,
+    /// Frames `load_image` allocated: the segments and the stack. What `Space::from_image`
+    /// charges.
+    pub pages: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -117,6 +122,7 @@ pub fn load_image(bytes: &[u8]) -> Result<Image, LoadError> {
         entry,
         handler,
         text,
+        pages: (image_end - IMAGE_BASE) / PAGE_SIZE + USER_STACK_PAGES,
     })
 }
 
@@ -164,9 +170,10 @@ pub fn start(thread: &Thread, img: &Image, arg: u64) -> Exit {
     start_ctx(thread, &img.space, entry_ctx(img, arg))
 }
 
-/// Runs `ctx` on `thread` in a new process that wraps `vm` and is owned by the thread's agent.
+/// Runs `ctx` on `thread` in a new process that wraps `vm` and is owned by the thread's agent. The
+/// caller keeps `vm` and its memory, so the process does not unmap it at teardown (`adopt`).
 fn start_ctx(thread: &Thread, vm: &Arc<VmSpace>, ctx: UserContext) -> Exit {
-    let space = Space::new(vm.clone(), thread.agent().clone());
+    let space = Space::adopt(vm.clone(), thread.agent().clone());
     run_registered(thread, &space, ctx)
 }
 
@@ -180,6 +187,7 @@ fn run_registered(thread: &Thread, space: &Arc<Space>, ctx: UserContext) -> Exit
     // Recorded, then announced while the space still counts the thread, then reaped.
     thread.set_exit(exit);
     space.note_exit(thread, exit);
+    thread.retire();
     space.reap(thread.tid());
     exit
 }
@@ -199,6 +207,7 @@ pub fn spawn_thread(space: &Arc<Space>, th: Arc<Thread>, start: ThreadStart) {
         // joiner that sees the exit may therefore still see the thread registered for an instant.
         t.set_exit(exit);
         space.note_exit(&t, exit);
+        t.retire();
         space.reap(t.tid());
     })
     .data(th)
@@ -288,11 +297,21 @@ fn run_ctx(thread: &Thread, process: &Arc<Space>, ctx: UserContext) -> Exit {
     space.activate();
     let mut um = UserMode::new(ctx);
     loop {
+        // Before every entry to ring 3, and so after every syscall, fault and kernel event: a
+        // killed thread never runs user code again.
+        if thread.is_killed() {
+            return Exit::Killed;
+        }
         let reason = um.execute(thread);
         // Ring 3 may have moved FS (OSTD turns on FSGSBASE): keep it for the next entry.
         let mut fs = FsBase::default();
         fs.save();
         thread.set_fs_base(fs.addr());
+        // Killed while in ring 3: whatever brought it back (a kernel event, a syscall it issued
+        // as the kill landed) is not served.
+        if thread.is_killed() {
+            return Exit::Killed;
+        }
         let ctx = um.context_mut();
         match reason {
             ReturnReason::UserSyscall => {
@@ -318,7 +337,7 @@ fn run_ctx(thread: &Thread, process: &Arc<Space>, ctx: UserContext) -> Exit {
                         CpuException::PageFault(pf)
                             if pf.error_code.contains(PageFaultErrorCode::WRITE) =>
                         {
-                            Some(handle_cow_fault(space, thread.agent(), pf.addr))
+                            Some(handle_cow_fault(space, &**process, pf.addr))
                         }
                         _ => None,
                     };
@@ -469,7 +488,14 @@ mod test {
     /// clone a fresh stack, so the only pages the child can copy are the ones it writes in the
     /// cloned range.
     fn cow_child(parent: &Image) -> Image {
-        let child = Arc::new(cow_clone(&parent.space, abi::IMAGE_BASE..DATA + PAGE_SIZE));
+        let child = Arc::new(
+            cow_clone(
+                &parent.space,
+                abi::IMAGE_BASE..DATA + PAGE_SIZE,
+                &*Agent::new_root(1, 64),
+            )
+            .expect("cow_clone"),
+        );
         map_stack(&child).unwrap();
         Image {
             space: child,
@@ -634,7 +660,7 @@ mod test {
     fn notify_rig(img: &Image) -> NotifyRig {
         let agent = Agent::new_root(42, 4);
         let ep = Endpoint::new();
-        let space = Space::new(img.space.clone(), agent.clone());
+        let space = Space::adopt(img.space.clone(), agent.clone());
         space.set_notify_cap(Cap::new(Object::Endpoint(ep.clone()), Rights::SEND));
         NotifyRig {
             server: Thread::new(Agent::new_root(99, 0)),
@@ -719,7 +745,7 @@ mod test {
         let (grant, fwd) = Cap::new(Object::Endpoint(ep.clone()), Rights::ALL)
             .grant_revocable(Rights::SEND)
             .unwrap();
-        let space = Space::new(img.space.clone(), agent.clone());
+        let space = Space::adopt(img.space.clone(), agent.clone());
         space.set_notify_cap(grant);
         fwd.revoke();
         assert!(space.notify_ep().is_none());
@@ -764,7 +790,12 @@ mod test {
         let agent = Agent::new_root(1, 4);
         let img = new_image(user_image!("futex_waiter"), PageFlags::RW);
         // The clone keeps the frame shared, so the waiter's next touch of it must copy.
-        let _clone = cow_clone(&img.space, abi::IMAGE_BASE..DATA + PAGE_SIZE);
+        let _clone = cow_clone(
+            &img.space,
+            abi::IMAGE_BASE..DATA + PAGE_SIZE,
+            &*Agent::new_root(1, 64),
+        )
+        .expect("cow_clone");
         let (waiter, waker) = (Thread::new(agent.clone()), Thread::new(agent));
 
         let we = spawn_image(&waiter, &img, 0);

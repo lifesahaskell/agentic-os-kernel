@@ -22,7 +22,7 @@ use crate::{
     ipc::{self, IpcError},
     space::{self, SpaceError, Target, ThreadStart},
     thread::Thread,
-    vm::{copy_from_user, copy_to_user},
+    vm::{CloneError, copy_from_user, copy_to_user},
 };
 
 /// A positive errno value; `dispatch` returns it negated.
@@ -63,6 +63,7 @@ impl From<IpcError> for Errno {
             IpcError::NoRoom => Errno::EMFILE,
             IpcError::Interrupted => Errno::EINTR,
             IpcError::TimedOut => Errno::ETIMEDOUT,
+            IpcError::Dead => Errno::ESRCH,
         }
     }
 }
@@ -79,6 +80,15 @@ impl From<AgentError> for Errno {
             AgentError::Budget => Errno::ENOMEM,
             AgentError::NoMemory => Errno::ENOMEM,
             AgentError::Cap(c) => c.into(),
+        }
+    }
+}
+
+impl From<CloneError> for Errno {
+    fn from(e: CloneError) -> Self {
+        match e {
+            CloneError::Range | CloneError::Unsupported(_) => Errno::EINVAL,
+            CloneError::Budget => Errno::ENOMEM,
         }
     }
 }
@@ -455,7 +465,7 @@ fn thread_create(
         // `ctx` was range-checked for the whole block, so this slice is in range too.
         let dst = UserSlice::new(ctx.addr() + THREAD_CTX_TID_OFFSET, size_of::<u64>())
             .map_err(|_| SpaceError::Fault)?;
-        copy_to_user(space, t.agent(), dst, &tid.to_le_bytes()).map_err(|_| SpaceError::Fault)
+        copy_to_user(space, &*t.payer(), dst, &tid.to_le_bytes()).map_err(|_| SpaceError::Fault)
     };
     let (slot, _thread) = space::thread_create(t, target, start, tag, publish)?;
     Ok(slot)

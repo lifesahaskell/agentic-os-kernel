@@ -6,29 +6,50 @@
 //! another space does not run with the creator's authority (OD-11).
 
 use abi::{
-    NOTE_EXIT, NOTE_KIND_BUDGET, NOTE_KIND_CODE, NOTE_KIND_EXCEPTION, NOTE_KIND_FAULT, USER_TOP,
+    NOTE_EXIT, NOTE_KIND_BUDGET, NOTE_KIND_CODE, NOTE_KIND_EXCEPTION, NOTE_KIND_FAULT,
+    NOTE_KIND_KILLED, USER_TOP,
 };
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
 
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
 use ostd::{
-    mm::{PAGE_SIZE, VmSpace},
+    mm::{PAGE_SIZE, Vaddr, VmSpace},
     sync::SpinLock,
+    task::disable_preempt,
 };
 
 use crate::{
-    agent::Agent,
+    agent::{Agent, AgentError, Payer},
     cap::{Cap, CapError, Object, Rights},
     ipc::Endpoint,
     thread::Thread,
-    user::{self, Exit},
+    user::{self, Exit, Image},
+    vm::{CloneError, cow_clone},
 };
 
 /// Most live threads one space holds. The 65th `thread_create` is refused (`Limit`).
 pub const MAX_THREADS_PER_SPACE: usize = 64;
 
+/// A process: an address space, the agent that owns it, and its threads.
+///
+/// Teardown (D-01, process level): when the last thread is reaped (or at `kill`, when none is
+/// live), the space unmaps the memory it owns, drops the notify capability, and uncharges every
+/// page it charged to its owner. The
+/// `Space` itself stays as a tombstone until its last capability drops (OD-14): `dying` is set and
+/// `register` answers `Dead`.
+///
+/// Known gap (D-07): data frames a cow-cloned child still shares stay charged to the parent, not
+/// to the child. They are uncharged at the parent's teardown even while the child maps them, so
+/// the error is an under-charge, never a leak. The child pays for its page-table node frames at
+/// clone time and for every copy it makes on a write fault; nothing charges a shared data frame
+/// twice.
 pub struct Space {
     vm: Arc<VmSpace>,
     owner: Arc<Agent>,
@@ -38,16 +59,65 @@ pub struct Space {
     /// Where exit and fault notes for this space's threads go: an Endpoint capability, kept as the
     /// capability and not the endpoint it names, so revoking it stops delivery (OD-06, OD-17).
     notify: SpinLock<Option<Cap>>,
+    /// Pages charged to `owner` through this space (see `impl Payer`), refunded at teardown.
+    charged_pages: AtomicUsize,
+    /// Set once the space is going away, by a kill or by the last thread leaving; `register`
+    /// refuses from then on. Never cleared. Set under the `threads` lock.
+    dying: AtomicBool,
+    /// Set by whoever wins the swap and runs `teardown`, so it runs once.
+    torn: AtomicBool,
+    /// Whether teardown unmaps `vm`. False when the caller keeps the memory (`adopt`).
+    owns_vm: bool,
 }
 
 impl Space {
-    pub fn new(vm: Arc<VmSpace>, owner: Arc<Agent>) -> Arc<Space> {
+    fn build(vm: Arc<VmSpace>, owner: Arc<Agent>, charged: usize, owns_vm: bool) -> Arc<Space> {
         Arc::new(Space {
             vm,
             owner,
             threads: SpinLock::new(Vec::new()),
             notify: SpinLock::new(None),
+            charged_pages: AtomicUsize::new(charged),
+            dying: AtomicBool::new(false),
+            torn: AtomicBool::new(false),
+            owns_vm,
         })
+    }
+
+    /// A space that owns `vm`: teardown unmaps it. Charges nothing, so the ledger starts empty.
+    pub fn new(vm: Arc<VmSpace>, owner: Arc<Agent>) -> Arc<Space> {
+        Space::build(vm, owner, 0, true)
+    }
+
+    /// A space over memory the caller keeps: teardown unmaps nothing and refunds nothing. A
+    /// copy-on-write copy made while it runs is charged through the ledger and stays charged,
+    /// because the frame stays mapped in the caller's `vm` after the process is gone.
+    pub fn adopt(vm: Arc<VmSpace>, owner: Arc<Agent>) -> Arc<Space> {
+        Space::build(vm, owner, 0, false)
+    }
+
+    /// A space over a loaded image: charges the image's frames (`img.pages`: segments and stack)
+    /// to `owner`, records them in the ledger, and owns the vm. `Budget` charges nothing.
+    pub fn from_image(img: &Image, owner: Arc<Agent>) -> Result<Arc<Space>, AgentError> {
+        owner.charge_pages(img.pages)?;
+        Ok(Space::build(img.space.clone(), owner, img.pages, true))
+    }
+
+    /// A space over a copy-on-write clone of `parent` in `range`, owned by `owner`. The clone's
+    /// page-table node frames are charged to `owner` and recorded in the ledger, so teardown
+    /// refunds them. `Err` leaves `owner` as it was (see `cow_clone`).
+    pub fn from_clone(
+        parent: &VmSpace,
+        range: Range<Vaddr>,
+        owner: Arc<Agent>,
+    ) -> Result<Arc<Space>, CloneError> {
+        let tally = Tally {
+            payer: &*owner,
+            pages: AtomicUsize::new(0),
+        };
+        let vm = cow_clone(parent, range, &tally)?;
+        let charged = tally.pages.load(Ordering::Acquire);
+        Ok(Space::build(Arc::new(vm), owner, charged, true))
     }
 
     pub fn vm(&self) -> &Arc<VmSpace> {
@@ -59,10 +129,25 @@ impl Space {
         &self.owner
     }
 
+    /// True once teardown has begun. Never goes back.
+    pub fn is_dying(&self) -> bool {
+        self.dying.load(Ordering::Acquire)
+    }
+
+    /// Pages currently recorded in the ledger.
+    pub fn charged(&self) -> usize {
+        self.charged_pages.load(Ordering::Acquire)
+    }
+
     /// Adds `th` to the space. Entries of threads that no longer exist are dropped first;
-    /// `Limit` when `MAX_THREADS_PER_SPACE` threads are still registered.
+    /// `Dead` once the space is dying, `Limit` when `MAX_THREADS_PER_SPACE` threads are still
+    /// registered. The dying check and the insert share the lock `reap` takes to decide on
+    /// teardown, so a thread cannot join a space that is being emptied.
     pub fn register(&self, th: &Thread) -> Result<(), SpaceError> {
         let mut threads = self.threads.lock();
+        if self.is_dying() {
+            return Err(SpaceError::Dead);
+        }
         threads.retain(|(_, w)| w.strong_count() > 0);
         if threads.len() >= MAX_THREADS_PER_SPACE {
             return Err(SpaceError::Limit);
@@ -71,9 +156,74 @@ impl Space {
         Ok(())
     }
 
-    /// Removes thread `tid` from the space.
-    pub fn reap(&self, tid: u64) {
+    /// Kills the process from outside (OD-15; a kernel API, ring 3 gets it with procmgr).
+    ///
+    /// `dying` is set under the `threads` lock, so `register` refuses from then on, and every live
+    /// thread is killed: each leaves its waits, ends as `Exit::Killed` (a note goes out like any
+    /// exit), retires and is reaped, and the last reap tears the space down. A space with no live
+    /// thread is torn down here. Returns without waiting for any of it.
+    pub fn kill(&self) {
+        let (victims, no_thread_left) = {
+            let threads = self.threads.lock();
+            self.dying.store(true, Ordering::Release);
+            let victims: Vec<Arc<Thread>> =
+                threads.iter().filter_map(|(_, w)| w.upgrade()).collect();
+            let none = victims.is_empty();
+            (victims, none && !self.torn.swap(true, Ordering::AcqRel))
+        };
+        for t in &victims {
+            t.kill();
+        }
+        if no_thread_left {
+            self.teardown();
+        }
+    }
+
+    /// Takes back a registration that never ran. Does not tear the space down.
+    pub fn unregister(&self, tid: u64) {
         self.threads.lock().retain(|(t, _)| *t != tid);
+    }
+
+    /// Removes thread `tid` from the space; when that leaves no live thread, tears the space down.
+    pub fn reap(&self, tid: u64) {
+        let last = {
+            let mut threads = self.threads.lock();
+            threads.retain(|(t, _)| *t != tid);
+            let empty = !threads.iter().any(|(_, w)| w.strong_count() > 0);
+            // Set under the lock `register` takes, so no registration slips in after the decision.
+            if empty {
+                self.dying.store(true, Ordering::Release);
+            }
+            empty && !self.torn.swap(true, Ordering::AcqRel)
+        };
+        if last {
+            self.teardown();
+        }
+    }
+
+    /// The work of teardown. The caller won the `torn` swap, so it runs once. In order: take the
+    /// notify capability (nothing is sent after the process is gone), unmap what the space owns,
+    /// refund what it charged. A space that does not own its `vm` unmaps nothing and refunds
+    /// nothing: the pages it charged are still mapped, by the caller.
+    fn teardown(&self) {
+        drop(self.notify.lock().take());
+        if self.owns_vm {
+            let guard = disable_preempt();
+            // `unmap` flushes and dispatches the TLB itself, and frees the frames once no CPU can
+            // still hold a stale translation.
+            let cursor = self.vm.cursor_mut(&guard, &(0..USER_TOP));
+            // OSTD refusing the whole user range would leave the pages mapped and charged, a
+            // leak; the ktests assert the range is mapped away, so it fails there, loudly.
+            debug_assert!(
+                cursor.is_ok(),
+                "teardown: cursor over the user range refused"
+            );
+            if let Ok(mut c) = cursor {
+                c.unmap(USER_TOP);
+            }
+            let pages = self.charged_pages.swap(0, Ordering::AcqRel);
+            self.owner.uncharge_pages(pages);
+        }
     }
 
     /// Sets the notify capability, replacing any earlier one. `cap` is stored as given; whether
@@ -108,7 +258,7 @@ impl Space {
     /// endpoint resolves. The result is ignored: the exit has happened either way.
     ///
     /// Called after `set_exit` and before `reap`, so the note leaves while the space still counts
-    /// the thread. `NOTE_KIND_KILLED` has no `Exit` variant yet (plan 02-06).
+    /// the thread.
     pub fn note_exit(&self, th: &Thread, exit: Exit) {
         let Some(ep) = self.notify_ep() else {
             return;
@@ -118,6 +268,7 @@ impl Space {
             Exit::Fault(a) => (NOTE_KIND_FAULT, a as u64),
             Exit::Budget => (NOTE_KIND_BUDGET, 0),
             Exit::Exception(v) => (NOTE_KIND_EXCEPTION, v),
+            Exit::Killed => (NOTE_KIND_KILLED, 0),
         };
         let _ = ep.push_note(th, NOTE_EXIT, [kind, value, 0, 0], None);
     }
@@ -129,6 +280,56 @@ impl Space {
             .iter()
             .filter(|(_, w)| w.strong_count() > 0)
             .count()
+    }
+}
+
+/// Counts what a clone charges through `payer`, so `from_clone` can seed the new space's ledger.
+struct Tally<'a> {
+    payer: &'a dyn Payer,
+    pages: AtomicUsize,
+}
+
+impl Payer for Tally<'_> {
+    fn charge_pages(&self, pages: usize) -> Result<(), AgentError> {
+        self.payer.charge_pages(pages)?;
+        self.pages.fetch_add(pages, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn uncharge_pages(&self, pages: usize) {
+        self.pages.fetch_sub(pages, Ordering::AcqRel);
+        self.payer.uncharge_pages(pages);
+    }
+}
+
+impl Payer for Space {
+    /// Charges the owner, then records the pages in the ledger teardown refunds.
+    fn charge_pages(&self, pages: usize) -> Result<(), AgentError> {
+        self.owner.charge_pages(pages)?;
+        self.charged_pages.fetch_add(pages, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Takes `pages` out of the ledger, then refunds the owner. A refund larger than the ledger
+    /// holds is cut to the ledger, so one space never uncharges the owner for another's pages.
+    fn uncharge_pages(&self, pages: usize) {
+        let taken = self
+            .charged_pages
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                Some(c.saturating_sub(pages))
+            })
+            .map_or(0, |before| before.min(pages));
+        self.owner.uncharge_pages(taken);
+    }
+}
+
+impl Drop for Space {
+    /// A space that never started a thread still frees what it holds when its last reference
+    /// drops. `torn` makes this a no-op after a real teardown.
+    fn drop(&mut self) {
+        if !self.torn.swap(true, Ordering::AcqRel) {
+            self.teardown();
+        }
     }
 }
 
@@ -232,13 +433,13 @@ pub fn thread_create(
     let slot = match caller.agent().cspace.lock().insert(cap) {
         Ok(slot) => slot,
         Err(_) => {
-            space.reap(th.tid());
+            space.unregister(th.tid());
             return Err(SpaceError::NoRoom);
         }
     };
     if let Err(e) = publish(th.tid()) {
         let _ = caller.agent().cspace.lock().remove(slot);
-        space.reap(th.tid());
+        space.unregister(th.tid());
         return Err(e);
     }
     user::spawn_thread(&space, th.clone(), start);
@@ -311,18 +512,20 @@ pub fn set_notify(caller: &Thread, target: Target, ep_slot: usize) -> Result<(),
 mod test {
     use abi::{IMAGE_BASE, NOTE_FAULT, TEST_DATA, USER_STACK_TOP, errno};
     use ostd::{
-        mm::{FrameAllocOptions, PageFlags, VmIo},
+        mm::{FrameAllocOptions, PageFlags, UFrame, VmIo},
         prelude::*,
-        task::{Task, TaskOptions},
+        task::{Task, TaskOptions, disable_preempt},
+        timer::Jiffies,
     };
 
     use super::*;
     use crate::{
         ipc::{IpcError, Message},
         sched::install_space_switch,
+        syscall::Errno,
         user::{
             Image, load_image, map_stack, map_test_page, spawn_thread,
-            testkit::{self, join, join_thread, recv_note, spawn_image},
+            testkit::{self, join, join_thread, recv_note, spawn_image, spawn_image_in},
             user_image,
         },
         vm::cow_clone,
@@ -336,7 +539,7 @@ mod test {
             FrameAllocOptions::new().alloc_frame().unwrap().into(),
             PageFlags::RW,
         );
-        (Space::new(img.space.clone(), owner.clone()), img)
+        (Space::adopt(img.space.clone(), owner.clone()), img)
     }
 
     /// Start at the spinner's entry. Every thread of one space shares the id `arg`, which the
@@ -695,10 +898,17 @@ mod test {
         // observed after all 64 are gone, not after one.
         stop_all(&caller, &started, img.handler);
         assert_eq!(b.live_threads(), 0);
-        let again = thread_create(&caller, Target::Slot(0), spin_at(&img), 0, ok).unwrap();
-        assert_eq!(b.live_threads(), 1);
-        stop_all(&caller, &[again], img.handler);
-        assert_eq!(b.live_threads(), 0);
+        // The last exit tore the process down: its slots are free but it takes no new thread.
+        assert!(b.is_dying());
+        assert_eq!(
+            thread_create(&caller, Target::Slot(0), spin_at(&img), 0, ok).err(),
+            Some(SpaceError::Dead)
+        );
+        assert_eq!(
+            a.cspace.lock().room(),
+            room,
+            "the refused call kept nothing"
+        );
     }
 
     #[ktest]
@@ -840,7 +1050,14 @@ mod test {
         arg: u64,
     ) -> (Arc<Space>, Arc<Thread>) {
         install_space_switch();
-        let vm = Arc::new(cow_clone(&parent.space, IMAGE_BASE..TEST_DATA + PAGE_SIZE));
+        let vm = Arc::new(
+            cow_clone(
+                &parent.space,
+                IMAGE_BASE..TEST_DATA + PAGE_SIZE,
+                &*Agent::new_root(1, 64),
+            )
+            .expect("cow_clone"),
+        );
         map_stack(&vm).unwrap();
         let space = Space::new(vm, owner.clone());
         if let Some(ep) = ep {
@@ -1158,7 +1375,382 @@ mod test {
         assert_note_shape(&m, NOTE_EXIT);
         assert_eq!(m.words, [NOTE_KIND_CODE, (-errno::EPERM) as u64, 0, 0]);
         assert_eq!((m.tid, m.tag), (t.tid(), 0x12));
-        assert!(Arc::ptr_eq(&s.notify_ep().unwrap(), &e));
         assert_eq!(join_thread(&t), Exit::Code((-errno::EPERM) as usize));
+        // The note left before the process went away; once the last thread is reaped the
+        // capability set by the first self-call is dropped with it.
+        while s.live_threads() != 0 {
+            Task::yield_now();
+        }
+        assert!(s.is_dying());
+        assert!(s.notify_ep().is_none());
+    }
+
+    /// Whether a page is mapped at `va` in `vm`.
+    fn mapped(vm: &VmSpace, va: usize) -> bool {
+        let guard = disable_preempt();
+        let mut c = vm.cursor(&guard, &(va..va + PAGE_SIZE)).unwrap();
+        c.query().unwrap().1.is_some()
+    }
+
+    /// Waits, yielding, until the last thread of `space` has been reaped. A thread's exit is
+    /// visible a moment before its reap (see `thread_create_limit_is_64`).
+    fn wait_reaped(space: &Space) {
+        let mut spins = 0usize;
+        while space.live_threads() != 0 || !space.is_dying() {
+            spins += 1;
+            assert!(spins < 1_000_000, "the last thread was never reaped");
+            Task::yield_now();
+        }
+    }
+
+    /// Iterations of the fork-and-exit loop. A module constant so a slow run can be shortened in
+    /// one place; the loop prints its wall time (1 jiffy is 1 ms at the 1 kHz tick).
+    const ITERATIONS: usize = 10_000;
+
+    /// A child space over a copy-on-write clone of `parent`'s image range, with a fresh stack.
+    fn cow_space(parent: &Image, owner: &Arc<Agent>) -> Arc<Space> {
+        let space = Space::from_clone(
+            &parent.space,
+            IMAGE_BASE..TEST_DATA + PAGE_SIZE,
+            owner.clone(),
+        )
+        .expect("from_clone");
+        map_stack(space.vm()).unwrap();
+        space
+    }
+
+    #[ktest]
+    fn teardown_loop_same_agent_10000x() {
+        install_space_switch();
+        let a = Agent::new_root(1, 64);
+        let holder = Thread::new(a.clone());
+        let parent = sibling_parent(PageFlags::RW);
+        let (used, room) = (a.mem_used_pages(), a.cspace.lock().room());
+
+        let t0 = Jiffies::elapsed().as_u64();
+        for i in 0..ITERATIONS {
+            let child = cow_space(&parent, &a);
+            let weak = Arc::downgrade(&child);
+            let slot = a
+                .cspace
+                .lock()
+                .insert(Cap::new(Object::Space(child), Rights::CREATE))
+                .unwrap();
+            // arg 1: store into the test page, which is copy-on-write in the child, then exit 8.
+            let start = ThreadStart {
+                arg: 1,
+                ..spin_at(&parent)
+            };
+            let (tslot, th) = thread_create(&holder, Target::Slot(slot), start, 0, ok).unwrap();
+            assert_eq!(join_thread(&th), Exit::Code(8), "iteration {i}");
+            a.cspace.lock().remove(tslot).unwrap();
+            a.cspace.lock().remove(slot).unwrap();
+            drop(th);
+            let mut yields = 0;
+            while weak.strong_count() > 0 {
+                yields += 1;
+                assert!(yields < 1000, "iteration {i}: the space never dropped");
+                Task::yield_now();
+            }
+        }
+        let t1 = Jiffies::elapsed().as_u64();
+        println!(
+            "teardown_loop: iterations={} jiffies={}",
+            ITERATIONS,
+            t1 - t0
+        );
+
+        assert_eq!(a.mem_used_pages(), used, "the loop leaked budget");
+        assert_eq!(a.cspace.lock().room(), room, "the loop leaked capabilities");
+    }
+
+    #[ktest]
+    fn teardown_charges_image_and_stack_pages() {
+        install_space_switch();
+        let img = load_image(user_image!("fault_sibling")).unwrap();
+
+        // A budget one page short refuses the image and charges nothing.
+        let small = Agent::new_root(2, img.pages - 1);
+        assert_eq!(
+            Space::from_image(&img, small.clone()).err(),
+            Some(AgentError::Budget)
+        );
+        assert_eq!(small.mem_used_pages(), 0);
+
+        let a = Agent::new_root(1, img.pages + 4);
+        let before = a.mem_used_pages();
+        let space = Space::from_image(&img, a.clone()).unwrap();
+        assert_eq!(a.mem_used_pages(), before + img.pages);
+        assert_eq!(space.charged(), img.pages);
+
+        let exit = spawn_image_in(&Thread::new(a.clone()), &space, &img, 0);
+        assert_eq!(join(&exit), Exit::Code(7));
+        wait_reaped(&space);
+        assert_eq!(a.mem_used_pages(), before, "the exit gave the pages back");
+        assert_eq!(space.charged(), 0);
+    }
+
+    #[ktest]
+    fn teardown_unmaps_owned_space_and_leaves_a_tombstone() {
+        install_space_switch();
+        let img = load_image(user_image!("fault_sibling")).unwrap();
+        let a = Agent::new_root(1, img.pages);
+        let space = Space::from_image(&img, a.clone()).unwrap();
+        let ep = Endpoint::new();
+        space.set_notify_cap(Cap::new(Object::Endpoint(ep.clone()), Rights::SEND));
+        assert!(mapped(space.vm(), IMAGE_BASE));
+        assert!(space.notify_ep().is_some());
+
+        let exit = spawn_image_in(&Thread::new(a.clone()), &space, &img, 0);
+        assert_eq!(join(&exit), Exit::Code(7));
+        wait_reaped(&space);
+
+        assert!(!mapped(space.vm(), IMAGE_BASE), "the image is unmapped");
+        assert!(
+            !mapped(space.vm(), USER_STACK_TOP - PAGE_SIZE),
+            "so is the stack"
+        );
+        assert_eq!(ep.queued(), 1, "the exit note left before the process went");
+        assert!(space.notify_ep().is_none(), "the notify capability is gone");
+
+        // A Space capability still names the tombstone, and it takes no more threads.
+        let (h, holder) = holder_of(&space, Rights::ALL);
+        let room = h.cspace.lock().room();
+        assert_eq!(
+            thread_create(&holder, Target::Slot(0), spin_at(&img), 0, ok).err(),
+            Some(SpaceError::Dead)
+        );
+        assert_eq!(
+            h.cspace.lock().room(),
+            room,
+            "the refused call kept nothing"
+        );
+    }
+
+    #[ktest]
+    fn teardown_keeps_an_adopted_space_mapped() {
+        install_space_switch();
+        let owner = Agent::new_root(1, 4);
+        let parent = sibling_parent(PageFlags::RW);
+        let vm = Arc::new(
+            cow_clone(
+                &parent.space,
+                IMAGE_BASE..TEST_DATA + PAGE_SIZE,
+                &*Agent::new_root(1, 64),
+            )
+            .expect("cow_clone"),
+        );
+        map_stack(&vm).unwrap();
+        let child = Image {
+            space: vm,
+            ..parent.clone()
+        };
+        let space = Space::adopt(child.space.clone(), owner.clone());
+
+        // arg 1 stores into the copy-on-write test page: one copy, charged through the space.
+        let exit = spawn_image_in(&Thread::new(owner.clone()), &space, &child, 1);
+        assert_eq!(join(&exit), Exit::Code(8));
+        wait_reaped(&space);
+
+        // The copy is still mapped in the caller's space, so it stays charged.
+        assert_eq!(owner.mem_used_pages(), 1, "the copy stays charged");
+        assert_eq!(space.charged(), 1);
+        for va in [IMAGE_BASE, TEST_DATA, USER_STACK_TOP - PAGE_SIZE] {
+            assert!(mapped(&child.space, va), "the caller still maps {va:#x}");
+        }
+    }
+
+    /// A space that owns a loaded `spinner` image over a test page the harness keeps a handle on.
+    fn owned_spinner(owner: &Arc<Agent>) -> (Arc<Space>, Image, UFrame) {
+        let img = load_image(user_image!("spinner")).unwrap();
+        let page: UFrame = FrameAllocOptions::new().alloc_frame().unwrap().into();
+        map_test_page(&img.space, page.clone(), PageFlags::RW);
+        (Space::new(img.space.clone(), owner.clone()), img, page)
+    }
+
+    /// Registers a thread tagged `tag` in `space` and starts it at `start`.
+    fn start_in(
+        space: &Arc<Space>,
+        owner: &Arc<Agent>,
+        tag: u64,
+        start: ThreadStart,
+    ) -> Arc<Thread> {
+        let th = Thread::new_tagged(owner.clone(), tag);
+        space.register(&th).unwrap();
+        spawn_thread(space, th.clone(), start);
+        th
+    }
+
+    #[ktest]
+    fn kill_stops_a_running_spinner() {
+        install_space_switch();
+        let owner = Agent::new_root(1, 0);
+        let (space, img, _page) = owned_spinner(&owner);
+        let ep = Endpoint::new();
+        space.set_notify_cap(Cap::new(Object::Endpoint(ep.clone()), Rights::SEND));
+        let th = start_in(&space, &owner, 0x21, spin_at(&img));
+
+        space.kill();
+        assert_eq!(join_thread(&th), Exit::Killed);
+        let m = recv_note(&ep, &receiver());
+        assert_note_shape(&m, NOTE_EXIT);
+        assert_eq!(m.words, [NOTE_KIND_KILLED, 0, 0, 0]);
+        assert_eq!((m.tid, m.tag), (th.tid(), 0x21));
+        wait_reaped(&space);
+        assert!(!mapped(&img.space, IMAGE_BASE), "the process is torn down");
+        assert_eq!(space.live_threads(), 0);
+    }
+
+    #[ktest]
+    fn kill_wakes_the_dead_process_futex_waiters() {
+        install_space_switch();
+        let owner = Agent::new_root(1, 0);
+        let img = load_image(user_image!("futex_waiter")).unwrap();
+        let word: UFrame = FrameAllocOptions::new().alloc_frame().unwrap().into();
+        word.write_val(0, &0x11u32).unwrap();
+        map_test_page(&img.space, word.clone(), PageFlags::RW);
+        let space = Space::new(img.space.clone(), owner.clone());
+        // Q maps the same frame, so a wake from Q reaches whatever S left in the futex table.
+        let q = VmSpace::new();
+        map_test_page(&q, word, PageFlags::RW);
+
+        let at = |back: usize| ThreadStart {
+            rip: img.entry as u64,
+            rsp: (USER_STACK_TOP - back) as u64,
+            arg: 0,
+            fs_base: 0,
+            clear_tid: 0,
+        };
+        let t1 = start_in(&space, &owner, 0, at(0));
+        let t2 = start_in(&space, &owner, 0, at(PAGE_SIZE));
+        let mut spins = 0usize;
+        while !(t1.is_blocked() && t2.is_blocked()) {
+            spins += 1;
+            assert!(spins < 1_000_000, "the waiters never reached the futex");
+            Task::yield_now();
+        }
+
+        space.kill();
+        assert_eq!(join_thread(&t1), Exit::Killed);
+        assert_eq!(join_thread(&t2), Exit::Killed);
+        let waker = Thread::new(Agent::new_root(2, 0));
+        assert_eq!(
+            crate::futex::wake(&waker, &q, TEST_DATA, 10),
+            Ok(0),
+            "no waiter was left in the table"
+        );
+    }
+
+    #[ktest]
+    fn kill_frees_a_thread_in_an_uninterruptible_reply_wait() {
+        install_space_switch();
+        let ep = Endpoint::new();
+        let agent = Agent::new_root(3, 0);
+        let slot = give_endpoint(&agent, &ep, Rights::SEND);
+        // `nullipc` calls the endpoint in slot `arg` until a call fails.
+        let img = load_image(user_image!("nullipc")).unwrap();
+        let space = Space::new(img.space.clone(), agent.clone());
+        let caller = Thread::new(agent);
+        let exit = spawn_image_in(&caller, &space, &img, slot as u64);
+
+        // A kernel task takes the call and never answers it.
+        let server = receiver();
+        let m = ep.recv(&server).unwrap();
+        let reply = m.reply.clone().expect("a call carries its reply");
+        testkit::wait_blocked(&caller, &exit);
+        caller.interrupt(img.handler);
+        for _ in 0..50 {
+            Task::yield_now();
+        }
+        assert!(
+            caller.is_blocked() && exit.lock().is_none(),
+            "an interrupted caller whose request a server holds waits for the reply"
+        );
+
+        space.kill();
+        assert_eq!(join(&exit), Exit::Killed);
+        assert!(!caller.is_blocked());
+
+        // The server's late answer has nobody to go to and must not panic.
+        reply.reply([1, 2, 3, 4]);
+        assert_eq!(ep.queued(), 0);
+        assert!(!caller.is_blocked());
+    }
+
+    #[ktest]
+    fn dead_server_answers_parked_callers_esrch() {
+        install_space_switch();
+        let ep = Endpoint::new();
+        let agent = Agent::new_root(4, 0);
+        let rx = give_endpoint(&agent, &ep, Rights::RECV);
+        // `park_srv` receives a call, parks it, then waits for a second one.
+        let img = load_image(user_image!("park_srv")).unwrap();
+        let space = Space::new(img.space.clone(), agent.clone());
+        let server = Thread::new(agent);
+        let exit = spawn_image_in(&server, &space, &img, rx as u64);
+
+        let caller = Thread::new(Agent::new_root(5, 0));
+        let out: Arc<SpinLock<Option<Result<[u64; 4], IpcError>>>> = Arc::new(SpinLock::new(None));
+        let (e2, c2, o2) = (ep.clone(), caller.clone(), out.clone());
+        TaskOptions::new(move || *o2.lock() = Some(e2.call(&c2, 7, [7, 0, 0, 0])))
+            .spawn()
+            .unwrap();
+        let mut spins = 0usize;
+        while server.replies.lock().len() < 1 {
+            spins += 1;
+            assert!(spins < 1_000_000, "the server never parked the call");
+            Task::yield_now();
+        }
+        assert!(out.lock().is_none(), "the caller is still waiting");
+
+        space.kill();
+        assert_eq!(join(&exit), Exit::Killed);
+        let answer = loop {
+            if let Some(r) = out.lock().take() {
+                break r;
+            }
+            Task::yield_now();
+        };
+        assert_eq!(answer, Err(IpcError::Dead));
+        assert_eq!(Errno::from(IpcError::Dead), Errno::ESRCH);
+        assert_eq!(
+            server.replies.lock().len(),
+            0,
+            "the dead server holds nothing"
+        );
+    }
+
+    #[ktest]
+    fn kill_before_first_run_never_enters_user_mode() {
+        install_space_switch();
+        let owner = Agent::new_root(1, 0);
+        let (space, img, page) = owned_spinner(&owner);
+        let th = Thread::new(owner.clone());
+        space.register(&th).unwrap();
+        space.kill();
+        spawn_thread(&space, th.clone(), spin_at(&img));
+
+        assert_eq!(join_thread(&th), Exit::Killed);
+        // The spinner stores its id in word 1 and counts in word 0 as soon as it runs.
+        assert_eq!(page.read_val::<u64>(0).unwrap(), 0, "it never ran");
+    }
+
+    #[ktest]
+    fn killed_space_refuses_thread_create() {
+        install_space_switch();
+        let owner = Agent::new_root(2, 0);
+        let (b, img, _page) = owned_spinner(&owner);
+        let (_a, caller) = holder_of(&b, Rights::CREATE.union(Rights::SIGNAL));
+
+        b.kill();
+        assert!(b.is_dying());
+        assert!(
+            !mapped(&img.space, IMAGE_BASE),
+            "killing a space with no live thread tears it down"
+        );
+        let r = thread_create(&caller, Target::Slot(0), spin_at(&img), 0, ok);
+        assert_eq!(r.err(), Some(SpaceError::Dead));
+        assert_eq!(Errno::from(SpaceError::Dead), Errno::ESRCH);
+        assert_eq!(b.live_threads(), 0);
     }
 }
