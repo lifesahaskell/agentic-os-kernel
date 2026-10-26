@@ -664,6 +664,41 @@ mod test {
             })
         );
         assert_eq!(
+            decode(SYS_THREAD_CREATE, [3, 0x1000, 0x77, 0, 0, 0]),
+            Ok(Syscall::ThreadCreate {
+                target: Target::Slot(3),
+                ctx: UserPtr::new(0x1000).unwrap(),
+                tag: 0x77,
+            })
+        );
+        assert_eq!(
+            decode(SYS_THREAD_CREATE, [SPACE_SELF as usize, 0x1000, 0, 0, 0, 0]),
+            Ok(Syscall::ThreadCreate {
+                target: Target::SelfSpace,
+                ctx: UserPtr::new(0x1000).unwrap(),
+                tag: 0,
+            })
+        );
+        assert_eq!(
+            err(SYS_THREAD_CREATE, [Handle::LIMIT, 0x1000, 0, 0, 0, 0]),
+            Some(Errno::EBADF)
+        );
+        assert_eq!(
+            err(SYS_THREAD_CREATE, [0, USER_TOP - 40, 0, 0, 0, 0]),
+            Some(Errno::EFAULT)
+        );
+        assert_eq!(
+            decode(SYS_THREAD_INTERRUPT, [4, 0x40_0000, 0, 0, 0, 0]),
+            Ok(Syscall::ThreadInterrupt {
+                thread: Handle::new(4).unwrap(),
+                entry: 0x40_0000,
+            })
+        );
+        assert_eq!(
+            err(SYS_THREAD_INTERRUPT, [Handle::LIMIT, 0x40_0000, 0, 0, 0, 0]),
+            Some(Errno::EBADF)
+        );
+        assert_eq!(
             decode(SYS_FUTEX, [0x1000, 4 | 128, 2, 5, 0x2000, 9]),
             Ok(Syscall::FutexRequeue {
                 addr: UserPtr::new(0x1000).unwrap(),
@@ -729,8 +764,9 @@ mod test {
         }
     }
 
-    const KNOWN: [isize; 11] = [
+    const KNOWN: [isize; 12] = [
         errno::EPERM,
+        errno::ESRCH,
         errno::EINTR,
         errno::EBADF,
         errno::EAGAIN,
@@ -784,7 +820,7 @@ mod test {
 
         // Each decode and copy error path once, with its exact errno.
         let z = [0usize; 6];
-        let targeted: [(usize, [usize; 6], isize); 16] = [
+        let targeted: [(usize, [usize; 6], isize); 21] = [
             (0xFFFF, z, errno::ENOSYS),
             (SYS_FUTEX, [mapped, 99, 0, 0, 0, 0], errno::ENOSYS),
             // The timeout pointer is address 1, which is unmapped.
@@ -810,6 +846,37 @@ mod test {
             // A timer delay of 0 is refused, and an empty slot is EBADF whatever the delay.
             (SYS_TIMER_ARM, [0, 0, 7, 0, 0, 0], errno::EINVAL),
             (SYS_TIMER_ARM, [5, 10, 7, 0, 0, 0], errno::EBADF),
+            // A ThreadCtx outside user space is EFAULT at decode.
+            (
+                SYS_THREAD_CREATE,
+                [SPACE_SELF as usize, KERNEL_HALF, 0, 0, 0, 0],
+                errno::EFAULT,
+            ),
+            // The stack page is zeroed: rip 0 is not a user address, refused before the target is
+            // looked at.
+            (
+                SYS_THREAD_CREATE,
+                [SPACE_SELF as usize, mapped + 128, 0, 0, 0, 0],
+                errno::EINVAL,
+            ),
+            // An empty slot is EBADF, whatever the entry.
+            (
+                SYS_THREAD_INTERRUPT,
+                [5, 0x40_0000, 0, 0, 0, 0],
+                errno::EBADF,
+            ),
+            // Slot 0 holds an Endpoint with SEND only: the rights check is the first refusal, and
+            // an entry outside user space is refused before the slot is looked at.
+            (
+                SYS_THREAD_INTERRUPT,
+                [0, 0x40_0000, 0, 0, 0, 0],
+                errno::EPERM,
+            ),
+            (
+                SYS_THREAD_INTERRUPT,
+                [0, KERNEL_HALF, 0, 0, 0, 0],
+                errno::EINVAL,
+            ),
         ];
         for (i, (nr, a, want)) in targeted.into_iter().enumerate() {
             assert_eq!(
@@ -838,6 +905,9 @@ mod test {
         crate::vm::copy_to_user(space, t.agent(), ts_at, &[0u8; 16]).unwrap();
 
         let mut rng = Rng(0x9E3779B97F4A7C15);
+        // No Space capability and no Space-bearing thread exist in this setup, so a random
+        // `thread_create` or `thread_interrupt` can only be refused. The success paths are the
+        // ktests in `space`.
         let numbers = [
             SYS_EXIT,
             SYS_SCHED_YIELD,
@@ -847,6 +917,8 @@ mod test {
             SYS_REPLY,
             SYS_REPLY_RECV,
             SYS_TIMER_ARM,
+            SYS_THREAD_CREATE,
+            SYS_THREAD_INTERRUPT,
         ];
         let (mut enosys, mut efault, mut einval, mut ebadf, mut eintr) = (0, 0, 0, 0, 0);
         for i in 0..ITERATIONS {

@@ -243,6 +243,30 @@ mod test {
     }
 
     #[ktest]
+    fn rights_include_create_and_signal() {
+        let all = Rights::from_bits(31);
+        for r in [
+            Rights::SEND,
+            Rights::RECV,
+            Rights::GRANT,
+            Rights::CREATE,
+            Rights::SIGNAL,
+        ] {
+            assert!(all.contains(r), "{r:?}");
+        }
+        assert_eq!(all, Rights::ALL);
+        assert_eq!(Rights::from_bits(32), Rights::NONE, "bit 5 is undefined");
+
+        // A Space capability derived with only SIGNAL can no longer create.
+        let space = Space::new(Arc::new(ostd::mm::VmSpace::new()), Agent::new_root(1, 0));
+        let c = Cap::new(Object::Space(space), Rights::ALL);
+        let d = c.derive(Rights::SIGNAL).unwrap();
+        assert_eq!(d.rights(), Rights::SIGNAL);
+        assert_eq!(d.resolve(Rights::CREATE).err(), Some(CapError::Rights));
+        assert!(d.resolve(Rights::SIGNAL).is_ok());
+    }
+
+    #[ktest]
     fn revoke_kills_one_grant_and_its_descendants() {
         let root = ep_cap(Rights::ALL);
         let (a, fwd_a) = root.grant_revocable(Rights::ALL).unwrap();

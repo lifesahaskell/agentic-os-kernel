@@ -444,4 +444,282 @@ mod test {
             "the capability was taken back"
         );
     }
+
+    /// An agent holding a Space capability for `b` with `rights` in slot 0, and a thread of it
+    /// that never runs and only names the agent whose capability space is used.
+    fn holder_of(b: &Arc<Space>, rights: Rights) -> (Arc<Agent>, Arc<Thread>) {
+        let a = Agent::new_root(1, 0);
+        let slot = a
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Space(b.clone()), rights))
+            .unwrap();
+        assert_eq!(slot, 0);
+        let caller = Thread::new(a.clone());
+        (a, caller)
+    }
+
+    /// Interrupts every thread, then waits for each to exit. All are interrupted first: the
+    /// ktest scheduler is OSTD's FIFO, which never preempts, so a thread still spinning that comes
+    /// ahead of the caller in the queue would keep the CPU for good.
+    fn stop_all(caller: &Thread, started: &[(usize, Arc<Thread>)], handler: usize) {
+        for (slot, _) in started {
+            thread_interrupt(caller, *slot, handler).unwrap();
+        }
+        for (_, th) in started {
+            join_thread(th);
+        }
+    }
+
+    #[ktest]
+    fn thread_create_refuses_without_create() {
+        install_space_switch();
+        let owner = Agent::new_root(2, 0);
+        let (b, img) = spinner_space(&owner);
+        // SIGNAL without CREATE.
+        let (a, caller) = holder_of(&b, Rights::SIGNAL.union(Rights::GRANT));
+        let room = a.cspace.lock().room();
+        let try_slot =
+            |slot| thread_create(&caller, Target::Slot(slot), spin_at(&img), 0, ok).err();
+
+        assert_eq!(try_slot(0), Some(SpaceError::Cap(CapError::Rights)));
+        // An empty slot.
+        assert_eq!(try_slot(5), Some(SpaceError::Cap(CapError::NoSlot)));
+        // A capability that is not a Space, with every right.
+        let ep = a
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Endpoint(Endpoint::new()), Rights::ALL))
+            .unwrap();
+        assert_eq!(try_slot(ep), Some(SpaceError::WrongType));
+        // Attenuated away: a derived capability without CREATE is refused as well.
+        let derived = {
+            let mut cs = a.cspace.lock();
+            let d = cs.get(0).unwrap().derive(Rights::SIGNAL).unwrap();
+            cs.insert(d).unwrap()
+        };
+        assert_eq!(try_slot(derived), Some(SpaceError::Cap(CapError::Rights)));
+
+        assert_eq!(b.live_threads(), 0, "no refusal started a thread");
+        assert_eq!(
+            a.cspace.lock().room(),
+            room - 2,
+            "only the two capabilities this test inserted"
+        );
+    }
+
+    #[ktest]
+    fn thread_create_refuses_bad_ctx() {
+        install_space_switch();
+        let owner = Agent::new_root(2, 0);
+        let (b, img) = spinner_space(&owner);
+        let (a, caller) = holder_of(&b, Rights::ALL);
+        let room = a.cspace.lock().room();
+        let good = spin_at(&img);
+        let bad = |s: ThreadStart| thread_create(&caller, Target::Slot(0), s, 0, ok).err();
+
+        let top = USER_TOP as u64;
+        for (what, s) in [
+            ("rip 0", ThreadStart { rip: 0, ..good }),
+            ("rip in page 0", ThreadStart { rip: 8, ..good }),
+            ("rip at USER_TOP", ThreadStart { rip: top, ..good }),
+            ("rsp 0", ThreadStart { rsp: 0, ..good }),
+            ("rsp at USER_TOP", ThreadStart { rsp: top, ..good }),
+            (
+                "fs_base at USER_TOP",
+                ThreadStart {
+                    fs_base: top,
+                    ..good
+                },
+            ),
+            (
+                "clear_tid set",
+                ThreadStart {
+                    clear_tid: 1,
+                    ..good
+                },
+            ),
+        ] {
+            assert_eq!(bad(s), Some(SpaceError::Invalid), "{what}");
+        }
+
+        // A thread cannot pick a tag for its own space, and a caller with no space has none.
+        let me = Thread::new_tagged(owner.clone(), 5);
+        assert_eq!(
+            thread_create(&me, Target::SelfSpace, good, 9, ok).err(),
+            Some(SpaceError::Invalid)
+        );
+        assert_eq!(
+            thread_create(&me, Target::SelfSpace, good, 0, ok).err(),
+            Some(SpaceError::Dead)
+        );
+        // The publish step failing takes the capability back and starts nothing.
+        assert_eq!(
+            thread_create(&caller, Target::Slot(0), good, 0, |_| Err(
+                SpaceError::Fault
+            ))
+            .err(),
+            Some(SpaceError::Fault)
+        );
+
+        assert_eq!(b.live_threads(), 0);
+        assert_eq!(a.cspace.lock().room(), room, "no capability was kept");
+    }
+
+    #[ktest]
+    fn thread_create_limit_is_64() {
+        install_space_switch();
+        let owner = Agent::new_root(2, 0);
+        let (b, img) = spinner_space(&owner);
+        let (a, caller) = holder_of(&b, Rights::ALL);
+
+        let mut started = Vec::new();
+        for i in 0..MAX_THREADS_PER_SPACE {
+            // Each thread gets its own slice of the shared stack; all share the spinner's id.
+            let s = ThreadStart {
+                rsp: USER_STACK_TOP as u64 - 0x400 * i as u64,
+                ..spin_at(&img)
+            };
+            started.push(thread_create(&caller, Target::Slot(0), s, 0, ok).unwrap());
+        }
+        assert_eq!(b.live_threads(), MAX_THREADS_PER_SPACE);
+
+        let room = a.cspace.lock().room();
+        assert_eq!(
+            thread_create(&caller, Target::Slot(0), spin_at(&img), 0, ok).err(),
+            Some(SpaceError::Limit)
+        );
+        assert_eq!(b.live_threads(), MAX_THREADS_PER_SPACE);
+        assert_eq!(
+            a.cspace.lock().room(),
+            room,
+            "the refused call kept nothing"
+        );
+
+        // Exits give the room back. Every thread is stopped at once (see `stop_all`), so room is
+        // observed after all 64 are gone, not after one.
+        stop_all(&caller, &started, img.handler);
+        assert_eq!(b.live_threads(), 0);
+        let again = thread_create(&caller, Target::Slot(0), spin_at(&img), 0, ok).unwrap();
+        assert_eq!(b.live_threads(), 1);
+        stop_all(&caller, &[again], img.handler);
+        assert_eq!(b.live_threads(), 0);
+    }
+
+    #[ktest]
+    fn thread_create_full_cspace_is_emfile() {
+        install_space_switch();
+        let owner = Agent::new_root(2, 0);
+        let (b, img) = spinner_space(&owner);
+        let (a, caller) = holder_of(&b, Rights::ALL);
+
+        // Fill the capability space with a placeholder.
+        let filler = Endpoint::new();
+        let last = {
+            let mut cs = a.cspace.lock();
+            let mut last = 0;
+            while cs.room() > 0 {
+                last = cs
+                    .insert(Cap::new(Object::Endpoint(filler.clone()), Rights::SEND))
+                    .unwrap();
+            }
+            last
+        };
+
+        assert_eq!(
+            thread_create(&caller, Target::Slot(0), spin_at(&img), 0, ok).err(),
+            Some(SpaceError::NoRoom)
+        );
+        assert_eq!(b.live_threads(), 0, "the refused thread was reaped");
+
+        // Freeing one slot lets the same call through.
+        a.cspace.lock().remove(last).unwrap();
+        let started = thread_create(&caller, Target::Slot(0), spin_at(&img), 0, ok).unwrap();
+        assert_eq!(started.0, last);
+        stop_all(&caller, &[started], img.handler);
+    }
+
+    #[ktest]
+    fn thread_interrupt_refuses() {
+        install_space_switch();
+        let owner = Agent::new_root(2, 0);
+        let (b, img) = spinner_space(&owner);
+        let (a, caller) = holder_of(&b, Rights::ALL);
+        let int = |slot, entry| thread_interrupt(&caller, slot, entry).err();
+        let insert = |cap: Cap| a.cspace.lock().insert(cap).unwrap();
+
+        let started = thread_create(&caller, Target::Slot(0), spin_at(&img), 0, ok).unwrap();
+        let (slot, th) = (started.0, started.1.clone());
+
+        // Entry outside user space is refused before the slot is looked at.
+        assert_eq!(int(slot, 0), Some(SpaceError::Invalid));
+        assert_eq!(int(slot, USER_TOP), Some(SpaceError::Invalid));
+        assert_eq!(int(99, 0), Some(SpaceError::Invalid));
+        // An empty slot.
+        assert_eq!(
+            int(99, img.handler),
+            Some(SpaceError::Cap(CapError::NoSlot))
+        );
+        // A Thread capability without SIGNAL.
+        let weak = Object::Thread(th.downgrade());
+        let no_signal = insert(Cap::new(weak, Rights::SEND));
+        assert_eq!(
+            int(no_signal, img.handler),
+            Some(SpaceError::Cap(CapError::Rights))
+        );
+        // Not a Thread at all, with every right (slot 0 is the Space capability).
+        assert_eq!(int(0, img.handler), Some(SpaceError::WrongType));
+        // A thread that no longer exists.
+        let gone = Thread::new(owner.clone());
+        let dead = insert(Cap::new(Object::Thread(gone.downgrade()), Rights::SIGNAL));
+        drop(gone);
+        assert_eq!(int(dead, img.handler), Some(SpaceError::Dead));
+
+        // None of that disturbed the running thread; stopping it works once, then it is Dead.
+        assert_eq!(b.live_threads(), 1);
+        stop_all(&caller, &[started], img.handler);
+        assert_eq!(int(slot, img.handler), Some(SpaceError::Dead));
+    }
+
+    #[ktest]
+    fn space_credential_matches_owner() {
+        install_space_switch();
+        let owner = Agent::new_root(2, 0);
+        let (b, img) = spinner_space(&owner);
+        assert!(Arc::ptr_eq(b.owner(), &owner));
+
+        // Two creators with different authority both produce threads that run as the owner.
+        let (a1, c1) = holder_of(&b, Rights::ALL);
+        let (a2, c2) = holder_of(&b, Rights::CREATE.union(Rights::SIGNAL));
+        assert_ne!(a1.credential(), owner.credential());
+        assert_ne!(a2.credential(), owner.credential());
+        let t1 = thread_create(&c1, Target::Slot(0), spin_at(&img), 1, ok).unwrap();
+        let t2 = thread_create(&c2, Target::Slot(0), spin_at(&img), 2, ok).unwrap();
+        for (t, a) in [(&t1, &a1), (&t2, &a2)] {
+            assert!(
+                Arc::ptr_eq(t.1.agent(), &owner),
+                "the owner, not the creator"
+            );
+            assert_eq!(t.1.agent().credential(), owner.credential());
+            assert_ne!(t.1.agent().credential(), a.credential());
+        }
+        // The tag is the holder's choice; it is not part of the credential.
+        assert_eq!((t1.1.tag(), t2.1.tag()), (1, 2));
+
+        // A thread of the space that makes another one stays the owner too.
+        let me = Thread::new_tagged(owner.clone(), 5);
+        me.set_process(b.clone());
+        let t3 = thread_create(&me, Target::SelfSpace, spin_at(&img), 0, ok).unwrap();
+        assert!(Arc::ptr_eq(t3.1.agent(), &owner));
+        assert_eq!(t3.1.tag(), 5);
+
+        // Each thread's capability sits in its creator's space, so each creator interrupts its own;
+        // all are interrupted before any is joined (see `stop_all`).
+        for (creator, t) in [(&c1, &t1), (&c2, &t2), (&me, &t3)] {
+            thread_interrupt(creator, t.0, img.handler).unwrap();
+        }
+        for t in [&t1, &t2, &t3] {
+            join_thread(&t.1);
+        }
+    }
 }
