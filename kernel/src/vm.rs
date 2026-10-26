@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Software bit marking a page that is read-only only because it is shared copy-on-write.
-const COW: PageFlags = PageFlags::AVAIL2;
+pub(crate) const COW: PageFlags = PageFlags::AVAIL2;
 
 /// Why `cow_clone` refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

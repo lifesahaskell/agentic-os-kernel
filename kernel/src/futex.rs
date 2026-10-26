@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ostd::{
     mm::{
-        HasPaddr, PAGE_SIZE, UFrame, Vaddr, VmIo, VmSpace, is_in_user_space,
+        HasPaddr, PAGE_SIZE, PageFlags, UFrame, Vaddr, VmIo, VmSpace, is_in_user_space,
         vm_space::VmQueriedItem,
     },
     sync::{SpinLock, WaitQueue},
@@ -111,7 +111,11 @@ fn lookup(space: &VmSpace, t: &Thread, va: Vaddr) -> Result<(UFrame, usize), Fut
         return Err(FutexError::Fault);
     };
     match item {
-        Some(VmQueriedItem::MappedRam { frame, .. }) => Ok(((*frame).clone(), va - page)),
+        // A page with R cleared (`PROT_NONE`) keeps its frame, but ring 3 cannot read it, so a
+        // futex on it is a fault.
+        Some(VmQueriedItem::MappedRam { frame, prop }) if prop.flags.contains(PageFlags::R) => {
+            Ok(((*frame).clone(), va - page))
+        }
         _ => Err(FutexError::Fault),
     }
 }

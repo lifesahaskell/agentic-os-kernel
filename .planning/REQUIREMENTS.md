@@ -116,7 +116,7 @@ recorded measurement. "Test" below names what would show it worked.
 ### Agentic properties (AGNT)
 
 - [ ] **AGNT-01**: A process without an agent credential sees an unmodified POSIX system. Dual-mode run: the suite score for non-agent and for agent-with-full-grant is identical.
-- [ ] **AGNT-02**: Agent budget exhaustion maps to standard errno (`ENOMEM`, `EAGAIN`) and `SIGXCPU`, never a new interface. Test: a memory-budget-exhausted `mmap` returns `ENOMEM`.
+- [x] **AGNT-02**: Agent budget exhaustion maps to standard errno (`ENOMEM`, `EAGAIN`) and `SIGXCPU`, never a new interface. Test: a memory-budget-exhausted `mmap` returns `ENOMEM`.
 - [ ] **AGNT-03**: Server audit records carry the kernel-stamped credential, not a client-supplied one.
 - [ ] **AGNT-04**: A narrow-grant demo: a real BusyBox tool run under a reduced namespace fails with `ENOENT` outside the grant and works inside it.
 - [ ] **AGNT-05**: The server CPU-exemption decision is recorded with a request ledger and a documented limit. The core-value statement does not claim kernel-enforced CPU limits cover server-side work.
@@ -247,7 +247,7 @@ Each v1 requirement maps to exactly one phase. Rule: the phase that builds its p
 | PERF-02 | Phase 4 | Pending |
 | PERF-03 | Phase 6 | Pending |
 | AGNT-01 | Phase 6 | Pending |
-| AGNT-02 | Phase 2 | Pending |
+| AGNT-02 | Phase 2 | Complete |
 | AGNT-03 | Phase 3 | Pending |
 | AGNT-04 | Phase 6 | Pending |
 | AGNT-05 | Phase 2 | Pending |
