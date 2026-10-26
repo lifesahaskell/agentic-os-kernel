@@ -101,7 +101,7 @@ Plans:
 
 **Research:** spike required. `thread_create` from a syscall onto an OSTD `Task`, the scheduler protocol (reverse-engineered from source), idle task versus `pick_next`. Add scheduler-protocol ktests and pin OSTD and the toolchain, since each OSTD upgrade is a deliberate task.
 **Decisions due:** Saved-context stack holds FPU state (revisit only if OSTD cannot). Self-memory calls (`mmap`, `brk`, `mprotect`) are cap-less syscalls on the caller's own space, not routed through procmgr. Scope the kernel calls LIBC-04 needs (set-FS-base, thread create for musl start-up, exit-and-unmap) here so Phase 6 does not reopen the kernel; they are verified under LIBC-04.
-**Plans:** 4/11 plans executed
+**Plans:** 6/11 plans executed
 
 Plans:
 **Wave 1**
@@ -113,8 +113,8 @@ Plans:
 - [x] 02-04-PLAN.md — Space and Thread capabilities, thread_create and thread_interrupt from ring 3 (W2)
 
 **Wave 3** *(blocked on Wave 2 completion)*
-- [ ] 02-05-PLAN.md — Exit and fault notes to the space endpoint naming tid and tag (W3)
-- [ ] 02-11-PLAN.md — Free-frame probe crates, A1 spike and settle protocol (D-06) (W3, parallel with 02-05)
+- [x] 02-05-PLAN.md — Exit and fault notes to the space endpoint naming tid and tag (W3)
+- [x] 02-11-PLAN.md — Free-frame probe crates, A1 spike and settle protocol (D-06) (W3, parallel with 02-05)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 - [ ] 02-06-PLAN.md — Teardown model sign-off (OD-04/07/08 checkpoint), process teardown and kill, 10,000x fork+exit loop, fallible cow_clone with node-frame charges (W4)
@@ -219,7 +219,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7.
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Userland, syscall ABI and IPC v2 | 8/8 | Complete    | 2026-10-26 |
-| 2. Process objects, teardown and timers | 4/11 | In Progress | - |
+| 2. Process objects, teardown and timers | 6/11 | In Progress | - |
 | 3. Bootstrap, server runtime and vfs | 0/0 | Not started | - |
 | 4. exec and procmgr | 0/0 | Not started | - |
 | 5. Signals, sessions and tty | 0/0 | Not started | - |
