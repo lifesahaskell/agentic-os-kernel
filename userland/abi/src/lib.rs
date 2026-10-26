@@ -24,6 +24,12 @@ pub const SYS_THREAD_CREATE: usize = 0x104;
 /// `thread_interrupt(thread, entry)`: redirects the thread named by a Thread capability with
 /// SIGNAL to `entry`, aborting a blocking IPC with `EINTR`. `ESRCH` once the thread has exited.
 pub const SYS_THREAD_INTERRUPT: usize = 0x105;
+/// `space_notify(space, ep)`: makes the Endpoint in slot `ep` (needs SEND) the one the kernel sends
+/// exit and fault notes to for the threads of `space`, a slot holding a Space capability with
+/// SIGNAL, or `SPACE_SELF` for the caller's own. A holder may replace the endpoint at any time;
+/// a thread naming its own space may set it only once (`EPERM` when one is already set), so a
+/// thread cannot redirect the notes its parent arranged (OD-18).
+pub const SYS_SPACE_NOTIFY: usize = 0x107;
 
 /// `thread_create`'s `space` argument for "the caller's own space". No slot can hold this value:
 /// slots are below `CSpace::MAX_SLOTS`.

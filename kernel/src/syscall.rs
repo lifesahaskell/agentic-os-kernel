@@ -87,6 +87,7 @@ impl From<SpaceError> for Errno {
         match e {
             SpaceError::Cap(c) => c.into(),
             SpaceError::WrongType | SpaceError::Invalid => Errno::EINVAL,
+            SpaceError::Denied => Errno::EPERM,
             SpaceError::Dead => Errno::ESRCH,
             SpaceError::Limit => Errno::EAGAIN,
             SpaceError::NoRoom => Errno::EMFILE,
