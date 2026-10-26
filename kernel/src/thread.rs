@@ -439,10 +439,25 @@ impl Thread {
         } = *f;
         *ctx = saved;
         self.set_fs_base(fs_base);
+        #[cfg(ktest)]
+        let corrupt = CORRUPT_FRAME.load(Ordering::Relaxed);
+        #[cfg(ktest)]
+        if corrupt == 1 {
+            let regs = ctx.general_regs_mut();
+            regs.rbx = regs.rbx.wrapping_add(1);
+        }
         let mut owner = FPU_OWNER.lock();
-        *self.fpu.lock() = fpu;
-        if owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, &self.fpu)) {
-            *owner = None;
+        #[cfg(ktest)]
+        let skip_fpu = corrupt == 2;
+        #[cfg(not(ktest))]
+        let skip_fpu = false;
+        // Skipping the restore also leaves the owner slot alone, so the handler's registers stay
+        // live: that is the failure the control exists to show.
+        if !skip_fpu {
+            *self.fpu.lock() = fpu;
+            if owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, &self.fpu)) {
+                *owner = None;
+            }
         }
     }
 
