@@ -74,6 +74,57 @@ pub struct Space {
     counted: bool,
 }
 
+/// Spaces that exist: raised by `build`, lowered when one is dropped.
+static LIVE_SPACES: AtomicUsize = AtomicUsize::new(0);
+
+/// Spaces dropped since boot. A loop that builds and frees one per turn advances it by exactly
+/// its iteration count.
+static DROPPED_SPACES: AtomicUsize = AtomicUsize::new(0);
+
+/// Spaces that exist now, for the leak checks.
+pub(crate) fn live_spaces() -> usize {
+    LIVE_SPACES.load(Ordering::Acquire)
+}
+
+/// Spaces dropped since boot, for the leak checks.
+pub(crate) fn dropped_spaces() -> usize {
+    DROPPED_SPACES.load(Ordering::Acquire)
+}
+
+/// Every counter the leak checks compare across a loop (D-03). The kernel's own object counts are
+/// the primary check; the frame probe covers what they cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counts {
+    pub live_threads: usize,
+    pub live_spaces: usize,
+    pub dropped_spaces: usize,
+    pub live_agents: usize,
+    /// Keys in the futex wait table.
+    pub futex_keys: usize,
+    /// Deadline waiters registered.
+    pub deadlines: usize,
+    pub armed_timers: usize,
+    /// Reply waits, parked and in flight.
+    pub reply_waits: usize,
+    /// 1 while the FPU owner slot holds a context. A single slot, so bounded, not compared.
+    pub fpu_owner: usize,
+}
+
+/// Reads every counter in `Counts`.
+pub fn counts() -> Counts {
+    Counts {
+        live_threads: crate::thread::live_threads(),
+        live_spaces: live_spaces(),
+        dropped_spaces: dropped_spaces(),
+        live_agents: crate::agent::live_agents(),
+        futex_keys: crate::futex::table_len(),
+        deadlines: crate::thread::deadline_count(),
+        armed_timers: crate::ipc::timer::armed_count(),
+        reply_waits: crate::ipc::live_reply_waits(),
+        fpu_owner: crate::thread::fpu_owner_count(),
+    }
+}
+
 impl Space {
     /// The one constructor. `counted` says the owner's `enter_space` succeeded for this space;
     /// `dying` is set for a space born after its owner began to retire, so `register` refuses it.
@@ -85,6 +136,7 @@ impl Space {
         counted: bool,
         dying: bool,
     ) -> Arc<Space> {
+        LIVE_SPACES.fetch_add(1, Ordering::AcqRel);
         Arc::new(Space {
             vm,
             owner,
@@ -257,11 +309,12 @@ impl Space {
     }
 
     /// The work of teardown. The caller won the `torn` swap, so it runs once. In order: take the
-    /// notify capability (nothing is sent after the process is gone), unmap what the space owns,
-    /// refund what it charged. A space that does not own its `vm` unmaps nothing and refunds
+    /// notify capability (nothing is sent after the process is gone), drop the timers armed from
+    /// this space (OD-04), unmap what the space owns, refund what it charged. A space that does not own its `vm` unmaps nothing and refunds
     /// nothing: the pages it charged are still mapped, by the caller.
     fn teardown(&self) {
         drop(self.notify.lock().take());
+        crate::ipc::timer::drop_space(&self.vm);
         if self.owns_vm {
             let guard = disable_preempt();
             // `unmap` flushes and dispatches the TLB itself, and frees the frames once no CPU can
@@ -389,6 +442,8 @@ impl Drop for Space {
         if !self.torn.swap(true, Ordering::AcqRel) {
             self.teardown();
         }
+        LIVE_SPACES.fetch_sub(1, Ordering::AcqRel);
+        DROPPED_SPACES.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -1485,32 +1540,15 @@ mod test {
         let holder = Thread::new(a.clone());
         let parent = sibling_parent(PageFlags::RW);
         let (used, room) = (a.mem_used_pages(), a.cspace.lock().room());
+        let f = footprint();
+        for i in 0..WARMUP {
+            teardown_turn(&a, &holder, &parent, i);
+        }
+        let (before_counts, before) = (counts(), crate::probe::settled());
 
         let t0 = Jiffies::elapsed().as_u64();
         for i in 0..ITERATIONS {
-            let child = cow_space(&parent, &a);
-            let weak = Arc::downgrade(&child);
-            let slot = a
-                .cspace
-                .lock()
-                .insert(Cap::new(Object::Space(child), Rights::CREATE))
-                .unwrap();
-            // arg 1: store into the test page, which is copy-on-write in the child, then exit 8.
-            let start = ThreadStart {
-                arg: 1,
-                ..spin_at(&parent)
-            };
-            let (tslot, th) = thread_create(&holder, Target::Slot(slot), start, 0, ok).unwrap();
-            assert_eq!(join_thread(&th), Exit::Code(8), "iteration {i}");
-            a.cspace.lock().remove(tslot).unwrap();
-            a.cspace.lock().remove(slot).unwrap();
-            drop(th);
-            let mut yields = 0;
-            while weak.strong_count() > 0 {
-                yields += 1;
-                assert!(yields < 1000, "iteration {i}: the space never dropped");
-                Task::yield_now();
-            }
+            teardown_turn(&a, &holder, &parent, i);
         }
         let t1 = Jiffies::elapsed().as_u64();
         println!(
@@ -1521,6 +1559,36 @@ mod test {
 
         assert_eq!(a.mem_used_pages(), used, "the loop leaked budget");
         assert_eq!(a.cspace.lock().room(), room, "the loop leaked capabilities");
+        assert_counts_flat("teardown", before_counts, ITERATIONS);
+        assert_probe_flat("teardown", before, crate::probe::settled(), f);
+    }
+
+    /// One turn of the same-agent loop: a clone of `parent` under `a` that stores to its
+    /// copy-on-write page, exits, and is dropped.
+    fn teardown_turn(a: &Arc<Agent>, holder: &Thread, parent: &Image, i: usize) {
+        let child = cow_space(parent, a);
+        let weak = Arc::downgrade(&child);
+        let slot = a
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Space(child), Rights::CREATE))
+            .unwrap();
+        // arg 1: store into the test page, which is copy-on-write in the child, then exit 8.
+        let start = ThreadStart {
+            arg: 1,
+            ..spin_at(parent)
+        };
+        let (tslot, th) = thread_create(holder, Target::Slot(slot), start, 0, ok).unwrap();
+        assert_eq!(join_thread(&th), Exit::Code(8), "iteration {i}");
+        a.cspace.lock().remove(tslot).unwrap();
+        a.cspace.lock().remove(slot).unwrap();
+        drop(th);
+        let mut yields = 0;
+        while weak.strong_count() > 0 {
+            yields += 1;
+            assert!(yields < 1000, "iteration {i}: the space never dropped");
+            Task::yield_now();
+        }
     }
 
     #[ktest]
@@ -2108,12 +2176,186 @@ mod test {
         }
     }
 
+    /// Turns each loop runs before its first probe read, so the heap and slab caches are at steady
+    /// state.
+    const WARMUP: usize = 100;
+
+    /// One process footprint F in bytes (D-03, D-06): the probe after a live process exists,
+    /// subtracted from the probe before it. It covers page-table nodes, the stack, the kernel stack
+    /// and the slab bytes of the Thread, Space and Agent objects. The process is killed and
+    /// everything dropped before it returns.
+    ///
+    /// F is the tolerance of the loop gates: a leak of one page per iteration is `ITERATIONS`
+    /// pages, far above one footprint, while a one-off allocation stays below it.
+    fn footprint() -> usize {
+        let w = child_loop();
+        for i in 0..10 {
+            child_agent_turn(&w, i);
+        }
+        // A futex waiter, not a spinner: the ktest scheduler does not preempt, and the probe's
+        // settle rounds yield, so a process that never blocks would take the CPU for good.
+        let parent = load_image(user_image!("futex_waiter")).unwrap();
+        let word: UFrame = FrameAllocOptions::new().alloc_frame().unwrap().into();
+        word.write_val(0, &0x11u32).unwrap();
+        map_test_page(&parent.space, word, PageFlags::RW);
+        let b = crate::probe::settled();
+
+        let c = w.a.spawn_child(&[], 16, 2).unwrap();
+        let space = cow_space(&parent, &c);
+        let (weak_c, weak_s) = (Arc::downgrade(&c), Arc::downgrade(&space));
+        let th = start_in(&space, &c, 0, spin_at(&parent));
+        // Blocked in the futex: the process has run, and holds the cloned page-table nodes, its
+        // stack, the copy it made of the test page, a kernel stack, and the three objects.
+        let mut spins = 0usize;
+        while !th.is_blocked() {
+            spins += 1;
+            assert!(spins < 1_000_000, "the footprint thread never blocked");
+            Task::yield_now();
+        }
+        let m = crate::probe::settled();
+        let f = b.saturating_sub(m);
+        println!("frame_probe: footprint={}", f);
+        assert!(
+            f >= PAGE_SIZE,
+            "a live process moved the probe by {} bytes: the probe is blind",
+            f
+        );
+
+        space.kill();
+        assert_eq!(join_thread(&th), Exit::Killed);
+        wait_reaped(&space);
+        drop((th, space, c));
+        let mut yields = 0;
+        while weak_c.strong_count() > 0 || weak_s.strong_count() > 0 {
+            yields += 1;
+            assert!(yields < 1000, "the footprint process never dropped");
+            Task::yield_now();
+        }
+        f
+    }
+
+    /// The one-sided probe gate (D-03): a probe low after the loop by more than `bound` is a leak.
+    /// A probe higher after the loop passes.
+    fn assert_probe_flat(name: &str, before: usize, after: usize, bound: usize) {
+        let drop = before.saturating_sub(after);
+        println!(
+            "frame_probe: loop={} before={} after={} drop={} bound={}",
+            name, before, after, drop, bound
+        );
+        assert!(
+            drop <= bound,
+            "{}: the probe fell by {} bytes (before {}, after {}), more than one process footprint {}",
+            name,
+            drop,
+            before,
+            after,
+            bound
+        );
+    }
+
+    /// Whether every counter but the two a loop moves on purpose is as it was.
+    fn counts_flat(before: &Counts, now: &Counts) -> bool {
+        let blank = |c: &Counts| Counts {
+            dropped_spaces: 0,
+            fpu_owner: 0,
+            ..*c
+        };
+        blank(before) == blank(now)
+    }
+
+    /// The counter gate (D-03, primary): after at most 1,000 yields for settling, every counter is
+    /// as before the loop, except `dropped_spaces`, which advanced by exactly `iterations` (one
+    /// space built and freed per turn), and `fpu_owner`, a single slot bounded by 1.
+    fn assert_counts_flat(name: &str, before: Counts, iterations: usize) {
+        let mut now = counts();
+        let mut yields = 0;
+        while !counts_flat(&before, &now) {
+            yields += 1;
+            assert!(
+                yields < 1000,
+                "{}: the counters never settled: before {:?}, now {:?}",
+                name,
+                before,
+                now
+            );
+            Task::yield_now();
+            now = counts();
+        }
+        assert_eq!(
+            now.dropped_spaces,
+            before.dropped_spaces + iterations,
+            "{}: the loop did not build and free one space per turn",
+            name
+        );
+        assert!(
+            before.fpu_owner <= 1 && now.fpu_owner <= 1,
+            "{}: the FPU owner slot holds more than one context",
+            name
+        );
+    }
+
+    #[ktest]
+    fn counts_drop_the_space_armed_timers() {
+        install_space_switch();
+        let owner = Agent::new_root(1, 0);
+        let (space, img, _page) = owned_spinner(&owner);
+        let ep = Endpoint::new();
+        let th = start_in(&space, &owner, 0, spin_at(&img));
+        // A timer remembers the space its arming thread runs in, which the thread takes on its
+        // first run. The ktest scheduler never preempts, so the spinner must not be given the CPU
+        // before it is killed: name the space now instead of waiting for the run.
+        th.set_space(space.vm().clone());
+
+        let armed = crate::ipc::timer::armed_count();
+        let delay = crate::ipc::timer::MAX_DELAY_MS.min(60_000);
+        for cookie in 0..2 {
+            crate::ipc::timer::arm(&th, ep.clone(), delay, cookie).unwrap();
+        }
+        assert_eq!(crate::ipc::timer::armed_count(), armed + 2);
+
+        space.kill();
+        assert_eq!(join_thread(&th), Exit::Killed);
+        wait_reaped(&space);
+        assert_eq!(
+            crate::ipc::timer::armed_count(),
+            armed,
+            "the process's timers died with it"
+        );
+        let t0 = Jiffies::elapsed().as_u64();
+        while Jiffies::elapsed().as_u64() - t0 < 20 {
+            Task::yield_now();
+        }
+        assert_eq!(ep.queued(), 0, "a dead process's timer fired");
+    }
+
+    #[ktest]
+    fn frame_probe_one_process_returns_to_baseline() {
+        let w = child_loop();
+        for i in 0..WARMUP {
+            child_agent_turn(&w, i);
+        }
+        let b = crate::probe::settled();
+        let f = footprint();
+        let a = crate::probe::settled();
+        println!("frame_probe: residual={}", b as isize - a as isize);
+        assert_eq!(
+            a, b,
+            "one process came and went and the probe did not return to its baseline (footprint {})",
+            f
+        );
+    }
+
     #[ktest]
     fn retire_loop_child_agent_10000x() {
         let w = child_loop();
         let (used, carved) = (w.a.mem_used_pages(), w.a.cpu_carved_ticks());
         let (live, refs) = (w.a.cspace.lock().live(), Arc::strong_count(&w.ep));
         let agents = crate::agent::live_agents();
+        let f = footprint();
+        for i in 0..WARMUP {
+            child_agent_turn(&w, i);
+        }
+        let (before_counts, before) = (counts(), crate::probe::settled());
 
         let t0 = Jiffies::elapsed().as_u64();
         for i in 0..ITERATIONS {
@@ -2139,5 +2381,7 @@ mod test {
             agents,
             "the loop leaked agents"
         );
+        assert_counts_flat("retire", before_counts, ITERATIONS);
+        assert_probe_flat("retire", before, crate::probe::settled(), f);
     }
 }

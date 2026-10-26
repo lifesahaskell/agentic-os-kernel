@@ -116,6 +116,11 @@ fn lookup(space: &VmSpace, t: &Thread, va: Vaddr) -> Result<(UFrame, usize), Fut
     }
 }
 
+/// Keys in the wait table, for the leak checks: a bucket lives only while it has a waiter.
+pub(crate) fn table_len() -> usize {
+    TABLE.lock().len()
+}
+
 fn pop(tab: &mut BTreeMap<usize, Bucket>, key: usize, n: usize) -> Vec<Arc<Waiter>> {
     let Some(b) = tab.get_mut(&key) else {
         return Vec::new();

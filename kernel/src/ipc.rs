@@ -12,7 +12,7 @@ use core::{
     fmt,
     mem::offset_of,
     ops::Deref,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 use abi::{IpcArgs, LABEL_CANCEL, LABEL_KERNEL_BASE, MAX_IPC_CAPS};
@@ -124,6 +124,15 @@ pub struct Answer {
     pub caps: Vec<(usize, Rights)>,
 }
 
+/// Reply waits that exist, parked in a reply table or in flight: raised by `ReplyWait::new`,
+/// lowered when one is dropped.
+static LIVE_REPLY_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+/// Reply waits that exist now, for the leak checks.
+pub(crate) fn live_reply_waits() -> usize {
+    LIVE_REPLY_WAITS.load(Ordering::Acquire)
+}
+
 /// The rendezvous between a `call`er blocked for its answer and the server that replies.
 pub struct ReplyWait {
     state: SpinLock<ReplyState>,
@@ -131,8 +140,15 @@ pub struct ReplyWait {
     wq: WaitQueue,
 }
 
+impl Drop for ReplyWait {
+    fn drop(&mut self) {
+        LIVE_REPLY_WAITS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl ReplyWait {
     fn new(caller: Weak<Thread>) -> Arc<Self> {
+        LIVE_REPLY_WAITS.fetch_add(1, Ordering::AcqRel);
         Arc::new(Self {
             state: SpinLock::new(ReplyState::Queued),
             caller,
@@ -1070,7 +1086,7 @@ mod test {
             (D + 1..=D + 3).contains(&elapsed),
             "parked elapsed {elapsed}"
         );
-        assert_eq!(crate::thread::pending_deadlines(), 0);
+        assert_eq!(crate::thread::deadline_count(), 0);
     }
 
     #[ktest]
@@ -1083,12 +1099,12 @@ mod test {
         sys_send(&client, 0, [5, 0, 0, 0]).unwrap();
         let m = ep.recv_until(&server, far()).unwrap();
         assert_eq!(m.words[0], 5);
-        assert_eq!(crate::thread::pending_deadlines(), 0);
+        assert_eq!(crate::thread::deadline_count(), 0);
 
         sys_send(&client, 0, [6, 0, 0, 0]).unwrap();
         let (m, handle) = ep.recv_parked_until(&server, far()).unwrap();
         assert_eq!((m.words[0], handle), (6, 0));
-        assert_eq!(crate::thread::pending_deadlines(), 0);
+        assert_eq!(crate::thread::deadline_count(), 0);
 
         // Sent while the receiver is blocked, well inside the deadline.
         let result: Arc<SpinLock<Option<Result<Message, IpcError>>>> =
@@ -1103,7 +1119,7 @@ mod test {
             Task::yield_now();
         }
         assert_eq!(result.lock().take().unwrap().unwrap().words[0], 7);
-        assert_eq!(crate::thread::pending_deadlines(), 0);
+        assert_eq!(crate::thread::deadline_count(), 0);
     }
 
     #[ktest]
