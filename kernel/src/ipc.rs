@@ -1244,6 +1244,7 @@ mod test {
             handler: img.handler,
             text: img.text.clone(),
             pages: img.pages,
+            brk_base: img.brk_base,
         };
         let seen: Arc<SpinLock<Vec<(Credential, u64, u64)>>> = Arc::new(SpinLock::new(Vec::new()));
         let (server, seen2) = (Thread::new(server_agent), seen.clone());
@@ -1350,6 +1351,7 @@ mod test {
             handler: parent.handler,
             text: parent.text.clone(),
             pages: parent.pages,
+            brk_base: parent.brk_base,
         };
         let server_img = load_image(user_image!("bulk_srv")).unwrap();
         let (client, server) = (Thread::new(client_agent), Thread::new(server_agent));

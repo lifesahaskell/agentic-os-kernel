@@ -9,10 +9,11 @@ use alloc::boxed::Box;
 use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
-    IpcArgs, MAP_ANONYMOUS, MAP_SHARED, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SPACE_SELF, SYS_CALL,
-    SYS_EXIT, SYS_FUTEX, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV,
-    SYS_SCHED_YIELD, SYS_SIGRETURN, SYS_SPACE_NOTIFY, SYS_THREAD_CREATE, SYS_THREAD_INTERRUPT,
-    SYS_TIMER_ARM, THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP, errno,
+    IpcArgs, MAP_ANONYMOUS, MAP_SHARED, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SPACE_SELF, SYS_BRK,
+    SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_RECV, SYS_REPLY,
+    SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_SIGRETURN, SYS_SPACE_NOTIFY, SYS_THREAD_CREATE,
+    SYS_THREAD_INTERRUPT, SYS_TIMER_ARM, THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP,
+    errno,
 };
 use ostd::{
     mm::{PAGE_SIZE, VmSpace},
@@ -305,6 +306,10 @@ pub enum Syscall {
         addr: usize,
         len: usize,
     },
+    /// The raw `brk`: `addr` 0 asks for the current break.
+    Brk {
+        addr: usize,
+    },
 }
 
 const FUTEX_WAIT: usize = 0;
@@ -415,6 +420,7 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
                 prot: a[2],
             }
         }
+        SYS_BRK => Syscall::Brk { addr: a[0] },
         SYS_MUNMAP => {
             if !a[0].is_multiple_of(PAGE_SIZE) || a[1] == 0 {
                 return Err(Errno::EINVAL);
@@ -647,6 +653,9 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
             Some(p) => p.munmap(addr, len).map(|_| 0),
             None => Err(Errno::ENOMEM),
         }),
+        // A break is never negative, and a failure is the old break, not an errno: musl's wrapper
+        // turns "the break did not move" into ENOMEM itself.
+        Syscall::Brk { addr } => Outcome::Return(t.process().map_or(0, |p| p.brk(addr)) as isize),
     }
 }
 
@@ -993,7 +1002,7 @@ mod test {
         }
     }
 
-    const KNOWN: [isize; 12] = [
+    const KNOWN: [isize; 14] = [
         errno::EPERM,
         errno::ESRCH,
         errno::EINTR,
@@ -1006,6 +1015,8 @@ mod test {
         errno::ENOSYS,
         errno::EMSGSIZE,
         errno::ETIMEDOUT,
+        errno::ENODEV,
+        errno::ENOTSUP,
     ];
 
     #[ktest]
@@ -1049,7 +1060,8 @@ mod test {
 
         // Each decode and copy error path once, with its exact errno.
         let z = [0usize; 6];
-        let targeted: [(usize, [usize; 6], isize); 25] = [
+        let anon = abi::MAP_PRIVATE | MAP_ANONYMOUS;
+        let targeted: [(usize, [usize; 6], isize); 33] = [
             (0xFFFF, z, errno::ENOSYS),
             (SYS_FUTEX, [mapped, 99, 0, 0, 0, 0], errno::ENOSYS),
             // The timeout pointer is address 1, which is unmapped.
@@ -1119,6 +1131,28 @@ mod test {
             (SYS_SPACE_NOTIFY, [0, 1, 0, 0, 0, 0], errno::EPERM),
             // No redirect has been applied to this thread, so its frame stack is empty.
             (SYS_SIGRETURN, z, errno::EINVAL),
+            // The self-memory calls: each decode refusal, and the process-less thread.
+            (SYS_MMAP, [0, 0, 3, anon, usize::MAX, 0], errno::EINVAL),
+            (SYS_MMAP, [0, 4096, 8, anon, usize::MAX, 0], errno::EINVAL),
+            (
+                SYS_MMAP,
+                [0, 4096, 3, abi::MAP_PRIVATE, usize::MAX, 0],
+                errno::ENODEV,
+            ),
+            (
+                SYS_MMAP,
+                [0, 4096, 3, MAP_SHARED | MAP_ANONYMOUS, usize::MAX, 0],
+                errno::ENOTSUP,
+            ),
+            (
+                SYS_MMAP,
+                [0x1001, 4096, 3, anon | abi::MAP_FIXED, usize::MAX, 0],
+                errno::EINVAL,
+            ),
+            (SYS_MUNMAP, [0x1001, 4096, 0, 0, 0, 0], errno::EINVAL),
+            (SYS_MPROTECT, [0x1000, 4096, 8, 0, 0, 0], errno::EINVAL),
+            // Valid, but this thread has no process to map into.
+            (SYS_MMAP, [0, 4096, 3, anon, usize::MAX, 0], errno::ENOMEM),
         ];
         for (i, (nr, a, want)) in targeted.into_iter().enumerate() {
             assert_eq!(
@@ -1163,6 +1197,10 @@ mod test {
             SYS_THREAD_INTERRUPT,
             SYS_SPACE_NOTIFY,
             SYS_SIGRETURN,
+            SYS_MMAP,
+            SYS_MPROTECT,
+            SYS_MUNMAP,
+            SYS_BRK,
         ];
         let (mut enosys, mut efault, mut einval, mut ebadf, mut eintr) = (0, 0, 0, 0, 0);
         for i in 0..ITERATIONS {

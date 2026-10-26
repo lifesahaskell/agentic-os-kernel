@@ -8,14 +8,16 @@
 //!
 //! Mode 2: `mprotect`, `munmap`, `PROT_NONE` and `MAP_FIXED` in nine steps. Exits 0, or the number
 //! of the first step whose result was wrong.
+//!
+//! Mode 3: `brk` in four steps. Exits 0, or the number of the first step whose result was wrong.
 
 #![no_std]
 #![no_main]
 #![deny(unsafe_code)]
 
 use abi::{
-    FUTEX_WAIT, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MMAP_TOP, PROT_NONE, PROT_READ, PROT_WRITE,
-    SYS_FUTEX, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, errno,
+    BRK_MAX, FUTEX_WAIT, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MMAP_TOP, PROT_NONE, PROT_READ,
+    PROT_WRITE, SYS_BRK, SYS_FUTEX, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, errno,
 };
 use libsys::raw::syscall6;
 
@@ -110,10 +112,33 @@ fn protect_and_unmap() -> u64 {
     0
 }
 
+fn brk(addr: usize) -> usize {
+    syscall6(SYS_BRK, [addr, 0, 0, 0, 0, 0]) as usize
+}
+
+/// The four steps of mode 3. Returns the first failing step number, or 0.
+fn brk_steps() -> u64 {
+    let b0 = brk(0);
+    if b0 == 0 || b0 % PAGE != 0 {
+        return 1;
+    }
+    if brk(b0 + 2 * PAGE) != b0 + 2 * PAGE || probe(b0) != -errno::EAGAIN {
+        return 2;
+    }
+    if brk(b0) != b0 || probe(b0) != -errno::EFAULT {
+        return 3;
+    }
+    if brk(b0 + BRK_MAX + PAGE) != b0 {
+        return 4;
+    }
+    0
+}
+
 fn main(mode: u64) -> u64 {
     match mode {
         1 => map_pages(),
         2 => protect_and_unmap(),
+        3 => brk_steps(),
         _ => 98,
     }
 }

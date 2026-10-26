@@ -191,14 +191,9 @@ impl Space {
             owner.uncharge_pages(img.pages);
             return Err(e);
         }
-        Ok(Space::build(
-            img.space.clone(),
-            owner,
-            img.pages,
-            true,
-            true,
-            false,
-        ))
+        let space = Space::build(img.space.clone(), owner, img.pages, true, true, false);
+        space.set_brk_base(img.brk_base);
+        Ok(space)
     }
 
     /// A space over a copy-on-write clone of `parent` in `range`, owned by `owner`. The clone's
@@ -2204,7 +2199,7 @@ mod test {
     ///
     /// F is the tolerance of the loop gates: a leak of one page per iteration is `ITERATIONS`
     /// pages, far above one footprint, while a one-off allocation stays below it.
-    fn footprint() -> usize {
+    pub(super) fn footprint() -> usize {
         let w = child_loop();
         for i in 0..10 {
             child_agent_turn(&w, i);
@@ -2253,7 +2248,7 @@ mod test {
 
     /// The one-sided probe gate (D-03): a probe low after the loop by more than `bound` is a leak.
     /// A probe higher after the loop passes.
-    fn assert_probe_flat(name: &str, before: usize, after: usize, bound: usize) {
+    pub(super) fn assert_probe_flat(name: &str, before: usize, after: usize, bound: usize) {
         let drop = before.saturating_sub(after);
         println!(
             "frame_probe: loop={} before={} after={} drop={} bound={}",

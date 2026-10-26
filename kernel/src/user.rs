@@ -50,6 +50,8 @@ pub struct Image {
     /// Frames `load_image` allocated: the segments and the stack. What `Space::from_image`
     /// charges.
     pub pages: usize,
+    /// Where the program break starts: the first page after the loaded segments.
+    pub brk_base: Vaddr,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -123,6 +125,7 @@ pub fn load_image(bytes: &[u8]) -> Result<Image, LoadError> {
         handler,
         text,
         pages: (image_end - IMAGE_BASE) / PAGE_SIZE + USER_STACK_PAGES,
+        brk_base: image_end,
     })
 }
 
@@ -167,13 +170,15 @@ fn entry_ctx(img: &Image, arg: u64) -> UserContext {
 /// Runs `img` on `thread` from its entry point with `arg` in `rdi` and the stack at the top of
 /// the mapped stack region.
 pub fn start(thread: &Thread, img: &Image, arg: u64) -> Exit {
-    start_ctx(thread, &img.space, entry_ctx(img, arg))
+    start_ctx(thread, img, entry_ctx(img, arg))
 }
 
-/// Runs `ctx` on `thread` in a new process that wraps `vm` and is owned by the thread's agent. The
-/// caller keeps `vm` and its memory, so the process does not unmap it at teardown (`adopt`).
-fn start_ctx(thread: &Thread, vm: &Arc<VmSpace>, ctx: UserContext) -> Exit {
-    let space = Space::adopt(vm.clone(), thread.agent().clone());
+/// Runs `ctx` on `thread` in a new process that wraps `img`'s vm and is owned by the thread's
+/// agent. The caller keeps the vm and its memory, so the process does not unmap it at teardown
+/// (`adopt`). The program break starts at the image's.
+fn start_ctx(thread: &Thread, img: &Image, ctx: UserContext) -> Exit {
+    let space = Space::adopt(img.space.clone(), thread.agent().clone());
+    space.set_brk_base(img.brk_base);
     run_registered(thread, &space, ctx)
 }
 
@@ -572,7 +577,7 @@ mod test {
         ctx.set_rip(img.entry);
         ctx.set_rsp(sp);
         ctx.set_rdi(0);
-        start_ctx(thread, &img.space, ctx)
+        start_ctx(thread, img, ctx)
     }
 
     /// CR-01: `_start` aligns `rsp` and `call`s, and the call's return-address push is an 8-byte

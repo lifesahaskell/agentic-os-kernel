@@ -460,6 +460,14 @@ impl Space {
         Ok(())
     }
 
+    /// Sets where the program break starts. Not built yet.
+    pub fn set_brk_base(&self, _va: Vaddr) {}
+
+    /// `brk(want)`: the raw Linux call. Not built yet.
+    pub fn brk(&self, _want: Vaddr) -> Vaddr {
+        0
+    }
+
     /// The protection the record covering `addr` last got, if one does.
     pub fn prot_at(&self, addr: Vaddr) -> Option<usize> {
         let mm = self.mm.lock();
@@ -475,7 +483,7 @@ impl Space {
 
 #[cfg(ktest)]
 mod test {
-    use abi::{MAP_ANONYMOUS, MAP_PRIVATE, USER_STACK_TOP, errno};
+    use abi::{BRK_MAX, MAP_ANONYMOUS, MAP_PRIVATE, USER_STACK_TOP, errno};
     use alloc::sync::Arc;
     use ostd::{
         mm::{VmWriter, io::util::HasVmReaderWriter, vm_space::VmQueriedItem},
@@ -738,5 +746,116 @@ mod test {
         assert_eq!(run_ring3(&a, &s, &img, 2), Exit::Code(0));
         wait_reaped(&s);
         assert_eq!(a.mem_used_pages(), 0);
+    }
+
+    #[ktest]
+    fn vmem_brk_grows_shrinks_and_fails_softly() {
+        let (a, s, img) = world("brk", 4);
+        let b0 = img.brk_base;
+        assert_ne!(b0, 0);
+        assert!(b0.is_multiple_of(PAGE_SIZE));
+        let used = a.mem_used_pages();
+        assert_eq!(s.brk(0), b0);
+        assert_eq!(s.brk(b0 + 3 * PAGE_SIZE + 5), b0 + 3 * PAGE_SIZE + 5);
+        assert_eq!(a.mem_used_pages(), used + 4);
+        assert_eq!(s.brk(b0), b0);
+        assert_eq!(a.mem_used_pages(), used);
+        assert_eq!(s.brk(b0 + BRK_MAX + PAGE_SIZE), b0, "past BRK_MAX");
+        assert_eq!(s.brk(b0 - PAGE_SIZE), b0, "below the base");
+        // The budget holds four more pages: take them, then one more is refused.
+        assert_eq!(s.brk(b0 + 4 * PAGE_SIZE), b0 + 4 * PAGE_SIZE);
+        assert_eq!(a.mem_used_pages(), used + 4);
+        assert_eq!(s.brk(b0 + 5 * PAGE_SIZE), b0 + 4 * PAGE_SIZE);
+        assert_eq!(a.mem_used_pages(), used + 4, "a refusal charges nothing");
+        assert_eq!(s.charged(), used + 4);
+    }
+
+    #[ktest]
+    fn vmem_brk_refuses_an_occupied_range() {
+        let (a, s, img) = world("brk-busy", 4);
+        let b0 = img.brk_base;
+        let used = a.mem_used_pages();
+        assert_eq!(
+            s.mmap(b0 + PAGE_SIZE, PAGE_SIZE, RW, FIXED_ANON, 0),
+            Ok(b0 + PAGE_SIZE)
+        );
+        assert_eq!(s.brk(b0 + 2 * PAGE_SIZE), b0);
+        assert_eq!(a.mem_used_pages(), used + 1, "only the mapping is charged");
+    }
+
+    #[ktest]
+    fn vmem_brk_without_an_image_is_zero() {
+        install_space_switch();
+        let a = Agent::new_root(7, 4);
+        let s = Space::new(Arc::new(VmSpace::new()), a.clone());
+        assert_eq!(s.brk(0), 0);
+        assert_eq!(s.brk(0x50_0000), 0);
+        assert_eq!(a.mem_used_pages(), 0);
+    }
+
+    #[ktest]
+    fn vmem_ring3_brk() {
+        let (a, s, img) = world("ring3-brk", 4);
+        assert_eq!(run_ring3(&a, &s, &img, 3), Exit::Code(0));
+        wait_reaped(&s);
+        assert_eq!(a.mem_used_pages(), 0);
+    }
+
+    #[ktest]
+    fn vmem_map_count_limit_is_enomem() {
+        let (_a, s, _img) = world("limit", 2);
+        // One record that a split could grow, then single-page reservations up to the limit.
+        let wide = s.mmap(0, 3 * PAGE_SIZE, NONE, ANON, 0).unwrap();
+        for i in 1..MAX_MAPS_PER_SPACE {
+            assert!(s.mmap(0, PAGE_SIZE, NONE, ANON, 0).is_ok(), "map {i}");
+        }
+        assert_eq!(s.map_count(), MAX_MAPS_PER_SPACE);
+        assert_eq!(s.mmap(0, PAGE_SIZE, NONE, ANON, 0), Err(Errno::ENOMEM));
+        assert_eq!(s.map_count(), MAX_MAPS_PER_SPACE);
+        // The middle page would split the record in two.
+        assert_eq!(s.munmap(wide + PAGE_SIZE, PAGE_SIZE), Err(Errno::ENOMEM));
+        assert_eq!(s.map_count(), MAX_MAPS_PER_SPACE);
+        // The same goes for mprotect, which splits a record the same way.
+        assert_eq!(
+            s.mprotect(wide + PAGE_SIZE, PAGE_SIZE, PROT_READ),
+            Err(Errno::ENOMEM)
+        );
+        // A trim from one end splits nothing.
+        assert_eq!(s.munmap(wide, PAGE_SIZE), Ok(0));
+        assert_eq!(s.map_count(), MAX_MAPS_PER_SPACE);
+        // A whole record goes, and one slot opens.
+        assert_eq!(s.munmap(wide + PAGE_SIZE, 2 * PAGE_SIZE), Ok(0));
+        assert_eq!(s.map_count(), MAX_MAPS_PER_SPACE - 1);
+        assert!(s.mmap(0, PAGE_SIZE, NONE, ANON, 0).is_ok());
+    }
+
+    #[ktest]
+    fn vmem_mmap_munmap_loop_keeps_pages_flat() {
+        use crate::space::{
+            counts,
+            test::{assert_probe_flat, footprint},
+        };
+
+        const WARM: usize = 100;
+        const TURNS: usize = 1000;
+        let (a, s, _img) = world("loop", 6);
+        let f = footprint();
+        let turn = || {
+            let at = s.mmap(0, 4 * PAGE_SIZE, RW, ANON, 0).unwrap();
+            assert_eq!(s.munmap(at, 4 * PAGE_SIZE), Ok(4));
+        };
+        for _ in 0..WARM {
+            turn();
+        }
+        let (used, maps, tally) = (a.mem_used_pages(), s.map_count(), counts());
+        let before = crate::probe::settled();
+        for _ in 0..TURNS {
+            turn();
+        }
+        assert_eq!(a.mem_used_pages(), used, "the loop leaked budget");
+        assert_eq!(s.charged(), used, "the loop leaked ledger pages");
+        assert_eq!(s.map_count(), maps, "the loop leaked records");
+        assert_eq!(counts(), tally, "the loop moved a kernel object count");
+        assert_probe_flat("vmem_mmap_munmap", before, crate::probe::settled(), f);
     }
 }
