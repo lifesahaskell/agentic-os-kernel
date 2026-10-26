@@ -31,6 +31,35 @@ impl From<CapError> for AgentError {
     }
 }
 
+/// Something that pays for memory in pages: an agent, a space that records what it charged so
+/// teardown can return it, or a private tally. The two halves are inverses.
+pub trait Payer {
+    /// Charges `pages`, or fails without charging.
+    fn charge_pages(&self, pages: usize) -> Result<(), AgentError>;
+    /// Returns `pages` previously charged.
+    fn uncharge_pages(&self, pages: usize);
+}
+
+impl Payer for Agent {
+    fn charge_pages(&self, pages: usize) -> Result<(), AgentError> {
+        Agent::charge_pages(self, pages)
+    }
+
+    fn uncharge_pages(&self, pages: usize) {
+        Agent::uncharge_pages(self, pages);
+    }
+}
+
+impl<T: Payer + ?Sized> Payer for Arc<T> {
+    fn charge_pages(&self, pages: usize) -> Result<(), AgentError> {
+        (**self).charge_pages(pages)
+    }
+
+    fn uncharge_pages(&self, pages: usize) {
+        (**self).uncharge_pages(pages);
+    }
+}
+
 /// CPU budgets are timer ticks per period of this many ticks (10 ms at OSTD's 1000 Hz timer).
 pub const CPU_PERIOD_TICKS: u64 = 10;
 
@@ -108,6 +137,18 @@ impl Agent {
             })
             .map(drop)
             .map_err(|_| AgentError::Budget)
+    }
+
+    /// Returns `pages` to the memory budget, the inverse of `charge_pages`. Saturates at 0; a
+    /// refund larger than the charge is a bug in the caller and trips a debug assertion.
+    pub fn uncharge_pages(&self, pages: usize) {
+        let before = self
+            .mem_used_pages
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(pages))
+            })
+            .unwrap_or_default();
+        debug_assert!(before >= pages, "uncharge_pages underflow");
     }
 
     /// Whether this agent's threads may run in the period containing tick `now`.

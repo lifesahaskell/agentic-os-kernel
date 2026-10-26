@@ -13,22 +13,37 @@ use alloc::{
     vec::Vec,
 };
 
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use ostd::{
     mm::{PAGE_SIZE, VmSpace},
     sync::SpinLock,
+    task::disable_preempt,
 };
 
 use crate::{
-    agent::Agent,
+    agent::{Agent, AgentError, Payer},
     cap::{Cap, CapError, Object, Rights},
     ipc::Endpoint,
     thread::Thread,
-    user::{self, Exit},
+    user::{self, Exit, Image},
 };
 
 /// Most live threads one space holds. The 65th `thread_create` is refused (`Limit`).
 pub const MAX_THREADS_PER_SPACE: usize = 64;
 
+/// A process: an address space, the agent that owns it, and its threads.
+///
+/// Teardown (D-01, process level): when the last thread is reaped, the space unmaps the memory it
+/// owns, drops the notify capability, and uncharges every page it charged to its owner. The
+/// `Space` itself stays as a tombstone until its last capability drops (OD-14): `dying` is set and
+/// `register` answers `Dead`.
+///
+/// Known gap (D-07): data frames a cow-cloned child still shares stay charged to the parent, not
+/// to the child. They are uncharged at the parent's teardown even while the child maps them, so
+/// the error is an under-charge, never a leak. The child pays for its page-table node frames at
+/// clone time and for every copy it makes on a write fault; nothing charges a shared data frame
+/// twice.
 pub struct Space {
     vm: Arc<VmSpace>,
     owner: Arc<Agent>,
@@ -38,16 +53,44 @@ pub struct Space {
     /// Where exit and fault notes for this space's threads go: an Endpoint capability, kept as the
     /// capability and not the endpoint it names, so revoking it stops delivery (OD-06, OD-17).
     notify: SpinLock<Option<Cap>>,
+    /// Pages charged to `owner` through this space (see `impl Payer`), refunded at teardown.
+    charged_pages: AtomicUsize,
+    /// Set once, by whoever wins the swap and tears the space down. Never cleared.
+    dying: AtomicBool,
+    /// Whether teardown unmaps `vm`. False when the caller keeps the memory (`adopt`).
+    owns_vm: bool,
 }
 
 impl Space {
-    pub fn new(vm: Arc<VmSpace>, owner: Arc<Agent>) -> Arc<Space> {
+    fn build(vm: Arc<VmSpace>, owner: Arc<Agent>, charged: usize, owns_vm: bool) -> Arc<Space> {
         Arc::new(Space {
             vm,
             owner,
             threads: SpinLock::new(Vec::new()),
             notify: SpinLock::new(None),
+            charged_pages: AtomicUsize::new(charged),
+            dying: AtomicBool::new(false),
+            owns_vm,
         })
+    }
+
+    /// A space that owns `vm`: teardown unmaps it. Charges nothing, so the ledger starts empty.
+    pub fn new(vm: Arc<VmSpace>, owner: Arc<Agent>) -> Arc<Space> {
+        Space::build(vm, owner, 0, true)
+    }
+
+    /// A space over memory the caller keeps: teardown unmaps nothing and refunds nothing. A
+    /// copy-on-write copy made while it runs is charged through the ledger and stays charged,
+    /// because the frame stays mapped in the caller's `vm` after the process is gone.
+    pub fn adopt(vm: Arc<VmSpace>, owner: Arc<Agent>) -> Arc<Space> {
+        Space::build(vm, owner, 0, false)
+    }
+
+    /// A space over a loaded image: charges the image's frames (`img.pages`: segments and stack)
+    /// to `owner`, records them in the ledger, and owns the vm. `Budget` charges nothing.
+    pub fn from_image(img: &Image, owner: Arc<Agent>) -> Result<Arc<Space>, AgentError> {
+        owner.charge_pages(img.pages)?;
+        Ok(Space::build(img.space.clone(), owner, img.pages, true))
     }
 
     pub fn vm(&self) -> &Arc<VmSpace> {
@@ -59,10 +102,25 @@ impl Space {
         &self.owner
     }
 
+    /// True once teardown has begun. Never goes back.
+    pub fn is_dying(&self) -> bool {
+        self.dying.load(Ordering::Acquire)
+    }
+
+    /// Pages currently recorded in the ledger.
+    pub fn charged(&self) -> usize {
+        self.charged_pages.load(Ordering::Acquire)
+    }
+
     /// Adds `th` to the space. Entries of threads that no longer exist are dropped first;
-    /// `Limit` when `MAX_THREADS_PER_SPACE` threads are still registered.
+    /// `Dead` once the space is dying, `Limit` when `MAX_THREADS_PER_SPACE` threads are still
+    /// registered. The dying check and the insert share the lock `reap` takes to decide on
+    /// teardown, so a thread cannot join a space that is being emptied.
     pub fn register(&self, th: &Thread) -> Result<(), SpaceError> {
         let mut threads = self.threads.lock();
+        if self.is_dying() {
+            return Err(SpaceError::Dead);
+        }
         threads.retain(|(_, w)| w.strong_count() > 0);
         if threads.len() >= MAX_THREADS_PER_SPACE {
             return Err(SpaceError::Limit);
@@ -71,9 +129,48 @@ impl Space {
         Ok(())
     }
 
-    /// Removes thread `tid` from the space.
-    pub fn reap(&self, tid: u64) {
+    /// Takes back a registration that never ran. Does not tear the space down.
+    pub fn unregister(&self, tid: u64) {
         self.threads.lock().retain(|(t, _)| *t != tid);
+    }
+
+    /// Removes thread `tid` from the space; when that leaves no live thread, tears the space down.
+    pub fn reap(&self, tid: u64) {
+        let last = {
+            let mut threads = self.threads.lock();
+            threads.retain(|(t, _)| *t != tid);
+            let empty = !threads.iter().any(|(_, w)| w.strong_count() > 0);
+            // Set under the lock `register` takes, so no registration slips in after the decision.
+            empty && !self.dying.swap(true, Ordering::AcqRel)
+        };
+        if last {
+            self.teardown();
+        }
+    }
+
+    /// The work of teardown. The caller won the `dying` swap, so it runs once. In order: take the
+    /// notify capability (nothing is sent after the process is gone), unmap what the space owns,
+    /// refund what it charged. A space that does not own its `vm` unmaps nothing and refunds
+    /// nothing: the pages it charged are still mapped, by the caller.
+    fn teardown(&self) {
+        drop(self.notify.lock().take());
+        if self.owns_vm {
+            let guard = disable_preempt();
+            // `unmap` flushes and dispatches the TLB itself, and frees the frames once no CPU can
+            // still hold a stale translation.
+            let cursor = self.vm.cursor_mut(&guard, &(0..USER_TOP));
+            // OSTD refusing the whole user range would leave the pages mapped and charged, a
+            // leak; the ktests assert the range is mapped away, so it fails there, loudly.
+            debug_assert!(
+                cursor.is_ok(),
+                "teardown: cursor over the user range refused"
+            );
+            if let Ok(mut c) = cursor {
+                c.unmap(USER_TOP);
+            }
+            let pages = self.charged_pages.swap(0, Ordering::AcqRel);
+            self.owner.uncharge_pages(pages);
+        }
     }
 
     /// Sets the notify capability, replacing any earlier one. `cap` is stored as given; whether
@@ -108,7 +205,7 @@ impl Space {
     /// endpoint resolves. The result is ignored: the exit has happened either way.
     ///
     /// Called after `set_exit` and before `reap`, so the note leaves while the space still counts
-    /// the thread. `NOTE_KIND_KILLED` has no `Exit` variant yet (plan 02-06).
+    /// the thread.
     pub fn note_exit(&self, th: &Thread, exit: Exit) {
         let Some(ep) = self.notify_ep() else {
             return;
@@ -129,6 +226,37 @@ impl Space {
             .iter()
             .filter(|(_, w)| w.strong_count() > 0)
             .count()
+    }
+}
+
+impl Payer for Space {
+    /// Charges the owner, then records the pages in the ledger teardown refunds.
+    fn charge_pages(&self, pages: usize) -> Result<(), AgentError> {
+        self.owner.charge_pages(pages)?;
+        self.charged_pages.fetch_add(pages, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Takes `pages` out of the ledger, then refunds the owner. A refund larger than the ledger
+    /// holds is cut to the ledger, so one space never uncharges the owner for another's pages.
+    fn uncharge_pages(&self, pages: usize) {
+        let taken = self
+            .charged_pages
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                Some(c.saturating_sub(pages))
+            })
+            .map_or(0, |before| before.min(pages));
+        self.owner.uncharge_pages(taken);
+    }
+}
+
+impl Drop for Space {
+    /// A space that never started a thread still frees what it holds when its last reference
+    /// drops. `dying` makes this a no-op after a real teardown.
+    fn drop(&mut self) {
+        if !self.dying.swap(true, Ordering::AcqRel) {
+            self.teardown();
+        }
     }
 }
 
@@ -232,13 +360,13 @@ pub fn thread_create(
     let slot = match caller.agent().cspace.lock().insert(cap) {
         Ok(slot) => slot,
         Err(_) => {
-            space.reap(th.tid());
+            space.unregister(th.tid());
             return Err(SpaceError::NoRoom);
         }
     };
     if let Err(e) = publish(th.tid()) {
         let _ = caller.agent().cspace.lock().remove(slot);
-        space.reap(th.tid());
+        space.unregister(th.tid());
         return Err(e);
     }
     user::spawn_thread(&space, th.clone(), start);
@@ -313,7 +441,8 @@ mod test {
     use ostd::{
         mm::{FrameAllocOptions, PageFlags, VmIo},
         prelude::*,
-        task::{Task, TaskOptions},
+        task::{Task, TaskOptions, disable_preempt},
+        timer::Jiffies,
     };
 
     use super::*;
@@ -322,7 +451,7 @@ mod test {
         sched::install_space_switch,
         user::{
             Image, load_image, map_stack, map_test_page, spawn_thread,
-            testkit::{self, join, join_thread, recv_note, spawn_image},
+            testkit::{self, join, join_thread, recv_note, spawn_image, spawn_image_in},
             user_image,
         },
         vm::cow_clone,
@@ -336,7 +465,7 @@ mod test {
             FrameAllocOptions::new().alloc_frame().unwrap().into(),
             PageFlags::RW,
         );
-        (Space::new(img.space.clone(), owner.clone()), img)
+        (Space::adopt(img.space.clone(), owner.clone()), img)
     }
 
     /// Start at the spinner's entry. Every thread of one space shares the id `arg`, which the
@@ -695,10 +824,17 @@ mod test {
         // observed after all 64 are gone, not after one.
         stop_all(&caller, &started, img.handler);
         assert_eq!(b.live_threads(), 0);
-        let again = thread_create(&caller, Target::Slot(0), spin_at(&img), 0, ok).unwrap();
-        assert_eq!(b.live_threads(), 1);
-        stop_all(&caller, &[again], img.handler);
-        assert_eq!(b.live_threads(), 0);
+        // The last exit tore the process down: its slots are free but it takes no new thread.
+        assert!(b.is_dying());
+        assert_eq!(
+            thread_create(&caller, Target::Slot(0), spin_at(&img), 0, ok).err(),
+            Some(SpaceError::Dead)
+        );
+        assert_eq!(
+            a.cspace.lock().room(),
+            room,
+            "the refused call kept nothing"
+        );
     }
 
     #[ktest]
@@ -1158,7 +1294,176 @@ mod test {
         assert_note_shape(&m, NOTE_EXIT);
         assert_eq!(m.words, [NOTE_KIND_CODE, (-errno::EPERM) as u64, 0, 0]);
         assert_eq!((m.tid, m.tag), (t.tid(), 0x12));
-        assert!(Arc::ptr_eq(&s.notify_ep().unwrap(), &e));
         assert_eq!(join_thread(&t), Exit::Code((-errno::EPERM) as usize));
+        // The note left before the process went away; once the last thread is reaped the
+        // capability set by the first self-call is dropped with it.
+        while s.live_threads() != 0 {
+            Task::yield_now();
+        }
+        assert!(s.is_dying());
+        assert!(s.notify_ep().is_none());
+    }
+
+    /// Whether a page is mapped at `va` in `vm`.
+    fn mapped(vm: &VmSpace, va: usize) -> bool {
+        let guard = disable_preempt();
+        let mut c = vm.cursor(&guard, &(va..va + PAGE_SIZE)).unwrap();
+        c.query().unwrap().1.is_some()
+    }
+
+    /// Waits, yielding, until the last thread of `space` has been reaped. A thread's exit is
+    /// visible a moment before its reap (see `thread_create_limit_is_64`).
+    fn wait_reaped(space: &Space) {
+        let mut spins = 0usize;
+        while space.live_threads() != 0 || !space.is_dying() {
+            spins += 1;
+            assert!(spins < 1_000_000, "the last thread was never reaped");
+            Task::yield_now();
+        }
+    }
+
+    /// Iterations of the fork-and-exit loop. A module constant so a slow run can be shortened in
+    /// one place; the loop prints its wall time (1 jiffy is 1 ms at the 1 kHz tick).
+    const ITERATIONS: usize = 10_000;
+
+    /// A child space over a copy-on-write clone of `parent`'s image range, with a fresh stack.
+    fn cow_space(parent: &Image, owner: &Arc<Agent>) -> Arc<Space> {
+        let vm = Arc::new(cow_clone(&parent.space, IMAGE_BASE..TEST_DATA + PAGE_SIZE));
+        map_stack(&vm).unwrap();
+        Space::new(vm, owner.clone())
+    }
+
+    #[ktest]
+    fn teardown_loop_same_agent_10000x() {
+        install_space_switch();
+        let a = Agent::new_root(1, 64);
+        let holder = Thread::new(a.clone());
+        let parent = sibling_parent(PageFlags::RW);
+        let (used, room) = (a.mem_used_pages(), a.cspace.lock().room());
+
+        let t0 = Jiffies::elapsed().as_u64();
+        for i in 0..ITERATIONS {
+            let child = cow_space(&parent, &a);
+            let weak = Arc::downgrade(&child);
+            let slot = a
+                .cspace
+                .lock()
+                .insert(Cap::new(Object::Space(child), Rights::CREATE))
+                .unwrap();
+            // arg 1: store into the test page, which is copy-on-write in the child, then exit 8.
+            let start = ThreadStart {
+                arg: 1,
+                ..spin_at(&parent)
+            };
+            let (tslot, th) = thread_create(&holder, Target::Slot(slot), start, 0, ok).unwrap();
+            assert_eq!(join_thread(&th), Exit::Code(8), "iteration {i}");
+            a.cspace.lock().remove(tslot).unwrap();
+            a.cspace.lock().remove(slot).unwrap();
+            drop(th);
+            let mut yields = 0;
+            while weak.strong_count() > 0 {
+                yields += 1;
+                assert!(yields < 1000, "iteration {i}: the space never dropped");
+                Task::yield_now();
+            }
+        }
+        let t1 = Jiffies::elapsed().as_u64();
+        println!(
+            "teardown_loop: iterations={} jiffies={}",
+            ITERATIONS,
+            t1 - t0
+        );
+
+        assert_eq!(a.mem_used_pages(), used, "the loop leaked budget");
+        assert_eq!(a.cspace.lock().room(), room, "the loop leaked capabilities");
+    }
+
+    #[ktest]
+    fn teardown_charges_image_and_stack_pages() {
+        install_space_switch();
+        let img = load_image(user_image!("fault_sibling")).unwrap();
+
+        // A budget one page short refuses the image and charges nothing.
+        let small = Agent::new_root(2, img.pages - 1);
+        assert_eq!(
+            Space::from_image(&img, small.clone()).err(),
+            Some(AgentError::Budget)
+        );
+        assert_eq!(small.mem_used_pages(), 0);
+
+        let a = Agent::new_root(1, img.pages + 4);
+        let before = a.mem_used_pages();
+        let space = Space::from_image(&img, a.clone()).unwrap();
+        assert_eq!(a.mem_used_pages(), before + img.pages);
+        assert_eq!(space.charged(), img.pages);
+
+        let exit = spawn_image_in(&Thread::new(a.clone()), &space, &img, 0);
+        assert_eq!(join(&exit), Exit::Code(7));
+        wait_reaped(&space);
+        assert_eq!(a.mem_used_pages(), before, "the exit gave the pages back");
+        assert_eq!(space.charged(), 0);
+    }
+
+    #[ktest]
+    fn teardown_unmaps_owned_space_and_leaves_a_tombstone() {
+        install_space_switch();
+        let img = load_image(user_image!("fault_sibling")).unwrap();
+        let a = Agent::new_root(1, img.pages);
+        let space = Space::from_image(&img, a.clone()).unwrap();
+        let ep = Endpoint::new();
+        space.set_notify_cap(Cap::new(Object::Endpoint(ep.clone()), Rights::SEND));
+        assert!(mapped(space.vm(), IMAGE_BASE));
+        assert!(space.notify_ep().is_some());
+
+        let exit = spawn_image_in(&Thread::new(a.clone()), &space, &img, 0);
+        assert_eq!(join(&exit), Exit::Code(7));
+        wait_reaped(&space);
+
+        assert!(!mapped(space.vm(), IMAGE_BASE), "the image is unmapped");
+        assert!(
+            !mapped(space.vm(), USER_STACK_TOP - PAGE_SIZE),
+            "so is the stack"
+        );
+        assert_eq!(ep.queued(), 1, "the exit note left before the process went");
+        assert!(space.notify_ep().is_none(), "the notify capability is gone");
+
+        // A Space capability still names the tombstone, and it takes no more threads.
+        let (h, holder) = holder_of(&space, Rights::ALL);
+        let room = h.cspace.lock().room();
+        assert_eq!(
+            thread_create(&holder, Target::Slot(0), spin_at(&img), 0, ok).err(),
+            Some(SpaceError::Dead)
+        );
+        assert_eq!(
+            h.cspace.lock().room(),
+            room,
+            "the refused call kept nothing"
+        );
+    }
+
+    #[ktest]
+    fn teardown_keeps_an_adopted_space_mapped() {
+        install_space_switch();
+        let owner = Agent::new_root(1, 4);
+        let parent = sibling_parent(PageFlags::RW);
+        let vm = Arc::new(cow_clone(&parent.space, IMAGE_BASE..TEST_DATA + PAGE_SIZE));
+        map_stack(&vm).unwrap();
+        let child = Image {
+            space: vm,
+            ..parent.clone()
+        };
+        let space = Space::adopt(child.space.clone(), owner.clone());
+
+        // arg 1 stores into the copy-on-write test page: one copy, charged through the space.
+        let exit = spawn_image_in(&Thread::new(owner.clone()), &space, &child, 1);
+        assert_eq!(join(&exit), Exit::Code(8));
+        wait_reaped(&space);
+
+        // The copy is still mapped in the caller's space, so it stays charged.
+        assert_eq!(owner.mem_used_pages(), 1, "the copy stays charged");
+        assert_eq!(space.charged(), 1);
+        for va in [IMAGE_BASE, TEST_DATA, USER_STACK_TOP - PAGE_SIZE] {
+            assert!(mapped(&child.space, va), "the caller still maps {va:#x}");
+        }
     }
 }

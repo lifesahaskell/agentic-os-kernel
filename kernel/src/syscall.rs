@@ -455,7 +455,7 @@ fn thread_create(
         // `ctx` was range-checked for the whole block, so this slice is in range too.
         let dst = UserSlice::new(ctx.addr() + THREAD_CTX_TID_OFFSET, size_of::<u64>())
             .map_err(|_| SpaceError::Fault)?;
-        copy_to_user(space, t.agent(), dst, &tid.to_le_bytes()).map_err(|_| SpaceError::Fault)
+        copy_to_user(space, &*t.payer(), dst, &tid.to_le_bytes()).map_err(|_| SpaceError::Fault)
     };
     let (slot, _thread) = space::thread_create(t, target, start, tag, publish)?;
     Ok(slot)

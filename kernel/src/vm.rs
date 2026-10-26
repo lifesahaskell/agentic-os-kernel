@@ -14,7 +14,7 @@ use ostd::{
 };
 
 use crate::{
-    agent::{Agent, AgentError},
+    agent::{AgentError, Payer},
     syscall::{Errno, UserSlice},
 };
 
@@ -60,12 +60,16 @@ pub fn cow_clone(parent: &VmSpace, range: Range<Vaddr>) -> VmSpace {
 
 /// Resolves a write fault at `addr` if it hit a copy-on-write page. Returns `Ok(false)` for any
 /// other fault (a real SIGSEGV), including an address outside the user half. The copy is charged
-/// to `agent`.
+/// to `payer`.
 ///
 /// `addr` comes straight from a ring-3 fault and can be anything. Once it is below `USER_TOP` and
 /// `cursor_mut` accepted the page, the `query` and `jump` unwraps below cannot fail: the page is
 /// inside the user page table.
-pub fn handle_cow_fault(space: &VmSpace, agent: &Agent, addr: Vaddr) -> Result<bool, AgentError> {
+pub fn handle_cow_fault(
+    space: &VmSpace,
+    payer: &dyn Payer,
+    addr: Vaddr,
+) -> Result<bool, AgentError> {
     // A ring-3 write fault can carry any address, and nothing at or above `USER_TOP` is a page of
     // this space. This also keeps `page + PAGE_SIZE` from overflowing.
     if addr >= abi::USER_TOP {
@@ -101,7 +105,7 @@ pub fn handle_cow_fault(space: &VmSpace, agent: &Agent, addr: Vaddr) -> Result<b
     let new = FrameAllocOptions::new()
         .alloc_frame()
         .map_err(|_| AgentError::NoMemory)?;
-    agent.charge_pages(1)?;
+    payer.charge_pages(1)?;
     new.writer().write(&mut old.reader());
     c.unmap(PAGE_SIZE);
     c.jump(page).unwrap();
@@ -121,12 +125,12 @@ fn decline_kernel_user_faults() {
 }
 
 /// Copies `src` into user memory at `dst` (the active `space`). Writing a copy-on-write page
-/// breaks it on `agent`'s budget and retries, so the kernel never writes into a frame the
+/// breaks it on `payer`'s budget and retries, so the kernel never writes into a frame the
 /// parent still shares. `EFAULT`: unmapped, not writable, or the fault would not resolve.
 /// `ENOMEM`: the budget refused the copy.
 pub fn copy_to_user(
     space: &VmSpace,
-    agent: &Agent,
+    payer: &dyn Payer,
     dst: UserSlice,
     src: &[u8],
 ) -> Result<(), Errno> {
@@ -149,7 +153,7 @@ pub fn copy_to_user(
                     (page, faults) = (at & !(PAGE_SIZE - 1), 0);
                 }
                 faults += 1;
-                if faults > MAX_FAULTS_PER_PAGE || !handle_cow_fault(space, agent, at)? {
+                if faults > MAX_FAULTS_PER_PAGE || !handle_cow_fault(space, payer, at)? {
                     return Err(Errno::EFAULT);
                 }
             }
@@ -187,6 +191,7 @@ mod test {
     };
 
     use super::*;
+    use crate::agent::Agent;
 
     const DATA: Vaddr = 0x50_0000;
 

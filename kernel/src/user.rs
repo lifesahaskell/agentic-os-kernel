@@ -45,6 +45,9 @@ pub struct Image {
     pub entry: Vaddr,
     pub handler: Vaddr,
     pub text: Range<Vaddr>,
+    /// Frames `load_image` allocated: the segments and the stack. What `Space::from_image`
+    /// charges.
+    pub pages: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -117,6 +120,7 @@ pub fn load_image(bytes: &[u8]) -> Result<Image, LoadError> {
         entry,
         handler,
         text,
+        pages: (image_end - IMAGE_BASE) / PAGE_SIZE + USER_STACK_PAGES,
     })
 }
 
@@ -164,9 +168,10 @@ pub fn start(thread: &Thread, img: &Image, arg: u64) -> Exit {
     start_ctx(thread, &img.space, entry_ctx(img, arg))
 }
 
-/// Runs `ctx` on `thread` in a new process that wraps `vm` and is owned by the thread's agent.
+/// Runs `ctx` on `thread` in a new process that wraps `vm` and is owned by the thread's agent. The
+/// caller keeps `vm` and its memory, so the process does not unmap it at teardown (`adopt`).
 fn start_ctx(thread: &Thread, vm: &Arc<VmSpace>, ctx: UserContext) -> Exit {
-    let space = Space::new(vm.clone(), thread.agent().clone());
+    let space = Space::adopt(vm.clone(), thread.agent().clone());
     run_registered(thread, &space, ctx)
 }
 
@@ -318,7 +323,7 @@ fn run_ctx(thread: &Thread, process: &Arc<Space>, ctx: UserContext) -> Exit {
                         CpuException::PageFault(pf)
                             if pf.error_code.contains(PageFaultErrorCode::WRITE) =>
                         {
-                            Some(handle_cow_fault(space, thread.agent(), pf.addr))
+                            Some(handle_cow_fault(space, &**process, pf.addr))
                         }
                         _ => None,
                     };
@@ -634,7 +639,7 @@ mod test {
     fn notify_rig(img: &Image) -> NotifyRig {
         let agent = Agent::new_root(42, 4);
         let ep = Endpoint::new();
-        let space = Space::new(img.space.clone(), agent.clone());
+        let space = Space::adopt(img.space.clone(), agent.clone());
         space.set_notify_cap(Cap::new(Object::Endpoint(ep.clone()), Rights::SEND));
         NotifyRig {
             server: Thread::new(Agent::new_root(99, 0)),
@@ -719,7 +724,7 @@ mod test {
         let (grant, fwd) = Cap::new(Object::Endpoint(ep.clone()), Rights::ALL)
             .grant_revocable(Rights::SEND)
             .unwrap();
-        let space = Space::new(img.space.clone(), agent.clone());
+        let space = Space::adopt(img.space.clone(), agent.clone());
         space.set_notify_cap(grant);
         fwd.revoke();
         assert!(space.notify_ep().is_none());

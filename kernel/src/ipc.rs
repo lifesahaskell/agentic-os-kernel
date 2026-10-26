@@ -627,13 +627,18 @@ fn read_bytes(space: &VmSpace, src: UserSlice) -> Result<Vec<u8>, Errno> {
 }
 
 /// Writes the first `min(data.len(), dst.len())` bytes of `data` to `dst`, breaking
-/// copy-on-write there, charged to `t`'s agent.
+/// copy-on-write there, charged through `t.payer()` (its process's ledger).
 fn write_bytes(t: &Thread, space: &VmSpace, dst: UserSlice, data: &[u8]) -> Result<(), Errno> {
     let n = data.len().min(dst.len());
     if n == 0 {
         return Ok(());
     }
-    copy_to_user(space, t.agent(), UserSlice::new(dst.addr(), n)?, &data[..n])
+    copy_to_user(
+        space,
+        &*t.payer(),
+        UserSlice::new(dst.addr(), n)?,
+        &data[..n],
+    )
 }
 
 /// Writes `bytes` at `offset` in the `IpcArgs` at `args`. Only the fields the call produces are
@@ -646,7 +651,7 @@ fn write_args(
     bytes: &[u8],
 ) -> Result<(), Errno> {
     let dst = UserSlice::new(args.addr() + offset, bytes.len())?;
-    copy_to_user(space, t.agent(), dst, bytes)
+    copy_to_user(space, &*t.payer(), dst, bytes)
 }
 
 // `recv_into` writes `caps..=reply` as one block of 12 quads.
@@ -1092,6 +1097,7 @@ mod test {
             entry: img.entry,
             handler: img.handler,
             text: img.text.clone(),
+            pages: img.pages,
         };
         let seen: Arc<SpinLock<Vec<(Credential, u64, u64)>>> = Arc::new(SpinLock::new(Vec::new()));
         let (server, seen2) = (Thread::new(server_agent), seen.clone());
@@ -1193,6 +1199,7 @@ mod test {
             entry: parent.entry,
             handler: parent.handler,
             text: parent.text.clone(),
+            pages: parent.pages,
         };
         let server_img = load_image(user_image!("bulk_srv")).unwrap();
         let (client, server) = (Thread::new(client_agent), Thread::new(server_agent));

@@ -85,7 +85,7 @@ fn lookup(space: &VmSpace, t: &Thread, va: Vaddr) -> Result<(UFrame, usize), Fut
     if !is_in_user_space(va, 4) {
         return Err(FutexError::Fault);
     }
-    handle_cow_fault(space, t.agent(), va).map_err(|_| FutexError::Budget)?;
+    handle_cow_fault(space, &*t.payer(), va).map_err(|_| FutexError::Budget)?;
     let page = va & !(PAGE_SIZE - 1);
     let guard = disable_preempt();
     let mut c = space.cursor(&guard, &(page..page + PAGE_SIZE)).unwrap();

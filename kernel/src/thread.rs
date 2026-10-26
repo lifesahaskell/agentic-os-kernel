@@ -20,7 +20,12 @@ use ostd::{
     user::UserModeHooks,
 };
 
-use crate::{agent::Agent, ipc::ReplyTable, space::Space, user::Exit};
+use crate::{
+    agent::{Agent, Payer},
+    ipc::ReplyTable,
+    space::Space,
+    user::Exit,
+};
 
 /// Why `Thread::block_until` gave up.
 #[derive(Debug, PartialEq, Eq)]
@@ -178,6 +183,15 @@ impl Thread {
 
     pub fn process(&self) -> Option<Arc<Space>> {
         self.state.lock().process.clone()
+    }
+
+    /// Who pays for a copy-on-write break made on this thread's behalf: its process, whose ledger
+    /// teardown refunds, or its agent when it runs no process.
+    pub fn payer(&self) -> Arc<dyn Payer> {
+        match self.process() {
+            Some(p) => p,
+            None => self.agent().clone(),
+        }
     }
 
     pub fn set_fs_base(&self, base: usize) {
