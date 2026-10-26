@@ -10,8 +10,8 @@ use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
     ARCH_GET_FS, ARCH_SET_FS, IpcArgs, MAP_ANONYMOUS, MAP_SHARED, MAX_IPC_BYTES, MAX_TIMEOUT_MS,
-    SPACE_SELF, SYS_ARCH_PRCTL, SYS_BRK, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_MMAP, SYS_MPROTECT,
-    SYS_MUNMAP, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_SIGRETURN,
+    SPACE_SELF, SYS_ARCH_PRCTL, SYS_BRK, SYS_CALL, SYS_EXIT, SYS_EXIT_UNMAP, SYS_FUTEX, SYS_MMAP,
+    SYS_MPROTECT, SYS_MUNMAP, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_SIGRETURN,
     SYS_SPACE_NOTIFY, SYS_THREAD_CREATE, SYS_THREAD_INTERRUPT, SYS_TIMER_ARM,
     THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP, errno,
 };
@@ -312,6 +312,12 @@ pub enum Syscall {
     },
     /// `arch_prctl` on the caller's own FS base.
     ArchPrctl(FsOp),
+    /// Unmaps `[addr, addr + len)` from the caller's own space, then exits the thread with `code`.
+    ExitUnmap {
+        addr: usize,
+        len: usize,
+        code: u64,
+    },
 }
 
 /// The two `arch_prctl` codes this kernel implements.
@@ -680,6 +686,8 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
             t.set_fs_base(base);
             Outcome::Return(0)
         }
+        // RED stub: not implemented yet.
+        Syscall::ExitUnmap { .. } => Outcome::Return(-Errno::ENOSYS.0),
         Syscall::ArchPrctl(FsOp::GetFs(p)) => {
             let bytes = (t.fs_base() as u64).to_le_bytes();
             ret(UserSlice::new(p.addr(), bytes.len())
@@ -790,6 +798,39 @@ mod test {
         for code in [0x1001, 0x1004, 0, usize::MAX] {
             assert_eq!(call(code, 0), Err(Errno::EINVAL), "code {code:#x}");
         }
+    }
+
+    #[ktest]
+    fn decode_exit_unmap() {
+        let call = |addr: usize, len: usize| decode(SYS_EXIT_UNMAP, [addr, len, 9, 0, 0, 0]);
+        assert_eq!(
+            call(0x1_0000_0000, 4096),
+            Ok(Syscall::ExitUnmap {
+                addr: 0x1_0000_0000,
+                len: 4096,
+                code: 9
+            })
+        );
+        // The length is not rounded in the variant; the unmap rounds it.
+        assert_eq!(
+            call(0x1000, 1),
+            Ok(Syscall::ExitUnmap {
+                addr: 0x1000,
+                len: 1,
+                code: 9
+            })
+        );
+        // The last page of user space is a legal range.
+        assert!(call(USER_TOP - PAGE_SIZE, PAGE_SIZE).is_ok());
+        assert_eq!(call(0x1_0000_0001, 4096), Err(Errno::EINVAL));
+        assert_eq!(call(0x1_0000_0000, 0), Err(Errno::EINVAL));
+        assert_eq!(
+            call(USER_TOP - PAGE_SIZE, PAGE_SIZE + 1),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(call(USER_TOP, PAGE_SIZE), Err(Errno::EINVAL));
+        assert_eq!(call(0x1000, usize::MAX), Err(Errno::EINVAL));
+        assert_eq!(call(KERNEL_HALF, PAGE_SIZE), Err(Errno::EINVAL));
     }
 
     #[ktest]

@@ -2412,4 +2412,55 @@ mod test {
         assert_eq!(join(&e1), Exit::Code(0));
         assert_eq!(join(&e2), Exit::Code(0));
     }
+
+    /// A world for the `lifecycle` bin: a space over its image with `extra` pages of budget beyond
+    /// the image's, and the owner.
+    fn lifecycle_world(extra: usize) -> (Arc<Agent>, Arc<Space>, Image) {
+        install_space_switch();
+        let img = load_image(user_image!("lifecycle")).unwrap();
+        let a = Agent::new_root(1, img.pages + extra);
+        let space = Space::from_image(&img, a.clone()).unwrap();
+        (a, space, img)
+    }
+
+    /// Runs the `lifecycle` bin in `space` with `mode`; returns how its first thread exited.
+    fn run_lifecycle(a: &Arc<Agent>, space: &Arc<Space>, img: &Image, mode: u64) -> Exit {
+        let exit = spawn_image_in(&Thread::new(a.clone()), space, img, mode);
+        let code = join(&exit);
+        wait_reaped(space);
+        code
+    }
+
+    #[ktest]
+    fn lifecycle_exit_unmap_frees_the_stack() {
+        let (a, space, img) = lifecycle_world(4);
+        // Code 0 is reached only after the bin's second 4-page mmap fits the budget, which it does
+        // only when the child's exit_unmap refunded the first four.
+        assert_eq!(run_lifecycle(&a, &space, &img, 2), Exit::Code(0));
+        assert_eq!(a.mem_used_pages(), 0, "teardown returned everything");
+    }
+
+    #[ktest]
+    fn lifecycle_exit_unmap_rejects_bad_ranges() {
+        let (a, space, img) = lifecycle_world(4);
+        assert_eq!(run_lifecycle(&a, &space, &img, 3), Exit::Code(0));
+        assert_eq!(a.mem_used_pages(), 0);
+    }
+
+    #[ktest]
+    fn lifecycle_exit_unmap_without_a_process_just_exits() {
+        use crate::syscall::{Outcome, Syscall, dispatch};
+        let (a, space, img) = lifecycle_world(4);
+        let used = a.mem_used_pages();
+        // A thread that never registered has no process: there is nothing to unmap, and it exits.
+        let t = Thread::new(a.clone());
+        let call = Syscall::ExitUnmap {
+            addr: 0x1_0000_0000,
+            len: PAGE_SIZE,
+            code: 9,
+        };
+        assert_eq!(dispatch(&t, &img.space, call), Outcome::Exit(9));
+        assert_eq!(a.mem_used_pages(), used);
+        assert_eq!(space.charged(), img.pages);
+    }
 }
