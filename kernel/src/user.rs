@@ -4,8 +4,8 @@
 use core::ops::Range;
 
 use abi::{
-    IMAGE_BASE, IMAGE_HEADER_LEN, IMAGE_MAGIC, MAX_IMAGE_SIZE, TEST_DATA, USER_STACK_PAGES,
-    USER_STACK_TOP,
+    IMAGE_BASE, IMAGE_HEADER_LEN, IMAGE_MAGIC, MAX_IMAGE_SIZE, NOTE_FAULT, TEST_DATA,
+    USER_STACK_PAGES, USER_STACK_TOP,
 };
 use alloc::sync::Arc;
 
@@ -20,10 +20,10 @@ use ostd::{
 };
 
 use crate::{
-    cap::{Object, Rights},
+    ipc::IpcError,
     space::{Space, ThreadStart},
     syscall::{self, Outcome},
-    thread::{ExcReply, Thread},
+    thread::Thread,
     vm::handle_cow_fault,
 };
 
@@ -251,12 +251,11 @@ fn vector(exc: &CpuException) -> u64 {
     }
 }
 
-/// Sends the fault to the thread's handler endpoint as `[vector, fault address, rip, page-fault
-/// error code]` (kernel-stamped credential) and waits for the verdict. `None`: carry on, the
-/// handler resumed the thread or redirected it (the caller applies the redirect). `Some`: the
-/// fault is fatal, either by the handler's verdict or because no handler could take it.
-// shortcut: `cap::Object` has no thread type, so the message does not name the faulting thread
-// and the handler replies through an `Arc<Thread>`; procmgr needs `Object::Thread` first.
+/// Calls the thread's space's notify endpoint with a `NOTE_FAULT` note, `[vector, fault address,
+/// rip, page-fault error code]`, stamped with the thread's credential, tid and tag, and waits for
+/// the reply: the verdict. `None`: carry on, the verdict was zero (resume) or the thread was
+/// interrupted (the caller applies the redirect). `Some`: the fault is fatal, by a non-zero
+/// verdict or because no endpoint could take the note (OD-06).
 fn deliver(thread: &Thread, exc: CpuException, rip: usize) -> Option<Exit> {
     let vector = vector(&exc);
     let (addr, err) = match exc {
@@ -269,22 +268,17 @@ fn deliver(thread: &Thread, exc: CpuException, rip: usize) -> Option<Exit> {
             _ => Exit::Exception(vector),
         })
     };
-    let Some(Object::Endpoint(ep)) = thread
-        .exception_handler()
-        .and_then(|cap| cap.resolve(Rights::SEND).ok())
-    else {
+    let Some(ep) = thread.process().and_then(|p| p.notify_ep()) else {
         return fatal();
     };
-    thread.clear_exception_reply();
-    if ep
-        .send(thread, [vector, addr as u64, rip as u64, err as u64])
-        .is_err()
-    {
-        return fatal();
-    }
-    match thread.wait_exception_reply() {
-        Ok(ExcReply::Resume) | Err(_) => None,
-        Ok(ExcReply::Kill) => fatal(),
+    let words = [vector, addr as u64, rip as u64, err as u64];
+    match ep.call_note(thread, NOTE_FAULT, words) {
+        Ok(verdict) if verdict[0] == 0 => None,
+        Ok(_) => fatal(),
+        // The thread was interrupted: the note is withdrawn or already answered, and the caller
+        // applies the redirect.
+        Err(IpcError::Interrupted) => None,
+        Err(_) => fatal(),
     }
 }
 
@@ -448,7 +442,7 @@ mod test {
     use super::*;
     use crate::{
         agent::Agent,
-        cap::Cap,
+        cap::{Cap, Object, Rights},
         futex,
         ipc::{Endpoint, Message, sys_recv},
         user::testkit::{join, recv_note, spawn_image, spawn_image_in, wait_blocked},

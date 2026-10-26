@@ -20,7 +20,7 @@ use ostd::{
     user::UserModeHooks,
 };
 
-use crate::{agent::Agent, cap::Cap, ipc::ReplyTable, space::Space, user::Exit};
+use crate::{agent::Agent, ipc::ReplyTable, space::Space, user::Exit};
 
 /// Why `Thread::block_until` gave up.
 #[derive(Debug, PartialEq, Eq)]
@@ -69,16 +69,6 @@ pub(crate) type FailHook = Arc<dyn Fn(&Thread) + Send + Sync>;
 pub(crate) static FAILPOINT: SpinLock<Option<(u8, FailHook)>, LocalIrqDisabled> =
     SpinLock::new(None);
 
-/// A handler's verdict on a faulted thread. A redirect needs no variant: the handler calls
-/// `Thread::interrupt`, which aborts the wait.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExcReply {
-    /// Re-execute the faulting instruction.
-    Resume,
-    /// The fault is fatal to the thread.
-    Kill,
-}
-
 struct State {
     /// Where to resume user code, set by `interrupt`, consumed by `take_redirect`.
     redirect: Option<Vaddr>,
@@ -89,8 +79,6 @@ struct State {
     /// The process this thread runs in. `space` is its `vm`, kept separately so the scheduler hook
     /// and the futex code never see the process.
     process: Option<Arc<Space>>,
-    /// The handler's answer to the exception message this thread is waiting on.
-    exc_reply: Option<ExcReply>,
 }
 
 type SharedFpu = Arc<SpinLock<FpuContext, LocalIrqDisabled>>;
@@ -128,10 +116,6 @@ pub struct Thread {
     exited: SpinLock<Option<Exit>, LocalIrqDisabled>,
     // IRQ-safe: a timer callback may interrupt the thread.
     state: SpinLock<State, LocalIrqDisabled>,
-    /// Where this thread's user exceptions are sent. Kept as the capability, not the endpoint,
-    /// so revoking the grant takes effect at the next fault.
-    exc_handler: SpinLock<Option<Cap>>,
-    exc_wq: WaitQueue,
 }
 
 impl Thread {
@@ -157,10 +141,7 @@ impl Thread {
                 blocked: None,
                 space: None,
                 process: None,
-                exc_reply: None,
             }),
-            exc_handler: SpinLock::new(None),
-            exc_wq: WaitQueue::new(),
         })
     }
 
@@ -219,29 +200,6 @@ impl Thread {
 
     pub fn exit_status(&self) -> Option<Exit> {
         *self.exited.lock()
-    }
-
-    pub fn set_exception_handler(&self, cap: Cap) {
-        *self.exc_handler.lock() = Some(cap);
-    }
-
-    pub fn exception_handler(&self) -> Option<Cap> {
-        self.exc_handler.lock().clone()
-    }
-
-    pub fn clear_exception_reply(&self) {
-        self.state.lock().exc_reply = None;
-    }
-
-    /// Called by the exception handler to answer the thread's fault message.
-    pub fn reply_exception(&self, r: ExcReply) {
-        self.state.lock().exc_reply = Some(r);
-        self.exc_wq.wake_all();
-    }
-
-    /// Blocks until the handler replies; `Interrupted` means the handler redirected the thread.
-    pub fn wait_exception_reply(&self) -> Result<ExcReply, BlockError> {
-        self.block_until(&self.exc_wq, || self.state.lock().exc_reply.take(), None)
     }
 
     pub fn space(&self) -> Option<Arc<VmSpace>> {
