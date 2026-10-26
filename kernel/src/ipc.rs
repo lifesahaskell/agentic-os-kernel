@@ -1153,7 +1153,14 @@ mod test {
         );
         let img = load_image(user_image!("sibling")).unwrap();
         let clone_of = |img: &Image| Image {
-            space: Arc::new(cow_clone(&img.space, abi::IMAGE_BASE..abi::USER_STACK_TOP)),
+            space: Arc::new(
+                cow_clone(
+                    &img.space,
+                    abi::IMAGE_BASE..abi::USER_STACK_TOP,
+                    &*Agent::new_root(1, 64),
+                )
+                .expect("cow_clone"),
+            ),
             entry: img.entry,
             handler: img.handler,
             text: img.text.clone(),
@@ -1252,10 +1259,14 @@ mod test {
             .unwrap();
         let parent = load_image(user_image!("bulk")).unwrap();
         let child = Image {
-            space: Arc::new(cow_clone(
-                &parent.space,
-                abi::IMAGE_BASE..abi::USER_STACK_TOP,
-            )),
+            space: Arc::new(
+                cow_clone(
+                    &parent.space,
+                    abi::IMAGE_BASE..abi::USER_STACK_TOP,
+                    &*Agent::new_root(1, 64),
+                )
+                .expect("cow_clone"),
+            ),
             entry: parent.entry,
             handler: parent.handler,
             text: parent.text.clone(),

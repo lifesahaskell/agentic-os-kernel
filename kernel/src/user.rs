@@ -488,7 +488,14 @@ mod test {
     /// clone a fresh stack, so the only pages the child can copy are the ones it writes in the
     /// cloned range.
     fn cow_child(parent: &Image) -> Image {
-        let child = Arc::new(cow_clone(&parent.space, abi::IMAGE_BASE..DATA + PAGE_SIZE));
+        let child = Arc::new(
+            cow_clone(
+                &parent.space,
+                abi::IMAGE_BASE..DATA + PAGE_SIZE,
+                &*Agent::new_root(1, 64),
+            )
+            .expect("cow_clone"),
+        );
         map_stack(&child).unwrap();
         Image {
             space: child,
@@ -783,7 +790,12 @@ mod test {
         let agent = Agent::new_root(1, 4);
         let img = new_image(user_image!("futex_waiter"), PageFlags::RW);
         // The clone keeps the frame shared, so the waiter's next touch of it must copy.
-        let _clone = cow_clone(&img.space, abi::IMAGE_BASE..DATA + PAGE_SIZE);
+        let _clone = cow_clone(
+            &img.space,
+            abi::IMAGE_BASE..DATA + PAGE_SIZE,
+            &*Agent::new_root(1, 64),
+        )
+        .expect("cow_clone");
         let (waiter, waker) = (Thread::new(agent.clone()), Thread::new(agent));
 
         let we = spawn_image(&waiter, &img, 0);

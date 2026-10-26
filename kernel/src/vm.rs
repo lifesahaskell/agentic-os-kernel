@@ -21,10 +21,27 @@ use crate::{
 /// Software bit marking a page that is read-only only because it is shared copy-on-write.
 const COW: PageFlags = PageFlags::AVAIL2;
 
+/// Why `cow_clone` refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneError {
+    /// A range that is not page-aligned, is empty or inverted, or reaches above `abi::USER_TOP`.
+    Range,
+    /// A huge page or an MMIO mapping at this address.
+    Unsupported(Vaddr),
+    /// A refused node charge.
+    Budget,
+}
+
 /// Clones the mappings of `parent` in `range` into a new space. Writable pages become read-only
 /// and copy-on-write in both spaces; nothing is copied until a write faults.
 // shortcut: 4 KiB pages only (asserted); huge pages need splitting before protect.
-pub fn cow_clone(parent: &VmSpace, range: Range<Vaddr>) -> VmSpace {
+pub fn cow_clone(
+    parent: &VmSpace,
+    range: Range<Vaddr>,
+    payer: &dyn Payer,
+) -> Result<VmSpace, CloneError> {
+    // RED stub: the fallible walk is the GREEN step.
+    let _ = payer;
     let child = VmSpace::new();
     let guard = disable_preempt();
     let mut pc = parent.cursor_mut(&guard, &range).unwrap();
@@ -55,7 +72,7 @@ pub fn cow_clone(parent: &VmSpace, range: Range<Vaddr>) -> VmSpace {
     pc.flusher().issue_tlb_flush(TlbFlushOp::for_range(range));
     pc.flusher().dispatch_tlb_flush();
     drop((pc, cc));
-    child
+    Ok(child)
 }
 
 /// Resolves a write fault at `addr` if it hit a copy-on-write page. Returns `Ok(false)` for any
@@ -186,6 +203,7 @@ mod test {
     use alloc::sync::Arc;
 
     use ostd::{
+        io::IoMem,
         mm::{CachePolicy, PageProperty, VmIo},
         prelude::*,
     };
@@ -214,6 +232,23 @@ mod test {
         Arc::new(space)
     }
 
+    /// One page filled with `fill` at each address in `at`, each mapped through its own cursor.
+    fn space_with_at(at: &[Vaddr], fill: u8, flags: PageFlags) -> Arc<VmSpace> {
+        let space = VmSpace::new();
+        let guard = disable_preempt();
+        for &va in at {
+            let mut c = space.cursor_mut(&guard, &(va..va + PAGE_SIZE)).unwrap();
+            let f = FrameAllocOptions::new().alloc_frame().unwrap();
+            f.write_bytes(0, &[fill; PAGE_SIZE]).unwrap();
+            c.map(
+                f.into(),
+                PageProperty::new_user(flags, CachePolicy::Writeback),
+            );
+        }
+        drop(guard);
+        Arc::new(space)
+    }
+
     fn byte(space: &Arc<VmSpace>, at: Vaddr) -> u8 {
         space.activate();
         let mut b = [0u8; 1];
@@ -225,7 +260,10 @@ mod test {
     fn first_kernel_write_after_cow_clone_breaks_cow() {
         let agent = Agent::new_root(1, 4);
         let parent = space_with(1, 0xAA, PageFlags::RW);
-        let child = Arc::new(cow_clone(&parent, DATA..DATA + PAGE_SIZE));
+        let child = Arc::new(
+            cow_clone(&parent, DATA..DATA + PAGE_SIZE, &*Agent::new_root(1, 64))
+                .expect("cow_clone"),
+        );
         child.activate();
         let dst = UserSlice::new(DATA, 64).unwrap();
         copy_to_user(&child, &agent, dst, &[0x55; 64]).unwrap();
@@ -240,7 +278,14 @@ mod test {
     fn copy_to_user_spanning_two_cow_pages_breaks_both() {
         let agent = Agent::new_root(1, 4);
         let parent = space_with(2, 0xAA, PageFlags::RW);
-        let child = Arc::new(cow_clone(&parent, DATA..DATA + 2 * PAGE_SIZE));
+        let child = Arc::new(
+            cow_clone(
+                &parent,
+                DATA..DATA + 2 * PAGE_SIZE,
+                &*Agent::new_root(1, 64),
+            )
+            .expect("cow_clone"),
+        );
         child.activate();
         let dst = UserSlice::new(DATA + PAGE_SIZE - 32, 64).unwrap();
         copy_to_user(&child, &agent, dst, &[0x55; 64]).unwrap();
@@ -278,7 +323,10 @@ mod test {
     #[ktest]
     fn copy_to_user_over_budget_is_enomem() {
         let parent = space_with(1, 0xAA, PageFlags::RW);
-        let child = Arc::new(cow_clone(&parent, DATA..DATA + PAGE_SIZE));
+        let child = Arc::new(
+            cow_clone(&parent, DATA..DATA + PAGE_SIZE, &*Agent::new_root(1, 64))
+                .expect("cow_clone"),
+        );
         child.activate();
         let dst = UserSlice::new(DATA, 8).unwrap();
         let poor = Agent::new_root(1, 0);
@@ -316,5 +364,101 @@ mod test {
             );
         }
         assert_eq!(agent.mem_used_pages(), 0);
+    }
+
+    const LOW: Vaddr = 0x40_0000;
+    const MID: Vaddr = 0x60_0000;
+
+    #[ktest]
+    fn cow_clone_partial_failure_unwinds() {
+        let parent = space_with_at(&[LOW, MID], 0xAA, PageFlags::RW);
+        let poor = Agent::new_root(1, 4);
+        let rich = Agent::new_root(1, 5);
+        let fresh = Agent::new_root(1, 4);
+        let b = crate::probe::settled();
+
+        // Root 1 + first page 3 = 4 fits; the second page opens a new 2 MiB window and needs 1.
+        let refused = cow_clone(&parent, LOW..MID + PAGE_SIZE, &*poor);
+        assert_eq!(refused.err(), Some(CloneError::Budget));
+        assert_eq!(
+            poor.mem_used_pages(),
+            0,
+            "the unwind refunds every node charge"
+        );
+        assert_eq!(
+            crate::probe::settled(),
+            b,
+            "the unwind frees the child's nodes"
+        );
+        assert_eq!(byte(&parent, LOW), 0xAA);
+        assert_eq!(byte(&parent, MID), 0xAA);
+
+        // The walk write-protected the first page and stopped before the second.
+        assert_eq!(handle_cow_fault(&parent, &*fresh, LOW), Ok(true));
+        assert_eq!(
+            fresh.mem_used_pages(),
+            0,
+            "sole owner again: taken over, not copied"
+        );
+        assert_eq!(handle_cow_fault(&parent, &*fresh, MID), Ok(false));
+
+        let child = Arc::new(cow_clone(&parent, LOW..MID + PAGE_SIZE, &*rich).expect("cow_clone"));
+        assert_eq!(rich.mem_used_pages(), 5);
+        assert_eq!(byte(&child, LOW), 0xAA);
+        assert_eq!(byte(&child, MID), 0xAA);
+    }
+
+    #[ktest]
+    fn cow_clone_rejects_bad_ranges() {
+        let parent = space_with_at(&[LOW], 0xAA, PageFlags::RW);
+        let payer = Agent::new_root(1, 64);
+        for range in [
+            LOW + 1..LOW + 2 * PAGE_SIZE,
+            LOW..LOW + PAGE_SIZE + 1,
+            LOW..LOW,
+            LOW + PAGE_SIZE..LOW,
+            LOW..abi::USER_TOP + PAGE_SIZE,
+        ] {
+            assert_eq!(
+                cow_clone(&parent, range.clone(), &*payer).err(),
+                Some(CloneError::Range),
+                "range {range:x?}"
+            );
+            assert_eq!(payer.mem_used_pages(), 0, "range {range:x?}");
+        }
+
+        let mmio = VmSpace::new();
+        {
+            let guard = disable_preempt();
+            let mut c = mmio.cursor_mut(&guard, &(LOW..LOW + PAGE_SIZE)).unwrap();
+            let iomem = IoMem::acquire(0x100_000_000_000..0x100_000_001_000).expect("iomem");
+            let prop = PageProperty::new_user(PageFlags::RW, CachePolicy::Uncacheable);
+            c.map_iomem(iomem, prop, PAGE_SIZE, 0);
+        }
+        assert_eq!(
+            cow_clone(&mmio, LOW..LOW + PAGE_SIZE, &*payer).err(),
+            Some(CloneError::Unsupported(LOW))
+        );
+        assert_eq!(payer.mem_used_pages(), 0);
+
+        assert_eq!(Errno::from(CloneError::Range), Errno::EINVAL);
+        assert_eq!(Errno::from(CloneError::Unsupported(LOW)), Errno::EINVAL);
+        assert_eq!(Errno::from(CloneError::Budget), Errno::ENOMEM);
+    }
+
+    #[ktest]
+    fn cow_clone_charge_matches_frames() {
+        let at = [LOW, LOW + PAGE_SIZE, MID, 0x4000_0000, 0x80_0000_0000];
+        let parent = space_with_at(&at, 0xAA, PageFlags::RW);
+        let payer = Agent::new_root(1, 64);
+        let b = crate::probe::settled();
+
+        // Root 1, first page 3, same window 0, new 2 MiB window 1, new 1 GiB window 2, new
+        // 512 GiB window 3.
+        let child = cow_clone(&parent, LOW..0x80_0000_1000, &*payer).expect("cow_clone");
+        assert_eq!(payer.mem_used_pages(), 10);
+        assert_eq!(b - crate::probe::settled(), 10 * PAGE_SIZE);
+        drop(child);
+        assert_eq!(crate::probe::settled(), b);
     }
 }

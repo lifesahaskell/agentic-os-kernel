@@ -1010,7 +1010,14 @@ mod test {
         arg: u64,
     ) -> (Arc<Space>, Arc<Thread>) {
         install_space_switch();
-        let vm = Arc::new(cow_clone(&parent.space, IMAGE_BASE..TEST_DATA + PAGE_SIZE));
+        let vm = Arc::new(
+            cow_clone(
+                &parent.space,
+                IMAGE_BASE..TEST_DATA + PAGE_SIZE,
+                &*Agent::new_root(1, 64),
+            )
+            .expect("cow_clone"),
+        );
         map_stack(&vm).unwrap();
         let space = Space::new(vm, owner.clone());
         if let Some(ep) = ep {
@@ -1362,7 +1369,14 @@ mod test {
 
     /// A child space over a copy-on-write clone of `parent`'s image range, with a fresh stack.
     fn cow_space(parent: &Image, owner: &Arc<Agent>) -> Arc<Space> {
-        let vm = Arc::new(cow_clone(&parent.space, IMAGE_BASE..TEST_DATA + PAGE_SIZE));
+        let vm = Arc::new(
+            cow_clone(
+                &parent.space,
+                IMAGE_BASE..TEST_DATA + PAGE_SIZE,
+                &*Agent::new_root(1, 64),
+            )
+            .expect("cow_clone"),
+        );
         map_stack(&vm).unwrap();
         Space::new(vm, owner.clone())
     }
@@ -1480,7 +1494,14 @@ mod test {
         install_space_switch();
         let owner = Agent::new_root(1, 4);
         let parent = sibling_parent(PageFlags::RW);
-        let vm = Arc::new(cow_clone(&parent.space, IMAGE_BASE..TEST_DATA + PAGE_SIZE));
+        let vm = Arc::new(
+            cow_clone(
+                &parent.space,
+                IMAGE_BASE..TEST_DATA + PAGE_SIZE,
+                &*Agent::new_root(1, 64),
+            )
+            .expect("cow_clone"),
+        );
         map_stack(&vm).unwrap();
         let child = Image {
             space: vm,

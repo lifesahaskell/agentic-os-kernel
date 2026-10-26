@@ -22,7 +22,7 @@ use crate::{
     ipc::{self, IpcError},
     space::{self, SpaceError, Target, ThreadStart},
     thread::Thread,
-    vm::{copy_from_user, copy_to_user},
+    vm::{CloneError, copy_from_user, copy_to_user},
 };
 
 /// A positive errno value; `dispatch` returns it negated.
@@ -80,6 +80,15 @@ impl From<AgentError> for Errno {
             AgentError::Budget => Errno::ENOMEM,
             AgentError::NoMemory => Errno::ENOMEM,
             AgentError::Cap(c) => c.into(),
+        }
+    }
+}
+
+impl From<CloneError> for Errno {
+    fn from(e: CloneError) -> Self {
+        match e {
+            CloneError::Range | CloneError::Unsupported(_) => Errno::EINVAL,
+            CloneError::Budget => Errno::ENOMEM,
         }
     }
 }
