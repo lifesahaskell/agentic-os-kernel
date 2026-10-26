@@ -24,6 +24,12 @@ pub const SYS_THREAD_CREATE: usize = 0x104;
 /// `thread_interrupt(thread, entry)`: redirects the thread named by a Thread capability with
 /// SIGNAL to `entry`, aborting a blocking IPC with `EINTR`. `ESRCH` once the thread has exited.
 pub const SYS_THREAD_INTERRUPT: usize = 0x105;
+/// `space_notify(space, ep)`: makes the Endpoint in slot `ep` (needs SEND) the one the kernel sends
+/// exit and fault notes to for the threads of `space`, a slot holding a Space capability with
+/// SIGNAL, or `SPACE_SELF` for the caller's own. A holder may replace the endpoint at any time;
+/// a thread naming its own space may set it only once (`EPERM` when one is already set), so a
+/// thread cannot redirect the notes its parent arranged (OD-18).
+pub const SYS_SPACE_NOTIFY: usize = 0x107;
 
 /// `thread_create`'s `space` argument for "the caller's own space". No slot can hold this value:
 /// slots are below `CSpace::MAX_SLOTS`.
@@ -232,14 +238,37 @@ pub const MAX_IPC_CAPS: usize = 4;
 pub const LABEL_CANCEL: u64 = u64::MAX;
 
 /// Labels at or above this are the kernel's: `send` and `call` refuse them with EINVAL, so a
-/// receiver can trust one. `LABEL_CANCEL` is `u64::MAX`; the timer takes `u64::MAX - 1`; plan 02-05
-/// takes two more and SIG-03 one (OD-12). The rest of the range stays free.
+/// receiver can trust one. `LABEL_CANCEL` is `u64::MAX`; the timer takes `u64::MAX - 1`, the two
+/// notes below take `u64::MAX - 2` and `u64::MAX - 3`, and SIG-03 takes one (OD-12). The rest of
+/// the range stays free.
 pub const LABEL_KERNEL_BASE: u64 = u64::MAX - 15;
 
 /// The label of a timer message. `words` are `[cookie, due, now, id]`: the cookie given to
 /// `timer_arm`, the tick it was due, the tick it was sent, and the timer id. The sender credential
 /// is the arming agent's, `tid` is 0 and `tag` is the arming thread's.
 pub const LABEL_TIMER: u64 = u64::MAX - 1;
+
+/// The label of a fault note, inside the kernel range (`LABEL_KERNEL_BASE`), so ring 3 cannot
+/// send it. The kernel makes it as a `call` from the faulting thread to the space's notify
+/// endpoint: `words` are `[vector, address, rip, error code]`, and the sender credential, `tid`
+/// and `tag` are the faulting thread's. The reply decides: `words[0] == 0` resumes the thread,
+/// anything else kills it. A note carries no capability and no data.
+pub const NOTE_FAULT: u64 = u64::MAX - 2;
+
+/// The label of an exit note: one message when a thread of the space exits, stamped like
+/// `NOTE_FAULT`. `words` are `[kind, value, 0, 0]`, with the `NOTE_KIND_*` values below.
+pub const NOTE_EXIT: u64 = u64::MAX - 3;
+
+/// `NOTE_EXIT` kind: the thread called `exit`; `value` is the code.
+pub const NOTE_KIND_CODE: u64 = 0;
+/// `NOTE_EXIT` kind: a fault that was not copy-on-write ended the thread; `value` is the address.
+pub const NOTE_KIND_FAULT: u64 = 1;
+/// `NOTE_EXIT` kind: a copy-on-write fault the agent's memory budget could not pay for.
+pub const NOTE_KIND_BUDGET: u64 = 2;
+/// `NOTE_EXIT` kind: a non-page-fault exception ended the thread; `value` is the x86 vector.
+pub const NOTE_KIND_EXCEPTION: u64 = 3;
+/// `NOTE_EXIT` kind: the thread was killed from outside (plan 02-06 sends it).
+pub const NOTE_KIND_KILLED: u64 = 4;
 
 /// Flat image: `userland/link.ld` puts five little-endian u64 at `IMAGE_BASE`: magic, entry,
 /// handler, `rx_end`, `mem_end`. Pages below `rx_end` map RX, pages up to `mem_end` map RW and

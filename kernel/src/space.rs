@@ -5,7 +5,9 @@
 //! Every thread's credential is its space owner's, never its creator's: a thread started in
 //! another space does not run with the creator's authority (OD-11).
 
-use abi::USER_TOP;
+use abi::{
+    NOTE_EXIT, NOTE_KIND_BUDGET, NOTE_KIND_CODE, NOTE_KIND_EXCEPTION, NOTE_KIND_FAULT, USER_TOP,
+};
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
@@ -19,8 +21,9 @@ use ostd::{
 use crate::{
     agent::Agent,
     cap::{Cap, CapError, Object, Rights},
+    ipc::Endpoint,
     thread::Thread,
-    user,
+    user::{self, Exit},
 };
 
 /// Most live threads one space holds. The 65th `thread_create` is refused (`Limit`).
@@ -32,6 +35,9 @@ pub struct Space {
     /// `(tid, thread)` of every thread started in this space and not yet reaped. Weak, so a
     /// registered thread never outlives its own last reference because of this list.
     threads: SpinLock<Vec<(u64, Weak<Thread>)>>,
+    /// Where exit and fault notes for this space's threads go: an Endpoint capability, kept as the
+    /// capability and not the endpoint it names, so revoking it stops delivery (OD-06, OD-17).
+    notify: SpinLock<Option<Cap>>,
 }
 
 impl Space {
@@ -40,6 +46,7 @@ impl Space {
             vm,
             owner,
             threads: SpinLock::new(Vec::new()),
+            notify: SpinLock::new(None),
         })
     }
 
@@ -67,6 +74,52 @@ impl Space {
     /// Removes thread `tid` from the space.
     pub fn reap(&self, tid: u64) {
         self.threads.lock().retain(|(t, _)| *t != tid);
+    }
+
+    /// Sets the notify capability, replacing any earlier one. `cap` is stored as given; whether
+    /// it still resolves is decided at each use.
+    pub fn set_notify_cap(&self, cap: Cap) {
+        *self.notify.lock() = Some(cap);
+    }
+
+    /// Sets the notify capability only if none is set, `Denied` otherwise. The test and the store
+    /// share one lock acquisition.
+    fn set_notify_cap_once(&self, cap: Cap) -> Result<(), SpaceError> {
+        let mut notify = self.notify.lock();
+        if notify.is_some() {
+            return Err(SpaceError::Denied);
+        }
+        *notify = Some(cap);
+        Ok(())
+    }
+
+    /// The endpoint notes go to: `None` when none is set, when the capability was revoked, or
+    /// when it no longer resolves to an endpoint with SEND. Resolved at each use.
+    pub fn notify_ep(&self) -> Option<Arc<Endpoint>> {
+        let cap = self.notify.lock().clone()?;
+        match cap.resolve(Rights::SEND) {
+            Ok(Object::Endpoint(ep)) => Some(ep),
+            _ => None,
+        }
+    }
+
+    /// Tells the notify endpoint that `th` exited as `exit`: one `NOTE_EXIT` message stamped with
+    /// the thread's credential, tid and tag, words `[kind, value, 0, 0]`. Nothing is sent when no
+    /// endpoint resolves. The result is ignored: the exit has happened either way.
+    ///
+    /// Called after `set_exit` and before `reap`, so the note leaves while the space still counts
+    /// the thread. `NOTE_KIND_KILLED` has no `Exit` variant yet (plan 02-06).
+    pub fn note_exit(&self, th: &Thread, exit: Exit) {
+        let Some(ep) = self.notify_ep() else {
+            return;
+        };
+        let (kind, value) = match exit {
+            Exit::Code(c) => (NOTE_KIND_CODE, c as u64),
+            Exit::Fault(a) => (NOTE_KIND_FAULT, a as u64),
+            Exit::Budget => (NOTE_KIND_BUDGET, 0),
+            Exit::Exception(v) => (NOTE_KIND_EXCEPTION, v),
+        };
+        let _ = ep.push_note(th, NOTE_EXIT, [kind, value, 0, 0], None);
     }
 
     /// Threads registered and still referenced.
@@ -110,6 +163,8 @@ pub enum SpaceError {
     /// The space already holds `MAX_THREADS_PER_SPACE` threads.
     Limit,
     Invalid,
+    /// A thread named its own space for a notify endpoint, and the space already has one.
+    Denied,
     /// The caller's capability space is full.
     NoRoom,
     /// The thread id could not be written back to the caller.
@@ -213,9 +268,48 @@ pub fn thread_interrupt(caller: &Thread, slot: usize, entry: usize) -> Result<()
     Ok(())
 }
 
+/// Makes the Endpoint in `ep_slot` of the caller's agent (needs SEND) the notify endpoint of the
+/// space named by `target`; the capability is kept, so revoking it later stops the notes.
+///
+/// Checked in this order: the target (`SelfSpace` is the caller's own space, `Dead` without one;
+/// `Slot` needs SIGNAL and a Space), the endpoint slot (SEND and an Endpoint), then the self rule.
+/// A holder of a Space capability may replace the endpoint at any time. A thread naming its own
+/// space may set it only while none is set (`Denied`), so it cannot redirect the notes its parent
+/// arranged (OD-18); the test and the store happen under one lock, so two racing self-sets cannot
+/// both succeed.
+pub fn set_notify(caller: &Thread, target: Target, ep_slot: usize) -> Result<(), SpaceError> {
+    let space = match target {
+        Target::SelfSpace => caller.process().ok_or(SpaceError::Dead)?,
+        Target::Slot(slot) => {
+            let obj = caller
+                .agent()
+                .cspace
+                .lock()
+                .get(slot)?
+                .resolve(Rights::SIGNAL)?;
+            match obj {
+                Object::Space(s) => s,
+                _ => return Err(SpaceError::WrongType),
+            }
+        }
+    };
+    let cap = caller.agent().cspace.lock().get(ep_slot)?.clone();
+    match cap.resolve(Rights::SEND)? {
+        Object::Endpoint(_) => {}
+        _ => return Err(SpaceError::WrongType),
+    }
+    match target {
+        Target::SelfSpace => space.set_notify_cap_once(cap),
+        Target::Slot(_) => {
+            space.set_notify_cap(cap);
+            Ok(())
+        }
+    }
+}
+
 #[cfg(ktest)]
 mod test {
-    use abi::USER_STACK_TOP;
+    use abi::{IMAGE_BASE, NOTE_FAULT, TEST_DATA, USER_STACK_TOP, errno};
     use ostd::{
         mm::{FrameAllocOptions, PageFlags, VmIo},
         prelude::*,
@@ -224,13 +318,14 @@ mod test {
 
     use super::*;
     use crate::{
-        ipc::Endpoint,
+        ipc::{IpcError, Message},
         sched::install_space_switch,
         user::{
-            Exit, Image, load_image, map_test_page,
-            testkit::{self, join, join_thread, spawn_image},
+            Image, load_image, map_stack, map_test_page, spawn_thread,
+            testkit::{self, join, join_thread, recv_note, spawn_image},
             user_image,
         },
+        vm::cow_clone,
     };
 
     /// A space running the `spinner` image under `owner`, with the test page it reads.
@@ -721,5 +816,349 @@ mod test {
         for t in [&t1, &t2, &t3] {
             join_thread(&t.1);
         }
+    }
+
+    /// The `fault_sibling` image over a test page mapped with `data`.
+    fn sibling_parent(data: PageFlags) -> Image {
+        let img = load_image(user_image!("fault_sibling")).unwrap();
+        map_test_page(
+            &img.space,
+            FrameAllocOptions::new().alloc_frame().unwrap().into(),
+            data,
+        );
+        img
+    }
+
+    /// A sibling of `parent`: its own space over a copy-on-write clone of the image range with a
+    /// fresh stack, owned by `owner`, whose notes go to `ep` (a SEND capability) when given. One
+    /// thread tagged `tag` starts at the entry with `arg`.
+    fn start_sibling(
+        parent: &Image,
+        owner: &Arc<Agent>,
+        ep: Option<&Arc<Endpoint>>,
+        tag: u64,
+        arg: u64,
+    ) -> (Arc<Space>, Arc<Thread>) {
+        install_space_switch();
+        let vm = Arc::new(cow_clone(&parent.space, IMAGE_BASE..TEST_DATA + PAGE_SIZE));
+        map_stack(&vm).unwrap();
+        let space = Space::new(vm, owner.clone());
+        if let Some(ep) = ep {
+            space.set_notify_cap(Cap::new(Object::Endpoint(ep.clone()), Rights::SEND));
+        }
+        let th = Thread::new_tagged(owner.clone(), tag);
+        space.register(&th).unwrap();
+        let start = ThreadStart {
+            rip: parent.entry as u64,
+            rsp: USER_STACK_TOP as u64,
+            arg,
+            fs_base: 0,
+            clear_tid: 0,
+        };
+        spawn_thread(&space, th.clone(), start);
+        (space, th)
+    }
+
+    /// A kernel thread with no authority, to receive on an endpoint.
+    fn receiver() -> Arc<Thread> {
+        Thread::new(Agent::new_root(99, 0))
+    }
+
+    /// Waits, yielding, until `ep` holds `n` messages.
+    fn wait_queued(ep: &Endpoint, n: usize) {
+        let mut spins = 0usize;
+        while ep.queued() < n {
+            spins += 1;
+            assert!(spins < 1_000_000, "the notes never arrived");
+            Task::yield_now();
+        }
+    }
+
+    /// What every note must be: the kernel's label, no capability, no data, no reply to wait on.
+    fn assert_note_shape(m: &Message, label: u64) {
+        assert_eq!(m.label, label);
+        assert!(m.caps.is_empty(), "a note carries no capability");
+        assert!(m.data.is_empty(), "a note carries no data");
+    }
+
+    #[ktest]
+    fn note_exit_names_tid_and_tag_of_each_sibling() {
+        let owner = Agent::new_root(5, 0);
+        let parent = sibling_parent(PageFlags::RW);
+        let e = Endpoint::new();
+        let (_s0, t0) = start_sibling(&parent, &owner, Some(&e), 0x10, 0);
+        let (_s1, t1) = start_sibling(&parent, &owner, Some(&e), 0x11, 0);
+
+        let me = receiver();
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        for _ in 0..2 {
+            let m = e.recv(&me).unwrap();
+            assert_note_shape(&m, NOTE_EXIT);
+            assert_eq!(m.words, [NOTE_KIND_CODE, 7, 0, 0]);
+            assert_eq!(m.sender, owner.credential());
+            assert!(m.reply.is_none(), "an exit note is not a call");
+            seen.push((m.tid, m.tag));
+        }
+        seen.sort();
+        let mut want = [(t0.tid(), 0x10), (t1.tid(), 0x11)];
+        want.sort();
+        assert_eq!(seen, want);
+        assert_eq!(join_thread(&t0), Exit::Code(7));
+        assert_eq!(join_thread(&t1), Exit::Code(7));
+        assert_eq!(e.queued(), 0, "exactly two notes");
+    }
+
+    #[ktest]
+    fn note_exit_without_notify_is_dropped() {
+        let owner = Agent::new_root(5, 0);
+        let parent = sibling_parent(PageFlags::RW);
+        // An endpoint nothing points at, to show that nothing reaches it either.
+        let bystander = Endpoint::new();
+        let (s, t) = start_sibling(&parent, &owner, None, 0x10, 0);
+        assert!(s.notify_ep().is_none());
+
+        assert_eq!(join_thread(&t), Exit::Code(7));
+        while s.live_threads() != 0 {
+            Task::yield_now();
+        }
+        assert_eq!(bystander.queued(), 0);
+    }
+
+    #[ktest]
+    fn note_labels_are_reserved() {
+        let me = receiver();
+        let ep = Endpoint::new();
+        for label in [NOTE_EXIT, NOTE_FAULT] {
+            assert_eq!(
+                ep.push(&me, label, [0; 4], Vec::new(), Vec::new(), None),
+                Err(IpcError::Invalid),
+                "send path, label {label:#x}"
+            );
+            assert_eq!(
+                ep.call(&me, label, [0; 4]),
+                Err(IpcError::Invalid),
+                "call path, label {label:#x}"
+            );
+        }
+        assert_eq!(ep.queued(), 0, "nothing was queued");
+    }
+
+    #[ktest]
+    fn note_exit_bypasses_queue_len() {
+        let owner = Agent::new_root(5, 0);
+        let parent = sibling_parent(PageFlags::RW);
+        let e = Endpoint::new();
+        let me = receiver();
+        for i in 0..Endpoint::QUEUE_LEN {
+            e.send(&me, [i as u64, 0, 0, 0]).unwrap();
+        }
+        assert_eq!(e.send(&me, [0; 4]), Err(IpcError::Full));
+
+        let (_s, t) = start_sibling(&parent, &owner, Some(&e), 0x10, 0);
+        wait_queued(&e, Endpoint::QUEUE_LEN + 1);
+        assert_eq!(join_thread(&t), Exit::Code(7));
+        assert_eq!(
+            e.send(&me, [0; 4]),
+            Err(IpcError::Full),
+            "an ordinary send is still refused"
+        );
+
+        for i in 0..Endpoint::QUEUE_LEN {
+            assert_eq!(e.recv(&me).unwrap().words[0], i as u64);
+        }
+        let note = e.recv(&me).unwrap();
+        assert_note_shape(&note, NOTE_EXIT);
+        assert_eq!(note.words, [NOTE_KIND_CODE, 7, 0, 0]);
+    }
+
+    #[ktest]
+    fn note_fault_then_exit_from_one_sibling() {
+        let owner = Agent::new_root(5, 0);
+        // Read-only, not copy-on-write: the sibling's store is a fault, not a page copy.
+        let parent = sibling_parent(PageFlags::R);
+        let e = Endpoint::new();
+        let me = receiver();
+
+        // S0 exits first, so S1's notes are the only ones left to read.
+        let (_s0, t0) = start_sibling(&parent, &owner, Some(&e), 0x10, 0);
+        let m = recv_note(&e, &me);
+        assert_note_shape(&m, NOTE_EXIT);
+        assert_eq!(m.words, [NOTE_KIND_CODE, 7, 0, 0]);
+        assert_eq!((m.tid, m.tag), (t0.tid(), 0x10));
+        assert_eq!(join_thread(&t0), Exit::Code(7));
+
+        let (_s1, t1) = start_sibling(&parent, &owner, Some(&e), 0x11, 1);
+        let m = recv_note(&e, &me);
+        assert_note_shape(&m, NOTE_FAULT);
+        assert_eq!(m.sender, owner.credential());
+        assert_eq!((m.tid, m.tag), (t1.tid(), 0x11));
+        assert_eq!(m.words[..2], [14, TEST_DATA as u64]);
+        let rip = m.words[2] as usize;
+        assert!(
+            parent.text.contains(&rip),
+            "fault rip {rip:#x} outside the image text"
+        );
+        assert_eq!(m.words[3] & 0b110, 0b110, "write fault from user mode");
+        assert!(t1.exit_status().is_none(), "S1 waits for the verdict");
+
+        // Any non-zero verdict kills; the exit note then names the fault.
+        m.reply
+            .as_ref()
+            .expect("a fault note is a call")
+            .reply([1, 0, 0, 0]);
+        let m = recv_note(&e, &me);
+        assert_note_shape(&m, NOTE_EXIT);
+        assert_eq!(m.words, [NOTE_KIND_FAULT, TEST_DATA as u64, 0, 0]);
+        assert_eq!((m.tid, m.tag), (t1.tid(), 0x11));
+        assert_eq!(join_thread(&t1), Exit::Fault(TEST_DATA));
+        assert_eq!(e.queued(), 0, "three notes in all");
+    }
+
+    #[ktest]
+    fn note_fault_interrupted_before_receive_resumes_redirect() {
+        let owner = Agent::new_root(5, 0);
+        let parent = sibling_parent(PageFlags::R);
+        let e = Endpoint::new();
+        let me = receiver();
+
+        let (_s, t) = start_sibling(&parent, &owner, Some(&e), 0x11, 1);
+        wait_queued(&e, 1);
+
+        // Nobody has received the fault note, so the interrupt withdraws it and the thread runs
+        // the redirect: the handler exits with the faulting pc.
+        t.interrupt(parent.handler);
+        let Exit::Code(pc) = join_thread(&t) else {
+            panic!("the interrupted fault did not end in the redirect handler");
+        };
+        assert!(
+            parent.text.contains(&pc),
+            "pc {pc:#x} outside the image text"
+        );
+
+        // The only note left is the exit note: the fault note was taken out, not left queued.
+        let m = recv_note(&e, &me);
+        assert_note_shape(&m, NOTE_EXIT);
+        assert_eq!(m.words, [NOTE_KIND_CODE, pc as u64, 0, 0]);
+        assert_eq!(e.queued(), 0, "the withdrawn fault note is gone");
+    }
+
+    /// A capability for `ep` with `rights`, inserted in `agent`; returns the slot.
+    fn give_endpoint(agent: &Agent, ep: &Arc<Endpoint>, rights: Rights) -> usize {
+        agent
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Endpoint(ep.clone()), rights))
+            .unwrap()
+    }
+
+    #[ktest]
+    fn space_notify_refuses() {
+        let owner = Agent::new_root(2, 0);
+        let b = Space::new(Arc::new(VmSpace::new()), owner.clone());
+        let e = Endpoint::new();
+        let refused = |caller: &Thread, target, slot| set_notify(caller, target, slot).err();
+
+        // The space capability is the first thing looked at: without SIGNAL it is a rights error,
+        // whatever the endpoint slot holds.
+        let (a0, c0) = holder_of(&b, Rights::SEND.union(Rights::CREATE));
+        let ep0 = give_endpoint(&a0, &e, Rights::SEND);
+        assert_eq!(
+            refused(&c0, Target::Slot(0), ep0),
+            Some(SpaceError::Cap(CapError::Rights)),
+            "no SIGNAL"
+        );
+
+        // With SIGNAL and SEND on the space capability itself, so the endpoint slot can name it.
+        let (a, c) = holder_of(&b, Rights::ALL);
+        let ep = give_endpoint(&a, &e, Rights::SEND);
+        let recv_only = give_endpoint(&a, &e, Rights::RECV);
+        let ep_as_space = give_endpoint(&a, &e, Rights::ALL);
+        assert_eq!(
+            refused(&c, Target::Slot(ep_as_space), ep),
+            Some(SpaceError::WrongType),
+            "an Endpoint where the Space belongs"
+        );
+        assert_eq!(
+            refused(&c, Target::Slot(0), 0),
+            Some(SpaceError::WrongType),
+            "a Space where the Endpoint belongs"
+        );
+        assert_eq!(
+            refused(&c, Target::Slot(0), recv_only),
+            Some(SpaceError::Cap(CapError::Rights)),
+            "an endpoint slot without SEND"
+        );
+        assert_eq!(
+            refused(&c, Target::Slot(0), 9),
+            Some(SpaceError::Cap(CapError::NoSlot)),
+            "an empty endpoint slot"
+        );
+        assert_eq!(
+            refused(&c, Target::Slot(9), ep),
+            Some(SpaceError::Cap(CapError::NoSlot)),
+            "an empty space slot"
+        );
+
+        // A thread with no Space has no "own space".
+        assert_eq!(refused(&c, Target::SelfSpace, ep), Some(SpaceError::Dead));
+
+        assert!(b.notify_ep().is_none(), "no refusal set an endpoint");
+    }
+
+    #[ktest]
+    fn space_notify_self_only_while_unset() {
+        let owner = Agent::new_root(2, 0);
+        let b = Space::new(Arc::new(VmSpace::new()), owner.clone());
+        let (e1, e2) = (Endpoint::new(), Endpoint::new());
+        let s1 = give_endpoint(&owner, &e1, Rights::SEND);
+        let s2 = give_endpoint(&owner, &e2, Rights::SEND);
+        let me = Thread::new_tagged(owner.clone(), 5);
+        me.set_process(b.clone());
+
+        assert_eq!(set_notify(&me, Target::SelfSpace, s1), Ok(()));
+        assert!(Arc::ptr_eq(&b.notify_ep().unwrap(), &e1));
+        assert_eq!(
+            set_notify(&me, Target::SelfSpace, s2),
+            Err(SpaceError::Denied),
+            "a thread cannot redirect what is already set"
+        );
+        assert!(Arc::ptr_eq(&b.notify_ep().unwrap(), &e1), "still E1");
+        // The endpoint is checked before the self rule, so a bad slot is still its own error.
+        assert_eq!(
+            set_notify(&me, Target::SelfSpace, 9),
+            Err(SpaceError::Cap(CapError::NoSlot))
+        );
+
+        // A holder with SIGNAL may replace it, and the next note goes to the new endpoint.
+        let (a, c) = holder_of(&b, Rights::SIGNAL);
+        let holder_ep = give_endpoint(&a, &e2, Rights::SEND);
+        assert_eq!(set_notify(&c, Target::Slot(0), holder_ep), Ok(()));
+        assert!(Arc::ptr_eq(&b.notify_ep().unwrap(), &e2));
+        b.note_exit(&me, Exit::Code(3));
+        assert_eq!((e1.queued(), e2.queued()), (0, 1));
+        let m = e2.recv(&receiver()).unwrap();
+        assert_note_shape(&m, NOTE_EXIT);
+        assert_eq!(m.words, [NOTE_KIND_CODE, 3, 0, 0]);
+        assert_eq!((m.tid, m.tag), (me.tid(), 5));
+    }
+
+    #[ktest]
+    fn space_notify_ring3_self_sets_once() {
+        let owner = Agent::new_root(5, 0);
+        let parent = sibling_parent(PageFlags::RW);
+        let e = Endpoint::new();
+        // The thread runs as the owner, so slot 0 of the owner's capability space is its slot 0.
+        assert_eq!(give_endpoint(&owner, &e, Rights::SEND), 0);
+        let me = receiver();
+
+        // No endpoint yet: the first self-set works, the second is refused, and the bin exits with
+        // the refusal. The note reaching E at all shows the first call set it.
+        let (s, t) = start_sibling(&parent, &owner, None, 0x12, 2);
+        let m = recv_note(&e, &me);
+        assert_note_shape(&m, NOTE_EXIT);
+        assert_eq!(m.words, [NOTE_KIND_CODE, (-errno::EPERM) as u64, 0, 0]);
+        assert_eq!((m.tid, m.tag), (t.tid(), 0x12));
+        assert!(Arc::ptr_eq(&s.notify_ep().unwrap(), &e));
+        assert_eq!(join_thread(&t), Exit::Code((-errno::EPERM) as usize));
     }
 }

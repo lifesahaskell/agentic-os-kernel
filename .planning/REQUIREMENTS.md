@@ -23,7 +23,7 @@ recorded measurement. "Test" below names what would show it worked.
 - [ ] **KERN-07**: An idle task halts the CPU when nothing is runnable. Test: the scheduler runs with all agents blocked and the CPU halts instead of spinning.
 - [ ] **KERN-08**: Destroying a process returns its carved budgets and capabilities to the parent (`charge_pages` gets an inverse) and wakes its futex waiters. Test: a 10,000x fork+exit loop leaves page and capability counts flat.
 - [x] **KERN-09**: `futex` wait and IPC `recv` accept timeouts, and a timer can deliver a message to an endpoint. Test: timed waits expire within a stated tolerance.
-- [ ] **KERN-10**: Thread-exit and exception notifications go to a process endpoint and name the faulting `tid` and `tag`. Test: procmgr can tell which of two forked siblings faulted.
+- [x] **KERN-10**: Thread-exit and exception notifications go to a process endpoint and name the faulting `tid` and `tag`. Test: procmgr can tell which of two forked siblings faulted.
 - [ ] **KERN-11**: Signal redirect saves the full user context on a kernel-held stack and `sigreturn` restores it, with no kernel write to the user stack. Test: all general registers and FPU state survive a redirect and return.
 - [x] **SAFE-01**: `unsafe` is allowed only where no safe workaround exists, and stays contained. The crate keeps `#![deny(unsafe_code)]`; each exception is a small named module with `#[allow(unsafe_code)]`, every block carries a `// SAFETY:` comment, and every block is listed in `docs/architecture/unsafe-ledger.md` (location, why no safe route, invariant relied on, how to retire it). Test: a CI grep fails if `unsafe` appears outside a ledger-listed module or a ledger entry has no matching block.
 - [x] **KERN-12**: One shared `block_until(condition, deadline)` helper implements every blocking wait. Hand-rolled wait loops are absent. Test: a fail-point ktest forces the wake-versus-interrupt interleaving, plus a 1000x loop in CI.
@@ -188,7 +188,7 @@ Each v1 requirement maps to exactly one phase. Rule: the phase that builds its p
 | KERN-07 | Phase 2 | Pending |
 | KERN-08 | Phase 2 | Pending |
 | KERN-09 | Phase 2 | Complete |
-| KERN-10 | Phase 2 | Pending |
+| KERN-10 | Phase 2 | Complete |
 | KERN-11 | Phase 2 | Pending |
 | KERN-12 | Phase 1 | Complete |
 | IPC-01 | Phase 1 | Complete |
