@@ -14,7 +14,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use abi::{IpcArgs, LABEL_CANCEL, MAX_IPC_CAPS};
+use abi::{IpcArgs, LABEL_CANCEL, LABEL_KERNEL_BASE, MAX_IPC_CAPS};
 use ostd::{
     mm::VmSpace,
     sync::{SpinLock, WaitQueue},
@@ -306,14 +306,11 @@ impl Endpoint {
         caps: Vec<Cap>,
         reply: Option<Arc<ReplyWait>>,
     ) -> Result<(), IpcError> {
-        if label == LABEL_CANCEL {
+        // The kernel's labels (Cancel, timer, ...) must not be forgeable by a sender.
+        if label >= LABEL_KERNEL_BASE {
             return Err(IpcError::Invalid);
         }
-        let mut q = self.queue.lock();
-        if q.len() >= Self::QUEUE_LEN {
-            return Err(IpcError::Full);
-        }
-        q.push_back(Message {
+        self.enqueue(Message {
             sender: from.agent().credential(),
             tid: from.tid(),
             tag: from.tag(),
@@ -322,7 +319,39 @@ impl Endpoint {
             label,
             caps,
             reply,
-        });
+        })
+    }
+
+    /// Queues a message the kernel makes: `label` is one of its own, `sender` and `tag` are those
+    /// of the agent and thread the message is on behalf of, and `tid` is 0 because no thread sent
+    /// it. Task context only (it takes the queue lock without disabling interrupts). `Full` at
+    /// `QUEUE_LEN`; the message is then dropped and the caller decides whether to retry.
+    pub(crate) fn push_kernel(
+        &self,
+        label: u64,
+        sender: Credential,
+        tag: u64,
+        words: [u64; 4],
+    ) -> Result<(), IpcError> {
+        debug_assert!(label >= LABEL_KERNEL_BASE);
+        self.enqueue(Message {
+            sender,
+            tid: 0,
+            tag,
+            words,
+            data: Vec::new(),
+            label,
+            caps: Vec::new(),
+            reply: None,
+        })
+    }
+
+    fn enqueue(&self, m: Message) -> Result<(), IpcError> {
+        let mut q = self.queue.lock();
+        if q.len() >= Self::QUEUE_LEN {
+            return Err(IpcError::Full);
+        }
+        q.push_back(m);
         drop(q);
         self.wq.wake_one();
         Ok(())

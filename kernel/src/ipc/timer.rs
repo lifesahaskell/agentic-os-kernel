@@ -1,10 +1,32 @@
 //! Timers that deliver a message: `timer_arm(ep, delay_ms, cookie)` makes the kernel send one
 //! `LABEL_TIMER` message to `ep` after the delay.
+//!
+//! One kernel task owns the table. It sleeps in `Thread::block_until` with the earliest due tick as
+//! its deadline, so the only code that runs in interrupt context is the existing `DEADLINES`
+//! callback in `thread.rs`, which only wakes. The endpoint lock, the allocator and the table all
+//! stay in task context.
 
-use alloc::sync::Arc;
+use alloc::{
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use abi::LABEL_TIMER;
+use ostd::{
+    mm::VmSpace,
+    sync::{SpinLock, WaitQueue},
+    task::TaskOptions,
+    timer::Jiffies,
+};
 
 use super::{Endpoint, IpcError, endpoint};
-use crate::{cap::Rights, thread::Thread};
+use crate::{
+    agent::{Agent, Credential},
+    cap::Rights,
+    thread::Thread,
+};
 
 /// Longest delay `arm` accepts, in milliseconds.
 pub const MAX_DELAY_MS: u64 = abi::MAX_TIMEOUT_MS;
@@ -12,9 +34,133 @@ pub const MAX_DELAY_MS: u64 = abi::MAX_TIMEOUT_MS;
 /// Timers one agent may have armed at once.
 pub const MAX_ARMED_PER_AGENT: usize = 16;
 
-/// RED stub: nothing is armed yet.
-pub fn arm(_t: &Thread, _ep: Arc<Endpoint>, _delay_ms: u64, _cookie: u64) -> Result<u64, IpcError> {
-    Err(IpcError::Invalid)
+struct Armed {
+    ep: Arc<Endpoint>,
+    cookie: u64,
+    /// The tick the timer was due; a retry after `Full` moves the key but not this.
+    due: u64,
+    /// The arming agent's credential and the arming thread's tag, stamped on the message.
+    sender: Credential,
+    tag: u64,
+    /// Counts against `MAX_ARMED_PER_AGENT`.
+    agent: u64,
+    /// The address space the arming thread ran in, so a dying space can drop its timers.
+    #[allow(
+        dead_code,
+        reason = "plan 02-06 drops a dying space's timers by this field"
+    )]
+    owner: Option<Weak<VmSpace>>,
+}
+
+/// Armed timers by `(due tick, id)`: the first entry is the next to fire, and equal ticks fire in
+/// arming order.
+// shortcut: one global lock, and the task fires every due entry while holding it; fine for 16
+// timers per agent on one CPU, SMP or many agents want a per-endpoint or sharded table.
+static ARMED: SpinLock<BTreeMap<(u64, u64), Armed>> = SpinLock::new(BTreeMap::new());
+
+/// Timer ids, from 1. Never reused.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The timer task sleeps here; `KICK` changing is its wake condition.
+static TIMER_WQ: WaitQueue = WaitQueue::new();
+static KICK: AtomicU64 = AtomicU64::new(0);
+static TASK_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Arms a timer that sends `LABEL_TIMER` with `[cookie, due, sent, id]` to `ep` once
+/// `delay_ms` (1 to `MAX_DELAY_MS`) has passed, and returns its id. The message is stamped with
+/// `t`'s agent credential and tag. `Invalid` for a delay out of range, `Full` when `t`'s agent
+/// already has `MAX_ARMED_PER_AGENT` armed. It fires between `delay_ms + 1` and `delay_ms + 3`
+/// ticks later: the extra tick covers the part of the current tick already elapsed.
+pub fn arm(t: &Thread, ep: Arc<Endpoint>, delay_ms: u64, cookie: u64) -> Result<u64, IpcError> {
+    if delay_ms == 0 || delay_ms > MAX_DELAY_MS {
+        return Err(IpcError::Invalid);
+    }
+    let sender = t.agent().credential();
+    let owner = t.space().map(|s| Arc::downgrade(&s));
+    let due = Jiffies::elapsed()
+        .as_u64()
+        .saturating_add(delay_ms)
+        .saturating_add(1);
+    let id = {
+        let mut armed = ARMED.lock();
+        if armed
+            .values()
+            .filter(|a| a.agent == sender.agent_id)
+            .count()
+            >= MAX_ARMED_PER_AGENT
+        {
+            return Err(IpcError::Full);
+        }
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        armed.insert(
+            (due, id),
+            Armed {
+                ep,
+                cookie,
+                due,
+                sender,
+                tag: t.tag(),
+                agent: sender.agent_id,
+                owner,
+            },
+        );
+        id
+    };
+    start_task();
+    kick();
+    Ok(id)
+}
+
+fn kick() {
+    KICK.fetch_add(1, Ordering::Release);
+    TIMER_WQ.wake_all();
+}
+
+fn start_task() {
+    if TASK_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // A thread of its own throwaway agent, used only to block: it is in no real agent's budget.
+    let me = Thread::new(Agent::new_root(0, 0));
+    TaskOptions::new(move || run(&me))
+        .spawn()
+        .expect("spawn the timer task");
+}
+
+/// Sends every entry due at `now`. An entry whose endpoint queue is full is retried at the next
+/// tick, so a slow receiver delays a timer and never loses it. The whole pass holds `ARMED`
+/// (preemption off), so no entry is ever out of the table while it is neither sent nor queued.
+fn fire_due(now: u64) {
+    let mut armed = ARMED.lock();
+    let due: Vec<(u64, u64)> = armed.range(..=(now, u64::MAX)).map(|(k, _)| *k).collect();
+    for key in due {
+        let Some(a) = armed.remove(&key) else {
+            continue;
+        };
+        let words = [a.cookie, a.due, now, key.1];
+        if a.ep
+            .push_kernel(LABEL_TIMER, a.sender, a.tag, words)
+            .is_err()
+        {
+            armed.insert((now + 1, key.1), a);
+        }
+    }
+}
+
+fn run(me: &Thread) {
+    loop {
+        // Read before the table: an arm after this either shows in `next` below or changes `KICK`.
+        let seen = KICK.load(Ordering::Acquire);
+        fire_due(Jiffies::elapsed().as_u64());
+        let next = ARMED.lock().keys().next().map(|k| k.0);
+        // Woken (a sooner timer was armed) or timed out (one is due); both mean look again. The
+        // thread is never interrupted, so there is no other outcome.
+        let _ = me.block_until(
+            &TIMER_WQ,
+            || (KICK.load(Ordering::Acquire) != seen).then_some(()),
+            next,
+        );
+    }
 }
 
 /// `SYS_TIMER_ARM`: arms a timer on the endpoint in `slot` (needs SEND); returns the timer id.
@@ -25,12 +171,16 @@ pub fn sys_timer_arm(t: &Thread, slot: usize, delay_ms: u64, cookie: u64) -> Res
 /// Ktest-only: timers armed and not yet sent.
 #[cfg(ktest)]
 pub(crate) fn armed_len() -> usize {
-    0
+    ARMED.lock().len()
 }
 
-/// Ktest-only: forgets every armed timer.
+/// Ktest-only: forgets every armed timer, so none outlives its test and holds a deadline
+/// registration that other tests assert is empty.
 #[cfg(ktest)]
-pub(crate) fn disarm_all() {}
+pub(crate) fn disarm_all() {
+    ARMED.lock().clear();
+    kick();
+}
 
 #[cfg(ktest)]
 mod test {
