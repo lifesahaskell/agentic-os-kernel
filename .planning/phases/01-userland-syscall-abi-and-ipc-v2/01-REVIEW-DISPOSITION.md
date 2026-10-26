@@ -5,7 +5,7 @@ titles: json
 findings:
   - id: CR-01
     severity: critical
-    disposition: open
+    disposition: fixed
     title: "Ring-3 write to a kernel-half address panics the kernel"
   - id: WR-01
     severity: warning
@@ -17,7 +17,7 @@ findings:
     title: "`unreceive` pushes past `QUEUE_LEN` and can hand a stranded caller a second chance only by luck"
   - id: WR-03
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "Frame allocation `unwrap`s turn memory pressure into a kernel panic"
   - id: WR-04
     severity: warning
@@ -63,7 +63,7 @@ findings:
     severity: info
     disposition: open
     title: "`osdk.sh` can leave root-owned files after an interrupted run"
-open: 15
+open: 13
 total: 15
 ---
 
@@ -71,10 +71,10 @@ total: 15
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| CR-01 | critical | open | - |
+| CR-01 | critical | fixed | 40a9da1 (plan 01-08) |
 | WR-01 | warning | open | - |
 | WR-02 | warning | open | - |
-| WR-03 | warning | open | - |
+| WR-03 | warning | fixed | 2ee2116 (plan 01-08) |
 | WR-04 | warning | open | - |
 | WR-05 | warning | open | - |
 | WR-06 | warning | open | - |
