@@ -34,13 +34,14 @@ the boot-time budget check pass in QEMU/KVM). Evidence:
 - ✓ Exceptions delivered as messages to a handler endpoint — B2
 - ✓ Futex wait/wake/requeue across address spaces, keyed by physical address — B2
 - ✓ Boots in QEMU on x86-64 — B2
+- ✓ Ring-3 Rust toolchain, fuzz-safe syscall ABI and call/reply IPC with capability transfer; null-IPC cost measured (QEMU TCG only, no KVM re-run yet) — Phase 1
 
 ### Active
 
 The B3 milestone (POSIX core). Each is a hypothesis until shipped and verified; the roadmap
 turns them into numbered requirements.
 
-- [ ] A syscall surface from ring 3 for capability, IPC, thread and address-space operations (user mode has only `exit` today)
+- [ ] A syscall surface from ring 3 for capability, IPC, thread and address-space operations (capability and IPC calls shipped in Phase 1; thread and address-space operations remain)
 - [ ] Capability-gated address-space clone and a thread capability type, so procmgr can fork and signal on another process's behalf
 - [ ] procmgr: pid, ppid, process groups, sessions, `wait`, `kill` routing, signal delivery over the kernel interrupt/redirect
 - [ ] exec server: ELF loading into a fresh address space
@@ -127,4 +128,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-10-24 after relaxing the unsafe constraint*
+*Last updated: 2026-10-26 after Phase 1*

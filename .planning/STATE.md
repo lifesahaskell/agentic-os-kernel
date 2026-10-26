@@ -20,10 +20,10 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-10-23)
+See: .planning/PROJECT.md (updated 2026-10-26)
 
 **Core value:** The protection boundary knows what an agent is: authority is exactly the set of capability handles an agent holds, and the kernel stamps its identity on every message, while unmodified POSIX programs still run.
-**Current focus:** Phase 01 — Userland, syscall ABI and IPC v2
+**Current focus:** Phase 02 — Process objects, teardown and timers
 
 ## Current Position
 
@@ -83,6 +83,7 @@ None yet.
 - [Phase 1]: All Phase 1 runtime evidence is QEMU TCG, not KVM. OSDK 0.19.0 never emits `-enable-kvm` and OSDK.toml sets no accelerator, so earlier "QEMU/KVM" labels (b2-spike-report.md line 14, 01-04 SUMMARY) are unverified. The WSL2 guest has no `svm` flag, so there is no `/dev/kvm`. IPC-06 (median 5.43M cycles, p99 7.54M, N=10,000, as recorded in ipc-measurements.md; other TCG runs gave 5.45M/7.34M and 5.79M/8.37M) is provisional. Re-run 01-01..01-07 ktests, boot checks and IPC-06 on a KVM host, and decide on `-enable-kvm` in OSDK.toml (the `-cpu Icelake-Server` model may not run under KVM on AMD).
 - [Phase 1]: User-mode FPU/SSE under OSTD 0.19.0 is the highest-risk unknown. Order: safe route, then contained `unsafe` (ledgered, SAFE-01), then Redox re-score only if both fail or an OSTD patch is needed.
 - [Phase 1]: OSTD 0.19.0 docs.rs build failed; read the source for `boot_info()`, initramfs and serial RX.
+- [Phase 2]: Carry-forward from the Phase 1 verification. RR-01: `cow_clone` unwraps and asserts become ring-3 reachable when procmgr fork or spawn calls it (plans 02-06, 02-07); make it fallible or prove the range. RR-03: `futex.rs:88` maps every `handle_cow_fault` error to `FutexError::Budget`. The three frame-allocation failure branches (01-08) are covered by inspection only; OSTD 0.19.0 has no failure injection.
 - [Phase 3]: Open decisions need Corey's sign-off: read-only grant errno (`EROFS` vs `EACCES`) and cross-domain `kill` errno (`ESRCH` vs `EPERM`). One ADR amending option-b.
 - [Phase 4]: musl is the default libc on source-level evidence only; nothing was built. The Phase 4 spike confirms or overturns it.
 - [Phase 6]: KVM on the CI host is assumed, not checked.
