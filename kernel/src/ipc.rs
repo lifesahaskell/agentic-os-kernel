@@ -11,17 +11,18 @@ use alloc::{
 use core::{
     fmt,
     mem::offset_of,
+    ops::Deref,
     sync::atomic::{AtomicU32, Ordering},
 };
 
 use abi::{IpcArgs, LABEL_CANCEL, LABEL_KERNEL_BASE, MAX_IPC_CAPS};
 use ostd::{
-    mm::VmSpace,
+    mm::{PAGE_SIZE, VmSpace},
     sync::{SpinLock, WaitQueue},
 };
 
 use crate::{
-    agent::{Agent, Credential},
+    agent::{Agent, Credential, Payer},
     cap::{Cap, CapError, Object, Rights},
     syscall::{Errno, Handle, UserPtr, UserSlice},
     thread::{BlockError, Thread},
@@ -29,6 +30,58 @@ use crate::{
 };
 
 pub mod timer;
+
+/// Pages charged for staged bytes, returned when the last holder of the charge drops.
+struct StagingCharge {
+    payer: Arc<dyn Payer>,
+    pages: usize,
+}
+
+impl Drop for StagingCharge {
+    fn drop(&mut self) {
+        self.payer.uncharge_pages(self.pages);
+    }
+}
+
+/// Bytes copied into kernel memory for a message or an answer. Bytes a ring-3 caller staged
+/// carry the charge for their pages, so a client cannot pin kernel heap for free; it is returned
+/// once, when the last copy is dropped. Bytes the kernel makes itself carry no charge.
+#[derive(Clone, Default)]
+pub struct Staged {
+    bytes: Vec<u8>,
+    /// Held for its `Drop`, which uncharges.
+    _charge: Option<Arc<StagingCharge>>,
+}
+
+impl Deref for Staged {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl From<Vec<u8>> for Staged {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            _charge: None,
+        }
+    }
+}
+
+impl fmt::Debug for Staged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Staged({} bytes)", self.bytes.len())
+    }
+}
+
+impl Staged {
+    /// The bytes as an owned `Vec`, uncharged; the charge ends with the last `Staged` copy.
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.bytes.clone()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -38,7 +91,7 @@ pub struct Message {
     pub tag: u64,
     pub words: [u64; 4],
     /// The bytes of the sender's `send_buf`, copied at send time.
-    pub data: Vec<u8>,
+    pub data: Staged,
     /// Chosen by the sender and opaque to the kernel, unlike `sender`.
     pub label: u64,
     /// Attenuated copies taken from the sender's capability space at send time; the receiver
@@ -67,7 +120,7 @@ enum ReplyState {
 /// rights).
 pub struct Answer {
     pub words: [u64; 4],
-    pub data: Vec<u8>,
+    pub data: Staged,
     pub caps: Vec<(usize, Rights)>,
 }
 
@@ -95,13 +148,13 @@ impl ReplyWait {
 
     pub fn reply_with(&self, words: [u64; 4], data: Vec<u8>) {
         // Nothing to install, so the one failure (no room) cannot happen.
-        let _ = self.deliver(words, data, &[]);
+        let _ = self.deliver(words, data.into(), &[]);
     }
 
     /// `reply_with` plus `caps`, installed in the caller's agent: all of them or none (`NoRoom`,
     /// nothing delivered, the caller keeps waiting). A caller that no longer exists, or a wait that
     /// is already done or failed, gets nothing: the payload is dropped.
-    fn deliver(&self, words: [u64; 4], data: Vec<u8>, caps: &[Cap]) -> Result<(), IpcError> {
+    fn deliver(&self, words: [u64; 4], data: Staged, caps: &[Cap]) -> Result<(), IpcError> {
         let Some(caller) = self.caller.upgrade() else {
             return Ok(());
         };
@@ -297,7 +350,7 @@ impl Endpoint {
         data: Vec<u8>,
     ) -> Result<([u64; 4], Vec<u8>), IpcError> {
         let a = self.call_caps(from, label, words, data, Vec::new())?;
-        Ok((a.words, a.data))
+        Ok((a.words, a.data.to_vec()))
     }
 
     /// `call_bulk` that also carries `caps` (already derived from the caller's space) and
@@ -307,9 +360,10 @@ impl Endpoint {
         from: &Thread,
         label: u64,
         words: [u64; 4],
-        data: Vec<u8>,
+        data: impl Into<Staged>,
         caps: Vec<Cap>,
     ) -> Result<Answer, IpcError> {
+        let data = data.into();
         self.call_via(from, |reply| {
             self.push(from, label, words, data, caps, Some(reply))
         })
@@ -392,7 +446,7 @@ impl Endpoint {
         from: &Thread,
         label: u64,
         words: [u64; 4],
-        data: Vec<u8>,
+        data: impl Into<Staged>,
         caps: Vec<Cap>,
         reply: Option<Arc<ReplyWait>>,
     ) -> Result<(), IpcError> {
@@ -405,7 +459,7 @@ impl Endpoint {
             tid: from.tid(),
             tag: from.tag(),
             words,
-            data,
+            data: data.into(),
             label,
             caps,
             reply,
@@ -429,7 +483,7 @@ impl Endpoint {
             tid: 0,
             tag,
             words,
-            data: Vec::new(),
+            data: Staged::default(),
             label,
             caps: Vec::new(),
             reply: None,
@@ -464,7 +518,7 @@ impl Endpoint {
                 tid: from.tid(),
                 tag: from.tag(),
                 words,
-                data: Vec::new(),
+                data: Staged::default(),
                 label,
                 caps: Vec::new(),
                 reply,
@@ -589,7 +643,7 @@ fn cancel_message(me: &Thread) -> Message {
         tid: 0,
         tag: 0,
         words: [0; 4],
-        data: Vec::new(),
+        data: Staged::default(),
         label: LABEL_CANCEL,
         caps: Vec::new(),
         reply: None,
@@ -676,14 +730,23 @@ fn user_slice(addr: u64, len: u64) -> Result<UserSlice, Errno> {
 }
 
 /// Copies the caller's bytes into kernel memory, in the caller's own context.
-// shortcut: staging memory is not charged to the sender's agent, so a client can pin
-// MAX_IPC_BYTES * QUEUE_LEN of kernel heap per endpoint; Phase 2 resource accounting charges it.
-fn read_bytes(space: &VmSpace, src: UserSlice) -> Result<Vec<u8>, Errno> {
-    let mut buf = vec![0u8; src.len()];
-    if !buf.is_empty() {
-        copy_from_user(space, &mut buf, src)?;
+/// The pages are charged to `payer` before the allocation, so a refusal is ENOMEM with nothing
+/// allocated; the returned `Staged` gives them back when the last copy drops. Zero bytes charge
+/// nothing.
+fn read_bytes(space: &VmSpace, src: UserSlice, payer: Arc<dyn Payer>) -> Result<Staged, Errno> {
+    if src.is_empty() {
+        return Ok(Staged::default());
     }
-    Ok(buf)
+    let pages = src.len().div_ceil(PAGE_SIZE);
+    payer.charge_pages(pages)?;
+    // From here the charge is owned by `charge`, so every exit returns it.
+    let charge = Arc::new(StagingCharge { payer, pages });
+    let mut bytes = vec![0u8; src.len()];
+    copy_from_user(space, &mut bytes, src)?;
+    Ok(Staged {
+        bytes,
+        _charge: Some(charge),
+    })
 }
 
 /// Writes the first `min(data.len(), dst.len())` bytes of `data` to `dst`, breaking
@@ -742,7 +805,7 @@ pub fn sys_call(
         user_slice(a.send_buf, a.send_len)?,
         user_slice(a.recv_buf, a.recv_len)?,
     );
-    let data = read_bytes(space, send)?;
+    let data = read_bytes(space, send, t.payer())?;
     let caps = derive_caps(t, &arg_caps(&a))?;
     let r = ep.call_caps(t, a.label, a.words, data, caps)?;
     let delivered = write_bytes(t, space, recv, &r.data)
@@ -825,7 +888,7 @@ pub fn sys_recv_args(
 /// `send_buf` and the capabilities named in `a.caps`, copied and derived in the server's context.
 /// A bad buffer, a bad capability or a full caller space leaves the handle usable.
 fn answer(t: &Thread, space: &VmSpace, a: &IpcArgs) -> Result<(), Errno> {
-    let data = read_bytes(space, user_slice(a.send_buf, a.send_len)?)?;
+    let data = read_bytes(space, user_slice(a.send_buf, a.send_len)?, t.payer())?;
     let caps = derive_caps(t, &arg_caps(a))?;
     let w = t
         .replies

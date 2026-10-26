@@ -35,7 +35,7 @@ impl From<CapError> for AgentError {
 
 /// Something that pays for memory in pages: an agent, a space that records what it charged so
 /// teardown can return it, or a private tally. The two halves are inverses.
-pub trait Payer {
+pub trait Payer: Send + Sync {
     /// Charges `pages`, or fails without charging.
     fn charge_pages(&self, pages: usize) -> Result<(), AgentError>;
     /// Returns `pages` previously charged.

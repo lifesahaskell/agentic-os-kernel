@@ -855,6 +855,21 @@ mod test {
     }
 
     #[ktest]
+    fn futex_cow_no_memory_maps_through_from() {
+        use crate::{agent::AgentError, cap::CapError, futex::FutexError};
+        // OSTD 0.19.0 cannot make a frame allocation fail, so the path from a real break that
+        // finds the allocator empty is covered by this mapping and by inspection (D-05).
+        let no_memory = FutexError::from(AgentError::NoMemory);
+        assert_eq!(no_memory, FutexError::NoMemory);
+        assert_eq!(no_memory.errno(), 12);
+        assert_eq!(FutexError::from(AgentError::Budget), FutexError::Budget);
+        assert_eq!(
+            FutexError::from(AgentError::Cap(CapError::Full)),
+            FutexError::Fault
+        );
+    }
+
+    #[ktest]
     fn interrupt_aborts_futex_wait() {
         let img = image_over(
             user_image!("futex_waiter"),
