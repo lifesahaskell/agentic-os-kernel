@@ -80,7 +80,7 @@ None yet.
 
 ### Blockers/Concerns
 
-- [Phase 1]: All Phase 1 runtime evidence is QEMU TCG, not KVM. OSDK 0.19.0 never emits `-enable-kvm` and OSDK.toml sets no accelerator, so earlier "QEMU/KVM" labels (b2-spike-report.md line 14, 01-04 SUMMARY) are unverified. The WSL2 guest has no `svm` flag, so there is no `/dev/kvm`. IPC-06 (median 5.4M cycles, p99 7.3M, N=10,000) is provisional. Re-run 01-01..01-07 ktests, boot checks and IPC-06 on a KVM host, and decide on `-enable-kvm` in OSDK.toml (the `-cpu Icelake-Server` model may not run under KVM on AMD).
+- [Phase 1]: All Phase 1 runtime evidence is QEMU TCG, not KVM. OSDK 0.19.0 never emits `-enable-kvm` and OSDK.toml sets no accelerator, so earlier "QEMU/KVM" labels (b2-spike-report.md line 14, 01-04 SUMMARY) are unverified. The WSL2 guest has no `svm` flag, so there is no `/dev/kvm`. IPC-06 (median 5.43M cycles, p99 7.54M, N=10,000, as recorded in ipc-measurements.md; other TCG runs gave 5.45M/7.34M and 5.79M/8.37M) is provisional. Re-run 01-01..01-07 ktests, boot checks and IPC-06 on a KVM host, and decide on `-enable-kvm` in OSDK.toml (the `-cpu Icelake-Server` model may not run under KVM on AMD).
 - [Phase 1]: User-mode FPU/SSE under OSTD 0.19.0 is the highest-risk unknown. Order: safe route, then contained `unsafe` (ledgered, SAFE-01), then Redox re-score only if both fail or an OSTD patch is needed.
 - [Phase 1]: OSTD 0.19.0 docs.rs build failed; read the source for `boot_info()`, initramfs and serial RX.
 - [Phase 3]: Open decisions need Corey's sign-off: read-only grant errno (`EROFS` vs `EACCES`) and cross-domain `kill` errno (`ESRCH` vs `EPERM`). One ADR amending option-b.
