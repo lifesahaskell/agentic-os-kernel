@@ -211,6 +211,9 @@ pub enum Syscall {
     Recv {
         ep: Handle,
         args: UserPtr<IpcArgs>,
+        /// Milliseconds to wait for a message; 0 waits until one arrives or the thread is
+        /// interrupted.
+        timeout_ms: u64,
     },
     Reply {
         args: UserPtr<IpcArgs>,
@@ -218,6 +221,8 @@ pub enum Syscall {
     ReplyRecv {
         ep: Handle,
         args: UserPtr<IpcArgs>,
+        /// As for `Recv`; the reply half is never timed.
+        timeout_ms: u64,
     },
 }
 
@@ -270,6 +275,7 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
         SYS_RECV => Syscall::Recv {
             ep: Handle::new(a[0])?,
             args: UserPtr::new(a[1])?,
+            timeout_ms: a[2] as u64,
         },
         SYS_REPLY => Syscall::Reply {
             args: UserPtr::new(a[0])?,
@@ -277,6 +283,7 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
         SYS_REPLY_RECV => Syscall::ReplyRecv {
             ep: Handle::new(a[0])?,
             args: UserPtr::new(a[1])?,
+            timeout_ms: a[2] as u64,
         },
         _ => return Err(Errno::ENOSYS),
     })
@@ -367,9 +374,11 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
                 .map_err(Errno::from),
         ),
         Syscall::Call { ep, args } => ret(ipc::sys_call(t, space, ep, args).map(|()| 0)),
-        Syscall::Recv { ep, args } => ret(ipc::sys_recv_args(t, space, ep, args).map(|()| 0)),
+        Syscall::Recv { ep, args, .. } => ret(ipc::sys_recv_args(t, space, ep, args).map(|()| 0)),
         Syscall::Reply { args } => ret(ipc::sys_reply(t, space, args).map(|()| 0)),
-        Syscall::ReplyRecv { ep, args } => ret(ipc::sys_reply_recv(t, space, ep, args).map(|()| 0)),
+        Syscall::ReplyRecv { ep, args, .. } => {
+            ret(ipc::sys_reply_recv(t, space, ep, args).map(|()| 0))
+        }
     }
 }
 
@@ -511,6 +520,7 @@ mod test {
             Ok(Syscall::Recv {
                 ep: Handle::new(3).unwrap(),
                 args: UserPtr::new(0x1000).unwrap(),
+                timeout_ms: 0,
             })
         );
         assert_eq!(
@@ -524,6 +534,7 @@ mod test {
             Ok(Syscall::ReplyRecv {
                 ep: Handle::new(3).unwrap(),
                 args: UserPtr::new(0x1000).unwrap(),
+                timeout_ms: 0,
             })
         );
         assert_eq!(
@@ -536,6 +547,31 @@ mod test {
                 cmp: Some(9),
             })
         );
+    }
+
+    #[ktest]
+    fn decode_recv_timeout_is_bounded() {
+        let at = |nr, ms| decode(nr, [3, 0x1000, ms, 0, 0, 0]);
+        for nr in [SYS_RECV, SYS_REPLY_RECV] {
+            let want = |timeout_ms| match nr {
+                SYS_RECV => Syscall::Recv {
+                    ep: Handle::new(3).unwrap(),
+                    args: UserPtr::new(0x1000).unwrap(),
+                    timeout_ms,
+                },
+                _ => Syscall::ReplyRecv {
+                    ep: Handle::new(3).unwrap(),
+                    args: UserPtr::new(0x1000).unwrap(),
+                    timeout_ms,
+                },
+            };
+            assert_eq!(at(nr, 0), Ok(want(0)), "nr {nr:#x}: 0 is no timeout");
+            assert_eq!(at(nr, 20), Ok(want(20)));
+            let max = abi::MAX_TIMEOUT_MS as usize;
+            assert_eq!(at(nr, max), Ok(want(max as u64)));
+            assert_eq!(at(nr, max + 1), Err(Errno::EINVAL), "nr {nr:#x}");
+            assert_eq!(at(nr, usize::MAX), Err(Errno::EINVAL));
+        }
     }
 
     /// xorshift64: deterministic, so a failing case index reproduces.
@@ -622,7 +658,7 @@ mod test {
 
         // Each decode and copy error path once, with its exact errno.
         let z = [0usize; 6];
-        let targeted: [(usize, [usize; 6], isize); 13] = [
+        let targeted: [(usize, [usize; 6], isize); 14] = [
             (0xFFFF, z, errno::ENOSYS),
             (SYS_FUTEX, [mapped, 99, 0, 0, 0, 0], errno::ENOSYS),
             // The timeout pointer is address 1, which is unmapped.
@@ -643,6 +679,8 @@ mod test {
             (SYS_CALL, [1 << 40, mapped, 0, 0, 0, 0], errno::EBADF),
             (SYS_CALL, [5, mapped, 0, 0, 0, 0], errno::EBADF),
             (SYS_CALL, [0, mapped, 0, 0, 0, 0], errno::EINTR),
+            // A receive timeout above the cap is refused at decode, before any slot is looked up.
+            (SYS_RECV, [1, mapped, 600_001, 0, 0, 0], errno::EINVAL),
         ];
         for (i, (nr, a, want)) in targeted.into_iter().enumerate() {
             assert_eq!(

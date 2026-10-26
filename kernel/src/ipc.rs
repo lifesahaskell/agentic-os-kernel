@@ -374,6 +374,19 @@ impl Endpoint {
         )?
     }
 
+    // RED stubs: the deadline is not honoured yet.
+    pub fn recv_until(&self, _me: &Thread, _deadline: Option<u64>) -> Result<Message, IpcError> {
+        Err(IpcError::Invalid)
+    }
+
+    pub fn recv_parked_until(
+        &self,
+        _me: &Thread,
+        _deadline: Option<u64>,
+    ) -> Result<(Message, u64), IpcError> {
+        Err(IpcError::Invalid)
+    }
+
     /// Undoes a `recv_parked` whose delivery to ring 3 failed, so the call is not lost.
     fn unreceive(&self, me: &Thread, mut m: Message, handle: u64) {
         if m.label == LABEL_CANCEL {
@@ -789,6 +802,102 @@ mod test {
             Task::yield_now();
         }
         assert_eq!(result.lock().take().unwrap().unwrap().words[0], 7);
+    }
+
+    /// OD-09: a wait of D ticks ends in [D+1, D+3] ticks on `-smp 1` with nothing else runnable.
+    #[ktest]
+    fn timeout_recv_expires_within_tolerance() {
+        const D: u64 = 10;
+        let (server, _client) = pair();
+        let ep = endpoint(&server, 0, Rights::RECV).unwrap();
+
+        // Warm-up, not measured: the first timed wait registers the deadline callback and runs
+        // every path cold, which under QEMU TCG costs a few extra ticks.
+        let now = Jiffies::elapsed().as_u64();
+        assert_eq!(
+            ep.recv_until(&server, Some(now + 3)).err(),
+            Some(IpcError::TimedOut)
+        );
+
+        let start = Jiffies::elapsed().as_u64();
+        let r = ep.recv_until(&server, Some(start + D + 1));
+        let elapsed = Jiffies::elapsed().as_u64() - start;
+        println!("aok: timeout_recv kernel D={} elapsed={} ticks", D, elapsed);
+        assert_eq!(r.err(), Some(IpcError::TimedOut));
+        assert!((D + 1..=D + 3).contains(&elapsed), "elapsed {elapsed}");
+
+        let start = Jiffies::elapsed().as_u64();
+        let r = ep.recv_parked_until(&server, Some(start + D + 1));
+        let elapsed = Jiffies::elapsed().as_u64() - start;
+        assert_eq!(r.err(), Some(IpcError::TimedOut));
+        assert!(
+            (D + 1..=D + 3).contains(&elapsed),
+            "parked elapsed {elapsed}"
+        );
+        assert_eq!(crate::thread::pending_deadlines(), 0);
+    }
+
+    #[ktest]
+    fn timeout_recv_message_beats_deadline() {
+        let (server, client) = pair();
+        let ep = endpoint(&server, 0, Rights::RECV).unwrap();
+        let far = || Some(Jiffies::elapsed().as_u64() + 50);
+
+        // Queued before the call: returned at once, and the deadline entry does not linger.
+        sys_send(&client, 0, [5, 0, 0, 0]).unwrap();
+        let m = ep.recv_until(&server, far()).unwrap();
+        assert_eq!(m.words[0], 5);
+        assert_eq!(crate::thread::pending_deadlines(), 0);
+
+        sys_send(&client, 0, [6, 0, 0, 0]).unwrap();
+        let (m, handle) = ep.recv_parked_until(&server, far()).unwrap();
+        assert_eq!((m.words[0], handle), (6, 0));
+        assert_eq!(crate::thread::pending_deadlines(), 0);
+
+        // Sent while the receiver is blocked, well inside the deadline.
+        let result: Arc<SpinLock<Option<Result<Message, IpcError>>>> =
+            Arc::new(SpinLock::new(None));
+        let (t, e, r, due) = (server.clone(), ep.clone(), result.clone(), far());
+        TaskOptions::new(move || *r.lock() = Some(e.recv_until(&t, due)))
+            .spawn()
+            .unwrap();
+        wait_blocked(&server);
+        sys_send(&client, 0, [7, 0, 0, 0]).unwrap();
+        while result.lock().is_none() {
+            Task::yield_now();
+        }
+        assert_eq!(result.lock().take().unwrap().unwrap().words[0], 7);
+        assert_eq!(crate::thread::pending_deadlines(), 0);
+    }
+
+    #[ktest]
+    fn timeout_recv_ring3_never_early() {
+        let agent = Agent::new_root(1, 64);
+        let slot = agent
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Endpoint(Endpoint::new()), Rights::RECV))
+            .unwrap();
+        assert_eq!(slot, 0);
+        let img = load_image(user_image!("timeout")).unwrap();
+        let t = Thread::new(agent);
+
+        let start = Jiffies::elapsed().as_u64();
+        let exit = spawn_image(&t, &img, 1);
+        // A program still waiting after 200 ticks has no working timeout: free it so the test
+        // fails instead of hanging.
+        while exit.lock().is_none() && Jiffies::elapsed().as_u64() - start < 200 {
+            Task::yield_now();
+        }
+        let elapsed = Jiffies::elapsed().as_u64() - start;
+        if exit.lock().is_none() {
+            t.interrupt(img.handler);
+        }
+        let code = join(&exit);
+        println!("aok: timeout_recv ring3 20 ms elapsed={} ticks", elapsed);
+
+        assert_eq!(code, Exit::Code(0));
+        assert!((20..=40).contains(&elapsed), "elapsed {elapsed}");
     }
 
     type Log = Arc<SpinLock<Vec<(u64, [u64; 4])>>>;
