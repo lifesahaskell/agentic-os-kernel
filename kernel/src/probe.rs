@@ -12,7 +12,24 @@
 //! ones read here (assumption A1, decided by `frame_probe_spike_counts_one_frame`). A second,
 //! unregistered copy would read 0.
 
-use ostd::mm::PAGE_SIZE;
+//! # Protocol: park, settle, read
+//!
+//! Two raw `free()` reads around an address space's life disagree for two reasons that are not
+//! leaks. Frames freed through RCU are returned only after grace periods, which OSTD advances in
+//! `switch_to_task` (a bare yield with no other runnable task switches nothing). And the per-CPU
+//! activated-space slot pins the last space `activate`d, with its page-table nodes. `settled()`
+//! is the one protocol the leak gates call before each read they compare: `park_activation`
+//! (activate a never-mapped dummy space, releasing whatever the slot pinned), `settle` (force real
+//! task switches), then `free()`.
+
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use ostd::{
+    mm::{PAGE_SIZE, VmSpace},
+    sync::{LocalIrqDisabled, SpinLock},
+    task::{Task, TaskOptions},
+};
 
 /// Free frame-allocator bytes plus slab bytes, now. Two reads are comparable only when both
 /// were taken after the same protocol; see the gates in 02-07 and 02-09.
@@ -20,26 +37,54 @@ pub fn free() -> usize {
     osdk_frame_allocator::load_total_free_size() + osdk_heap_allocator::load_total_slab_size()
 }
 
-// RED stubs: the protocol has the right signatures and does nothing yet.
+/// Settle rounds `settled()` runs before it reads. Calibrated: the SUMMARY of 02-11 records the
+/// logged delta curve after 1, 2, 4, 8 and 16 rounds. Raise it if the 16-round line ever shows a
+/// smaller delta than the 8-round line.
 pub const SETTLE_ROUNDS: usize = 8;
 
-pub fn settle(_rounds: usize) {}
+/// Runs `rounds` rounds of a no-op peer kernel task. The peer carries no task data, so
+/// `sched::eligible` always admits it, and the caller yields until the peer has run. Each round
+/// forces at least two real task switches, which is where OSTD advances RCU grace periods.
+pub fn settle(rounds: usize) {
+    for _ in 0..rounds {
+        let done = Arc::new(AtomicBool::new(false));
+        let peer = done.clone();
+        TaskOptions::new(move || peer.store(true, Ordering::Release))
+            .spawn()
+            .unwrap();
+        while !done.load(Ordering::Acquire) {
+            Task::yield_now();
+        }
+    }
+}
 
-pub fn park_activation() {}
+/// The dummy space `park_activation` activates. Created once and never mapped, so it pins the
+/// same root frame during every read.
+static PARK: SpinLock<Option<Arc<VmSpace>>, LocalIrqDisabled> = SpinLock::new(None);
 
+/// Activates the never-mapped dummy space, which releases the space the per-CPU slot pinned
+/// before.
+pub fn park_activation() {
+    let dummy = PARK
+        .lock()
+        .get_or_insert_with(|| Arc::new(VmSpace::new()))
+        .clone();
+    dummy.activate();
+}
+
+/// The probe protocol: park, settle, then read. Call it before each read you compare.
 pub fn settled() -> usize {
+    park_activation();
+    settle(SETTLE_ROUNDS);
     free()
 }
 
 #[cfg(ktest)]
 mod test {
-    use alloc::{boxed::Box, sync::Arc, vec::Vec};
+    use alloc::{boxed::Box, vec::Vec};
 
     use ostd::{
-        mm::{
-            CachePolicy, FrameAllocOptions, PageFlags, PageProperty, Vaddr, VmSpace,
-            tlb::TlbFlushOp,
-        },
+        mm::{CachePolicy, FrameAllocOptions, PageFlags, PageProperty, Vaddr, tlb::TlbFlushOp},
         prelude::*,
         task::disable_preempt,
     };
