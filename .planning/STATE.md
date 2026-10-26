@@ -1,15 +1,15 @@
 ---
 gsd_state_version: "1.0"
-current_phase: 1
+current_phase: 01
 current_phase_name: Userland, syscall ABI and IPC v2
 status: executing
 stopped_at: context exhaustion at 99% (2026-10-24)
-last_updated: "2026-10-25T19:24:05.365Z"
+last_updated: "2026-10-25T20:25:31.867Z"
 last_activity: 2026-10-25
-last_activity_desc: Phase 1 execution resumed (wave continue)
-state_head: 093e9f170933c6d5d8713ff8a1dc9d50d2339f27
+last_activity_desc: Phase 01 execution started
+state_head: 3e400bce0857aaac0ebd2da3ea16b7eadcd9537b
 progress:
-  total_phases: 6
+  total_phases: 7
   completed_phases: 0
   total_plans: 7
   completed_plans: 6
@@ -23,14 +23,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-23)
 
 **Core value:** The protection boundary knows what an agent is: authority is exactly the set of capability handles an agent holds, and the kernel stamps its identity on every message, while unmodified POSIX programs still run.
-**Current focus:** Phase 1 — Userland, syscall ABI and IPC v2
+**Current focus:** Phase 01 — Userland, syscall ABI and IPC v2
 
 ## Current Position
 
-Phase: 1 (Userland, syscall ABI and IPC v2) — EXECUTING
+Phase: 01 (Userland, syscall ABI and IPC v2) — EXECUTING
 Plan: 7 of 7
-Status: Ready to execute
-Last activity: 2026-10-25 - Completed quick task 261025-jbm: Ingest recursivemas and aide2 papers into the wiki
+Status: Executing Phase 01
+Last activity: 2026-10-25 — Phase 01 execution started
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -70,12 +70,17 @@ Recent decisions affecting current work:
 - [Roadmap]: Requirement maps to the phase that builds its primary component; later legs are separate requirements.
 - [Phase 1]: 01-01: abi path dependency resolves under OSDK; Message is Clone (not Copy) carrying Arc<ReplyWait>; sys_call rejects buffer/cap fields until later plans
 
+### Roadmap Evolution
+
+- Phase 7 added (2026-10-25): Recursion and cheap-inference spikes. Post-MVP, after Phase 6; source is docs/architecture/research/recursion-and-cheap-inference-spikes.md.
+
 ### Pending Todos
 
 None yet.
 
 ### Blockers/Concerns
 
+- [Phase 1]: All Phase 1 runtime evidence is QEMU TCG, not KVM. OSDK 0.19.0 never emits `-enable-kvm` and OSDK.toml sets no accelerator, so earlier "QEMU/KVM" labels (b2-spike-report.md line 14, 01-04 SUMMARY) are unverified. The WSL2 guest has no `svm` flag, so there is no `/dev/kvm`. IPC-06 (median 5.4M cycles, p99 7.3M, N=10,000) is provisional. Re-run 01-01..01-07 ktests, boot checks and IPC-06 on a KVM host, and decide on `-enable-kvm` in OSDK.toml (the `-cpu Icelake-Server` model may not run under KVM on AMD).
 - [Phase 1]: User-mode FPU/SSE under OSTD 0.19.0 is the highest-risk unknown. Order: safe route, then contained `unsafe` (ledgered, SAFE-01), then Redox re-score only if both fail or an OSTD patch is needed.
 - [Phase 1]: OSTD 0.19.0 docs.rs build failed; read the source for `boot_info()`, initramfs and serial RX.
 - [Phase 3]: Open decisions need Corey's sign-off: read-only grant errno (`EROFS` vs `EACCES`) and cross-domain `kill` errno (`ESRCH` vs `EPERM`). One ADR amending option-b.

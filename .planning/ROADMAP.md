@@ -42,6 +42,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 4: exec and procmgr** - Static exec, fork/spawn/wait, process state machine, credential inheritance, libc ADR
 - [ ] **Phase 5: Signals, sessions and tty** - Signal delivery and EINTR contract, fault-to-signal, job control, ttyd, pty, locks, poll
 - [ ] **Phase 6: libc, BusyBox, conformance and measurement** - musl port, `ash`, os-test CI gate, Linux-relative timings, agentic audit
+- [ ] **Phase 7: Recursion and cheap-inference spikes** - post-MVP: containment, first self-improvement loop, ignition and reward-hacking measurement, 16 GB inference baseline
 
 ## Phase Details
 
@@ -60,7 +61,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Research:** research-phase AND spike. Read the OSTD 0.19.0 source (docs.rs failed for 0.19.0): user-mode FPU/SSE enablement and per-thread save (highest-risk unknown; a musl binary cannot run without it), OSDK initramfs key and `boot_info()` contents, serial RX, custom target flags, LLVM 21 in the image. Spike: frame-level cross-space copy and CoW-break order (inferred, never run), the cancel-then-wait protocol (no tested precedent here), whether `VmSpace::activate` keeps TLB entries.
 **Decisions due:** `libaok` sits on `posix-client`; Linux syscall numbers stop at `libaok` and server protocols are POSIX-operation granular. Per-thread `tid`/`tag` is the process identity, badged endpoints only for server-to-server delegation. Cancel semantics replace the older "interrupt aborts blocked IPC" wording; abort-at-once stays for a blocked `recv`. One custom user target JSON for all user code.
-**Plans:** 6/7 plans executed
+**Plans:** 7/7 plans executed
 
 Plans:
 **Wave 1**
@@ -80,7 +81,7 @@ Plans:
 - [x] 01-06-PLAN.md — Cancel-then-wait and capability transfer with attenuation (W5)
 
 **Wave 6** *(blocked on Wave 5 completion)*
-- [ ] 01-07-PLAN.md — Port B2 byte programs to Rust bins, null-IPC measurement, full gate green (W6)
+- [x] 01-07-PLAN.md — Port B2 byte programs to Rust bins, null-IPC measurement, full gate green (W6)
 
 ### Phase 2: Process objects, teardown and timers
 
@@ -97,7 +98,34 @@ Plans:
 
 **Research:** spike required. `thread_create` from a syscall onto an OSTD `Task`, the scheduler protocol (reverse-engineered from source), idle task versus `pick_next`. Add scheduler-protocol ktests and pin OSTD and the toolchain, since each OSTD upgrade is a deliberate task.
 **Decisions due:** Saved-context stack holds FPU state (revisit only if OSTD cannot). Self-memory calls (`mmap`, `brk`, `mprotect`) are cap-less syscalls on the caller's own space, not routed through procmgr. Scope the kernel calls LIBC-04 needs (set-FS-base, thread create for musl start-up, exit-and-unmap) here so Phase 6 does not reopen the kernel; they are verified under LIBC-04.
-**Plans:** TBD
+**Plans:** 10 plans
+
+Plans:
+**Wave 1**
+- [ ] 02-01-PLAN.md — Idle task and boot halt check, scheduler-protocol ktests, exact OSTD and toolchain pins (W1)
+- [ ] 02-02-PLAN.md — Timed futex and recv waits, timer that messages an endpoint (W1, parallel with 02-01)
+- [ ] 02-03-PLAN.md — Server CPU exemption sign-off (OD-05 checkpoint), per-client request ledger, ADR 0003, PROJECT.md wording (W1, parallel with 02-01)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [ ] 02-04-PLAN.md — Space and Thread capabilities, thread_create and thread_interrupt from ring 3 (W2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 02-05-PLAN.md — Exit and fault notes to the space endpoint naming tid and tag (W3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+- [ ] 02-06-PLAN.md — Teardown model sign-off (OD-04/07/08 checkpoint), process teardown and kill, 10,000x fork+exit loop (W4)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+- [ ] 02-07-PLAN.md — Agent retirement, charged staging and CoW breaks, timer cleanup, counters and frame probe (W5)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+- [ ] 02-08-PLAN.md — Kernel-held saved-context stack and SYS_SIGRETURN (W6)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+- [ ] 02-09-PLAN.md — mmap, munmap, mprotect and brk on the caller's space, ENOMEM past budget from ring 3 (W7)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+- [ ] 02-10-PLAN.md — arch_prctl FS base, exit-and-unmap, clear_tid zeroed and woken at exit (W8)
 
 ### Phase 3: Bootstrap, server runtime and vfs
 
@@ -167,16 +195,29 @@ Plans:
 **Decisions due:** Verify whether musl's `posix_spawn` uses `clone(CLONE_VM|CLONE_VFORK)` in the pin and map it to the procmgr `SPAWN`. No os-test target tier is set here (B5 owns it); the allowlist baseline is whatever the first full run produces.
 **Plans:** TBD
 
+### Phase 7: Recursion and cheap-inference spikes
+
+**Goal:** As the researcher, I want the recursion and cheap-GPU inference spikes run after the B3 MVP, so that I know whether a contained self-improvement loop works at this scale before building on it.
+**Depends on:** Phase 6 (post-MVP: nothing here is scheduled before Phase 6 completes, decided 2026-10-25)
+**Requirements:** TBD
+**Source:** [recursion-and-cheap-inference-spikes.md](../docs/architecture/research/recursion-and-cheap-inference-spikes.md). Thresholds there are *proposed*; each spike measures its baseline first and fixes the threshold before the experiment.
+**Order:** S0 (containment) gates S1 to S3. S4 to S6 are independent of S0. K1 to K3 are design-only and consume S4 numbers.
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 7 to break down)
+
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6.
+Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7.
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Userland, syscall ABI and IPC v2 | 6/7 | In Progress | - |
+| 1. Userland, syscall ABI and IPC v2 | 7/7 | In Progress | - |
 | 2. Process objects, teardown and timers | 0/0 | Not started | - |
 | 3. Bootstrap, server runtime and vfs | 0/0 | Not started | - |
 | 4. exec and procmgr | 0/0 | Not started | - |
 | 5. Signals, sessions and tty | 0/0 | Not started | - |
 | 6. libc, BusyBox, conformance and measurement | 0/0 | Not started | - |
+| 7. Recursion and cheap-inference spikes | 0/0 | Not started | - |
