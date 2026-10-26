@@ -1,7 +1,7 @@
 //! The agent object: a protection domain with a kernel-stamped credential, a root capability
 //! space, a parent link, and memory and CPU budgets carved out of its parent's.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ostd::sync::{LocalIrqDisabled, SpinLock};
@@ -23,6 +23,8 @@ pub enum AgentError {
     /// A frame allocation failed: the machine is out of memory, not the agent's budget.
     NoMemory,
     Cap(CapError),
+    /// The agent is retiring or retired and takes no new space and no new child (D-02).
+    Retired,
 }
 
 impl From<CapError> for AgentError {
@@ -70,6 +72,31 @@ struct CpuUse {
     total: u64,
 }
 
+/// Where an agent is in its life. `Retiring` begins when the last counted Space is gone (D-02) and
+/// lasts until the agent's own children are gone too; `Retired` is the end, and the carve is back
+/// with the parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    Live,
+    Retiring,
+    Retired,
+}
+
+/// The retirement ledger of one agent.
+///
+/// Lock rule: `life` is taken before `cspace`, and no code holds `life` while it drops
+/// capabilities or calls into the parent. Both can come back into this agent or the parent's
+/// `life` (a dropped capability can be the last reference to a Space or an Agent).
+struct Life {
+    stage: Stage,
+    /// Counted Spaces that exist (`enter_space` raises it, `leave_space` lowers it).
+    spaces: usize,
+    /// Child agents whose carve this agent has not yet got back.
+    children: usize,
+    /// Set under the lock by whoever sends the carve back, so it goes back at most once.
+    carve_returned: bool,
+}
+
 pub struct Agent {
     cred: Credential,
     pub cspace: SpinLock<CSpace>,
@@ -80,9 +107,20 @@ pub struct Agent {
     cpu_carved_ticks: AtomicU64,
     // IRQ-safe: charged from the timer interrupt.
     cpu: SpinLock<CpuUse, LocalIrqDisabled>,
+    life: SpinLock<Life>,
+    /// The agent that carved this one's budgets. Weak, so a child never keeps its parent alive.
+    parent: Option<Weak<Agent>>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Agents that exist: raised by `build`, lowered when one is dropped.
+static LIVE_AGENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Agents that exist now, for the leak checks.
+pub fn live_agents() -> usize {
+    LIVE_AGENTS.load(Ordering::Acquire)
+}
 
 impl Agent {
     /// A root agent with a whole CPU. Only the kernel's boot path creates these; everything
@@ -90,6 +128,7 @@ impl Agent {
     pub fn new_root(on_behalf_of: u64, mem_limit_pages: usize) -> Arc<Self> {
         Self::build(
             on_behalf_of,
+            None,
             None,
             mem_limit_pages,
             CPU_PERIOD_TICKS,
@@ -100,11 +139,13 @@ impl Agent {
     fn build(
         on_behalf_of: u64,
         parent: Option<u64>,
+        parent_link: Option<Weak<Agent>>,
         limit: usize,
         cpu_quota_ticks: u64,
         cspace: CSpace,
     ) -> Arc<Self> {
         let agent_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        LIVE_AGENTS.fetch_add(1, Ordering::AcqRel);
         Arc::new(Self {
             cred: Credential {
                 agent_id,
@@ -117,6 +158,13 @@ impl Agent {
             cpu_quota_ticks,
             cpu_carved_ticks: AtomicU64::new(0),
             cpu: SpinLock::new(CpuUse::default()),
+            life: SpinLock::new(Life {
+                stage: Stage::Live,
+                spaces: 0,
+                children: 0,
+                carve_returned: false,
+            }),
+            parent: parent_link,
         })
     }
 
@@ -126,6 +174,16 @@ impl Agent {
 
     pub fn mem_used_pages(&self) -> usize {
         self.mem_used_pages.load(Ordering::Relaxed)
+    }
+
+    /// Ticks per period this agent has carved out for its children.
+    pub fn cpu_carved_ticks(&self) -> u64 {
+        self.cpu_carved_ticks.load(Ordering::Relaxed)
+    }
+
+    /// True from the moment retirement begins, whether or not the carve is back yet.
+    pub fn is_retired(&self) -> bool {
+        self.life.lock().stage != Stage::Live
     }
 
     /// Charges `pages` against the memory budget, or fails without charging.
@@ -182,10 +240,31 @@ impl Agent {
     }
 
     /// A child agent holding only attenuated copies of the listed parent slots, with memory and
-    /// CPU budgets carved out of the parent's. The child inherits the human principal.
-    // shortcut: carved budget is never returned to the parent, add on agent teardown.
+    /// CPU budgets carved out of the parent's. The child inherits the human principal. The carve
+    /// comes back when the child retires (see `retire`); `Retired` once this agent is retiring.
     pub fn spawn_child(
-        &self,
+        self: &Arc<Self>,
+        grants: &[(usize, Rights)],
+        mem_limit_pages: usize,
+        cpu_quota_ticks: u64,
+    ) -> Result<Arc<Self>, AgentError> {
+        {
+            let mut life = self.life.lock();
+            if life.stage != Stage::Live {
+                return Err(AgentError::Retired);
+            }
+            life.children += 1;
+        }
+        let child = self.carve_child(grants, mem_limit_pages, cpu_quota_ticks);
+        if child.is_err() {
+            self.child_gone();
+        }
+        child
+    }
+
+    /// The part of `spawn_child` after the child is counted: derive, carve, charge.
+    fn carve_child(
+        self: &Arc<Self>,
         grants: &[(usize, Rights)],
         mem_limit_pages: usize,
         cpu_quota_ticks: u64,
@@ -214,10 +293,126 @@ impl Agent {
         Ok(Self::build(
             c.on_behalf_of,
             Some(c.agent_id),
+            Some(Arc::downgrade(self)),
             mem_limit_pages,
             cpu_quota_ticks,
             cspace,
         ))
+    }
+
+    /// Counts one more Space of this agent, or `Retired` when the agent has begun to retire.
+    pub fn enter_space(&self) -> Result<(), AgentError> {
+        let mut life = self.life.lock();
+        if life.stage != Stage::Live {
+            return Err(AgentError::Retired);
+        }
+        life.spaces += 1;
+        Ok(())
+    }
+
+    /// One counted Space is gone. When it was the last and this is a child agent, retirement
+    /// begins (D-02). A root agent never retires on its own.
+    pub fn leave_space(&self) {
+        let begin = {
+            let mut life = self.life.lock();
+            debug_assert!(life.spaces > 0, "leave_space without enter_space");
+            life.spaces = life.spaces.saturating_sub(1);
+            let last = life.spaces == 0 && life.stage == Stage::Live && self.parent.is_some();
+            if last {
+                life.stage = Stage::Retiring;
+            }
+            last
+        };
+        if begin {
+            self.retire();
+        }
+    }
+
+    /// Retirement, begun by `leave_space` at the last counted Space (D-01, D-02): the CSpace is
+    /// drained and closed at once, then the carve goes back to the parent once this agent's own
+    /// children are gone (D-08).
+    ///
+    /// Capabilities this agent derived to others are not touched: transfer is `derive`, a copy, so
+    /// the kernel revokes nothing here and the copies survive (D-01).
+    ///
+    /// Known gaps:
+    /// - pages still staged in messages a retired agent sent are counted against nobody until
+    ///   those messages are consumed;
+    /// - procmgr's exec must build the new space before the old one is torn down, or the agent
+    ///   retires between the two (D-02's stated consequence);
+    /// - an agent dropped while it still has children never returns its carve: a leak toward its
+    ///   parent, never a double spend;
+    /// - a retiring owner refused by `Space::from_clone` is reported as `CloneError::Budget`.
+    fn retire(&self) {
+        let caps = {
+            let mut cspace = self.cspace.lock();
+            let caps = cspace.drain();
+            cspace.close();
+            caps
+        };
+        // Outside the lock: dropping one can drop a Space or an Agent, and that can come back
+        // here through `child_gone`.
+        drop(caps);
+        self.finish_if_childless();
+    }
+
+    /// Ends a retirement that has no children left to wait for, and sends the carve back. The
+    /// stage and the flag change under one lock hold, so whoever gets here first sends it and
+    /// nobody sends it twice.
+    fn finish_if_childless(&self) {
+        let done = {
+            let mut life = self.life.lock();
+            let done = life.stage == Stage::Retiring && life.children == 0 && !life.carve_returned;
+            if done {
+                life.stage = Stage::Retired;
+                life.carve_returned = true;
+            }
+            done
+        };
+        if done {
+            self.return_carve();
+        }
+    }
+
+    /// Gives this agent's carve back to the parent and tells it one child is gone. A parent that
+    /// no longer exists has nothing to take it.
+    fn return_carve(&self) {
+        let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        parent.uncharge_pages(self.mem_limit_pages);
+        parent
+            .cpu_carved_ticks
+            .fetch_sub(self.cpu_quota_ticks, Ordering::AcqRel);
+        parent.child_gone();
+    }
+
+    /// A child's carve is back. When this agent was waiting only for its last child, its own
+    /// retirement finishes now, and its carve goes one level further up (the D-08 cascade).
+    fn child_gone(&self) {
+        {
+            let mut life = self.life.lock();
+            life.children = life.children.saturating_sub(1);
+        }
+        self.finish_if_childless();
+    }
+}
+
+impl Drop for Agent {
+    /// A child that never had a counted Space still returns its budget.
+    fn drop(&mut self) {
+        LIVE_AGENTS.fetch_sub(1, Ordering::AcqRel);
+        let give_back = {
+            let mut life = self.life.lock();
+            let give = self.parent.is_some() && !life.carve_returned && life.children == 0;
+            if give {
+                life.carve_returned = true;
+            }
+            give
+        };
+        if give_back {
+            self.return_carve();
+        }
     }
 }
 
@@ -289,7 +484,8 @@ mod test {
             parent.spawn_child(&[], 7, 1).err(),
             Some(AgentError::Budget)
         );
-        parent.spawn_child(&[], 0, 8).unwrap();
+        // Held: a child dropped without ever running a process returns its carve at once.
+        let _carved = parent.spawn_child(&[], 0, 8).unwrap();
         assert!(
             !parent.has_cpu(0),
             "all 10 ticks carved; nothing left for the parent"

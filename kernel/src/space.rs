@@ -68,56 +68,111 @@ pub struct Space {
     torn: AtomicBool,
     /// Whether teardown unmaps `vm`. False when the caller keeps the memory (`adopt`).
     owns_vm: bool,
+    /// Whether this space is one of its owner's counted spaces: teardown then calls
+    /// `owner.leave_space()`, and the owner retires when the last one goes (D-02). Never true for
+    /// an adopted space (OD-19): the caller keeps that memory and the agent's life is its own.
+    counted: bool,
 }
 
 impl Space {
-    fn build(vm: Arc<VmSpace>, owner: Arc<Agent>, charged: usize, owns_vm: bool) -> Arc<Space> {
+    /// The one constructor. `counted` says the owner's `enter_space` succeeded for this space;
+    /// `dying` is set for a space born after its owner began to retire, so `register` refuses it.
+    fn build(
+        vm: Arc<VmSpace>,
+        owner: Arc<Agent>,
+        charged: usize,
+        owns_vm: bool,
+        counted: bool,
+        dying: bool,
+    ) -> Arc<Space> {
         Arc::new(Space {
             vm,
             owner,
             threads: SpinLock::new(Vec::new()),
             notify: SpinLock::new(None),
             charged_pages: AtomicUsize::new(charged),
-            dying: AtomicBool::new(false),
+            dying: AtomicBool::new(dying),
             torn: AtomicBool::new(false),
             owns_vm,
+            counted,
         })
     }
 
     /// A space that owns `vm`: teardown unmaps it. Charges nothing, so the ledger starts empty.
+    /// When `owner` has begun to retire, the space is born dying and `register` answers `Dead`.
     pub fn new(vm: Arc<VmSpace>, owner: Arc<Agent>) -> Arc<Space> {
-        Space::build(vm, owner, 0, true)
+        let counted = owner.enter_space().is_ok();
+        Space::build(vm, owner, 0, true, counted, !counted)
     }
 
     /// A space over memory the caller keeps: teardown unmaps nothing and refunds nothing. A
     /// copy-on-write copy made while it runs is charged through the ledger and stays charged,
-    /// because the frame stays mapped in the caller's `vm` after the process is gone.
+    /// because the frame stays mapped in the caller's `vm` after the process is gone. It is not
+    /// counted: the owner does not retire when it ends (OD-19).
     pub fn adopt(vm: Arc<VmSpace>, owner: Arc<Agent>) -> Arc<Space> {
-        Space::build(vm, owner, 0, false)
+        Space::build(vm, owner, 0, false, false, false)
     }
 
     /// A space over a loaded image: charges the image's frames (`img.pages`: segments and stack)
-    /// to `owner`, records them in the ledger, and owns the vm. `Budget` charges nothing.
+    /// to `owner`, records them in the ledger, and owns the vm. `Budget` charges nothing, and
+    /// `Retired` when `owner` is retiring, also with nothing charged.
+    ///
+    /// The fallible work comes first and the owner is told last, so a failed constructor never
+    /// touches the owner's count.
     pub fn from_image(img: &Image, owner: Arc<Agent>) -> Result<Arc<Space>, AgentError> {
+        if owner.is_retired() {
+            return Err(AgentError::Retired);
+        }
         owner.charge_pages(img.pages)?;
-        Ok(Space::build(img.space.clone(), owner, img.pages, true))
+        if let Err(e) = owner.enter_space() {
+            // Retired between the check and now.
+            owner.uncharge_pages(img.pages);
+            return Err(e);
+        }
+        Ok(Space::build(
+            img.space.clone(),
+            owner,
+            img.pages,
+            true,
+            true,
+            false,
+        ))
     }
 
     /// A space over a copy-on-write clone of `parent` in `range`, owned by `owner`. The clone's
     /// page-table node frames are charged to `owner` and recorded in the ledger, so teardown
     /// refunds them. `Err` leaves `owner` as it was (see `cow_clone`).
+    ///
+    /// A retiring owner is refused as `CloneError::Budget`, which reaches ring 3 as ENOMEM:
+    /// D-07 fixes `CloneError`'s variants, so there is no variant that says "retired".
     pub fn from_clone(
         parent: &VmSpace,
         range: Range<Vaddr>,
         owner: Arc<Agent>,
     ) -> Result<Arc<Space>, CloneError> {
+        if owner.is_retired() {
+            return Err(CloneError::Budget);
+        }
         let tally = Tally {
             payer: &*owner,
             pages: AtomicUsize::new(0),
         };
         let vm = cow_clone(parent, range, &tally)?;
         let charged = tally.pages.load(Ordering::Acquire);
-        Ok(Space::build(Arc::new(vm), owner, charged, true))
+        if owner.enter_space().is_err() {
+            // Retired while the clone ran: give the nodes back and report it as a budget refusal.
+            drop(vm);
+            tally.uncharge_pages(charged);
+            return Err(CloneError::Budget);
+        }
+        Ok(Space::build(
+            Arc::new(vm),
+            owner,
+            charged,
+            true,
+            true,
+            false,
+        ))
     }
 
     pub fn vm(&self) -> &Arc<VmSpace> {
@@ -223,6 +278,10 @@ impl Space {
             }
             let pages = self.charged_pages.swap(0, Ordering::AcqRel);
             self.owner.uncharge_pages(pages);
+        }
+        // Last: the owner may retire here, and retiring drains its capabilities.
+        if self.counted {
+            self.owner.leave_space();
         }
     }
 
@@ -1752,5 +1811,333 @@ mod test {
         assert_eq!(r.err(), Some(SpaceError::Dead));
         assert_eq!(Errno::from(SpaceError::Dead), Errno::ESRCH);
         assert_eq!(b.live_threads(), 0);
+    }
+
+    /// A counted space that runs nothing: it owns an empty vm and charges nothing. Dropping its
+    /// last `Arc` tears it down, which is the owner's `leave_space`.
+    fn idle_space(owner: &Arc<Agent>) -> Arc<Space> {
+        Space::new(Arc::new(VmSpace::new()), owner.clone())
+    }
+
+    /// An agent's pool: pages in use and ticks carved out for children.
+    fn pool(a: &Agent) -> (usize, u64) {
+        (a.mem_used_pages(), a.cpu_carved_ticks())
+    }
+
+    #[ktest]
+    fn retire_keeps_derived_grants() {
+        let a = Agent::new_root(1, 20);
+        let ep = Endpoint::new();
+        let slot = give_endpoint(&a, &ep, Rights::ALL);
+        // GRANT as well, so the child can derive onward.
+        let c = a
+            .spawn_child(&[(slot, Rights::SEND.union(Rights::GRANT))], 4, 1)
+            .unwrap();
+        let d = Agent::new_root(2, 0);
+        let derived = c
+            .cspace
+            .lock()
+            .get(0)
+            .unwrap()
+            .derive(Rights::SEND)
+            .unwrap();
+        let dslot = d.cspace.lock().insert(derived).unwrap();
+        let before = Arc::strong_count(&ep);
+
+        drop(idle_space(&c));
+        assert!(c.is_retired());
+        assert_eq!(c.cspace.lock().live(), 0, "the child's own copy is gone");
+        assert_eq!(
+            Arc::strong_count(&ep),
+            before - 1,
+            "exactly the child's own copy was dropped"
+        );
+        assert!(
+            d.cspace
+                .lock()
+                .get(dslot)
+                .unwrap()
+                .resolve(Rights::SEND)
+                .is_ok(),
+            "the derived copy outlives its delegator (D-01)"
+        );
+    }
+
+    #[ktest]
+    fn retire_returns_carve() {
+        let a = Agent::new_root(1, 20);
+        let base = pool(&a);
+        let c = a.spawn_child(&[], 16, 2).unwrap();
+        assert_eq!(pool(&a), (base.0 + 16, base.1 + 2));
+
+        drop(idle_space(&c));
+        assert!(c.is_retired());
+        assert_eq!(pool(&a), base, "the carve came back with the last space");
+
+        let again = a
+            .spawn_child(&[], 16, 2)
+            .expect("the carve can be spent again");
+        assert_eq!(pool(&a), (base.0 + 16, base.1 + 2));
+        drop(c);
+        assert_eq!(
+            pool(&a),
+            (base.0 + 16, base.1 + 2),
+            "dropping the retired child returned nothing more"
+        );
+        drop(again);
+        assert_eq!(pool(&a), base);
+    }
+
+    #[ktest]
+    fn root_never_retires() {
+        let img = load_image(user_image!("fault_sibling")).unwrap();
+        let r = Agent::new_root(1, img.pages);
+        let slot = give_endpoint(&r, &Endpoint::new(), Rights::ALL);
+        let live = r.cspace.lock().live();
+
+        drop(idle_space(&r));
+        assert!(!r.is_retired());
+        assert_eq!(r.cspace.lock().live(), live);
+        assert!(r.cspace.lock().get(slot).is_ok());
+        let again = Space::from_image(&img, r.clone());
+        assert!(again.is_ok(), "a root still takes spaces");
+    }
+
+    #[ktest]
+    fn retire_waits_for_children() {
+        let a = Agent::new_root(1, 20);
+        let base = pool(&a);
+        let c = a.spawn_child(&[], 16, 2).unwrap();
+        let g = c.spawn_child(&[], 4, 1).unwrap();
+        let held = give_endpoint(&c, &Endpoint::new(), Rights::ALL);
+        assert!(c.cspace.lock().get(held).is_ok());
+        let (cs, gs) = (idle_space(&c), idle_space(&g));
+
+        drop(cs);
+        assert!(c.is_retired());
+        assert_eq!(c.cspace.lock().live(), 0, "the CSpace is drained at once");
+        assert_eq!(
+            c.spawn_child(&[], 0, 0).err(),
+            Some(AgentError::Retired),
+            "and takes no new child"
+        );
+        assert_eq!(
+            pool(&a),
+            (base.0 + 16, base.1 + 2),
+            "the carve stays out while a descendant spends it"
+        );
+
+        drop(gs);
+        assert!(g.is_retired());
+        assert_eq!(pool(&c), (0, 0), "G's carve went back to C");
+        assert_eq!(pool(&a), base, "and C's went back to A: once, in order");
+    }
+
+    #[ktest]
+    fn retire_after_the_last_counted_space() {
+        let a = Agent::new_root(1, 20);
+        let base = pool(&a);
+        let ep = Endpoint::new();
+        let slot = give_endpoint(&a, &ep, Rights::ALL);
+        let c = a.spawn_child(&[(slot, Rights::SEND)], 16, 2).unwrap();
+        // Both are built before either is torn down: a child with no space retires.
+        let (s1, s2) = (idle_space(&c), idle_space(&c));
+        assert_eq!(c.cspace.lock().live(), 1);
+
+        drop(s1);
+        assert!(!c.is_retired(), "one counted space is still alive");
+        assert_eq!(c.cspace.lock().live(), 1);
+
+        drop(s2);
+        assert!(c.is_retired());
+        assert_eq!(c.cspace.lock().live(), 0);
+        assert_eq!(c.cspace.lock().room(), 0, "and the CSpace is closed");
+        assert_eq!(pool(&a), base);
+    }
+
+    #[ktest]
+    fn retire_breaks_a_cspace_cycle() {
+        let a = Agent::new_root(1, 20);
+        let c = a.spawn_child(&[], 4, 1).unwrap();
+        let s = idle_space(&c);
+        // The agent's own CSpace names its only space, and the space holds the agent.
+        c.cspace
+            .lock()
+            .insert(Cap::new(Object::Space(s.clone()), Rights::CREATE))
+            .unwrap();
+        let (weak_c, weak_s) = (Arc::downgrade(&c), Arc::downgrade(&s));
+        drop(c);
+
+        // No thread ever ran in it, so the kill is the last act of the process.
+        s.kill();
+        drop(s);
+        assert_eq!(weak_s.strong_count(), 0, "the space is freed");
+        assert_eq!(weak_c.strong_count(), 0, "so is the agent");
+    }
+
+    #[ktest]
+    fn retire_refuses_new_threads() {
+        install_space_switch();
+        let spinner = load_image(user_image!("spinner")).unwrap();
+        let parent = sibling_parent(PageFlags::RW);
+        let a = Agent::new_root(1, 128);
+        let c = a.spawn_child(&[], 64, 2).unwrap();
+        drop(idle_space(&c));
+        assert!(c.is_retired());
+        let used = c.mem_used_pages();
+
+        let born = Space::new(Arc::new(VmSpace::new()), c.clone());
+        assert!(born.is_dying(), "a space born to a retired agent is dying");
+        let (_h, caller) = holder_of(&born, Rights::CREATE);
+        assert_eq!(
+            thread_create(&caller, Target::Slot(0), spin_at(&spinner), 0, ok).err(),
+            Some(SpaceError::Dead)
+        );
+
+        assert_eq!(
+            Space::from_image(&spinner, c.clone()).err(),
+            Some(AgentError::Retired)
+        );
+        assert_eq!(c.mem_used_pages(), used, "from_image charged nothing");
+        assert_eq!(
+            Space::from_clone(&parent.space, IMAGE_BASE..TEST_DATA + PAGE_SIZE, c.clone()).err(),
+            Some(CloneError::Budget)
+        );
+        assert_eq!(c.mem_used_pages(), used, "from_clone charged nothing");
+
+        let cap = Cap::new(Object::Endpoint(Endpoint::new()), Rights::ALL);
+        assert_eq!(c.cspace.lock().insert(cap).err(), Some(CapError::Full));
+        assert_eq!(Errno::from(AgentError::Retired), Errno::ESRCH);
+    }
+
+    #[ktest]
+    fn retire_on_drop_returns_the_carve() {
+        let a = Agent::new_root(1, 20);
+        let base = pool(&a);
+        let c = a.spawn_child(&[], 16, 2).unwrap();
+        assert_eq!(pool(&a), (base.0 + 16, base.1 + 2));
+        drop(c);
+        assert_eq!(pool(&a), base, "a child that never ran still gives it back");
+    }
+
+    #[ktest]
+    fn retire_adopted_spaces_do_not_count() {
+        install_space_switch();
+        let a = Agent::new_root(1, 8);
+        let c = a.spawn_child(&[], 4, 1).unwrap();
+        let img = load_image(user_image!("fault_sibling")).unwrap();
+        // `spawn_image` runs the image in an adopted space.
+        let exit = spawn_image(&Thread::new(c.clone()), &img, 0);
+        assert_eq!(join(&exit), Exit::Code(7));
+        for _ in 0..100 {
+            Task::yield_now();
+        }
+        assert!(!c.is_retired(), "an adopted space never retires its owner");
+    }
+
+    #[ktest]
+    fn retire_unrun_space_uncharges_its_image() {
+        let img = load_image(user_image!("fault_sibling")).unwrap();
+        let a = Agent::new_root(1, img.pages);
+        let space = Space::from_image(&img, a.clone()).unwrap();
+        assert_eq!(a.mem_used_pages(), img.pages);
+        drop(space);
+        assert_eq!(
+            a.mem_used_pages(),
+            0,
+            "a space that never ran still returns its image"
+        );
+    }
+
+    /// What the child-agent loop runs against: a root agent holding `ep` in `ep_slot`, a thread of
+    /// it to call `thread_create` as, and a parent image to clone.
+    struct ChildLoop {
+        a: Arc<Agent>,
+        holder: Arc<Thread>,
+        parent: Image,
+        ep: Arc<Endpoint>,
+        ep_slot: usize,
+    }
+
+    fn child_loop() -> ChildLoop {
+        install_space_switch();
+        let a = Agent::new_root(1, 128);
+        let ep = Endpoint::new();
+        let ep_slot = give_endpoint(&a, &ep, Rights::ALL);
+        ChildLoop {
+            holder: Thread::new(a.clone()),
+            parent: sibling_parent(PageFlags::RW),
+            a,
+            ep,
+            ep_slot,
+        }
+    }
+
+    /// One turn: a child agent with a granted endpoint, a process cloned into it that runs to
+    /// exit, and everything dropped. Both weak handles must stop upgrading.
+    fn child_agent_turn(w: &ChildLoop, i: usize) {
+        let c =
+            w.a.spawn_child(&[(w.ep_slot, Rights::SEND)], 16, 2)
+                .unwrap();
+        let child = cow_space(&w.parent, &c);
+        let (weak_c, weak_s) = (Arc::downgrade(&c), Arc::downgrade(&child));
+        drop(c);
+        let slot =
+            w.a.cspace
+                .lock()
+                .insert(Cap::new(Object::Space(child), Rights::CREATE))
+                .unwrap();
+        // arg 1: store into the test page, copy-on-write in the child, then exit 8.
+        let start = ThreadStart {
+            arg: 1,
+            ..spin_at(&w.parent)
+        };
+        let (tslot, th) = thread_create(&w.holder, Target::Slot(slot), start, 0, ok).unwrap();
+        assert_eq!(join_thread(&th), Exit::Code(8), "iteration {i}");
+        w.a.cspace.lock().remove(tslot).unwrap();
+        w.a.cspace.lock().remove(slot).unwrap();
+        drop(th);
+        let mut yields = 0;
+        while weak_c.strong_count() > 0 || weak_s.strong_count() > 0 {
+            yields += 1;
+            assert!(
+                yields < 1000,
+                "iteration {i}: the agent or its space never dropped"
+            );
+            Task::yield_now();
+        }
+    }
+
+    #[ktest]
+    fn retire_loop_child_agent_10000x() {
+        let w = child_loop();
+        let (used, carved) = (w.a.mem_used_pages(), w.a.cpu_carved_ticks());
+        let (live, refs) = (w.a.cspace.lock().live(), Arc::strong_count(&w.ep));
+        let agents = crate::agent::live_agents();
+
+        let t0 = Jiffies::elapsed().as_u64();
+        for i in 0..ITERATIONS {
+            child_agent_turn(&w, i);
+        }
+        let t1 = Jiffies::elapsed().as_u64();
+        println!("retire_loop: iterations={} jiffies={}", ITERATIONS, t1 - t0);
+
+        assert_eq!(w.a.mem_used_pages(), used, "the loop leaked budget");
+        assert_eq!(w.a.cpu_carved_ticks(), carved, "the loop leaked CPU carve");
+        assert_eq!(
+            w.a.cspace.lock().live(),
+            live,
+            "the loop leaked capabilities"
+        );
+        assert_eq!(
+            Arc::strong_count(&w.ep),
+            refs,
+            "the loop leaked endpoint refs"
+        );
+        assert_eq!(
+            crate::agent::live_agents(),
+            agents,
+            "the loop leaked agents"
+        );
     }
 }

@@ -80,6 +80,8 @@ impl From<AgentError> for Errno {
             AgentError::Budget => Errno::ENOMEM,
             AgentError::NoMemory => Errno::ENOMEM,
             AgentError::Cap(c) => c.into(),
+            // The process the call names is gone.
+            AgentError::Retired => Errno::ESRCH,
         }
     }
 }
