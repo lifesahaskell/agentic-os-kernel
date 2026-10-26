@@ -217,14 +217,20 @@ pub fn thread_interrupt(caller: &Thread, slot: usize, entry: usize) -> Result<()
 mod test {
     use abi::USER_STACK_TOP;
     use ostd::{
-        mm::{FrameAllocOptions, PageFlags},
+        mm::{FrameAllocOptions, PageFlags, VmIo},
         prelude::*,
+        task::{Task, TaskOptions},
     };
 
     use super::*;
     use crate::{
+        ipc::Endpoint,
         sched::install_space_switch,
-        user::{Exit, Image, load_image, map_test_page, testkit::join_thread, user_image},
+        user::{
+            Exit, Image, load_image, map_test_page,
+            testkit::{self, join, join_thread, spawn_image},
+            user_image,
+        },
     };
 
     /// A space running the `spinner` image under `owner`, with the test page it reads.
@@ -312,5 +318,130 @@ mod test {
         thread_interrupt(&caller, slot, img.handler).unwrap();
         join_thread(&th);
         assert_eq!(b.live_threads(), 0);
+    }
+
+    type Reply = Arc<SpinLock<Option<[u64; 4]>>>;
+
+    /// A ring-3 holder `A` (the `thread_create` program, agent `a`) with the endpoint in slot 0 and
+    /// a Space capability for `b` in slot 1. A kernel task calls the endpoint with `label` and
+    /// `[1, b.entry, USER_STACK_TOP, b.handler]`; the reply words arrive in the returned slot.
+    fn ring3_holder(
+        a: &Arc<Agent>,
+        a_img: &Image,
+        b_img: &Image,
+        label: u64,
+        ep: &Arc<Endpoint>,
+    ) -> (Reply, testkit::ExitSlot) {
+        let exit = spawn_image(&Thread::new(a.clone()), a_img, 0);
+        let reply: Reply = Arc::new(SpinLock::new(None));
+        let (ep, r2) = (ep.clone(), reply.clone());
+        let words = [
+            1,
+            b_img.entry as u64,
+            USER_STACK_TOP as u64,
+            b_img.handler as u64,
+        ];
+        let caller = Thread::new(Agent::new_root(3, 0));
+        TaskOptions::new(move || {
+            *r2.lock() = Some(ep.call(&caller, label, words).unwrap());
+        })
+        .spawn()
+        .unwrap();
+        (reply, exit)
+    }
+
+    fn holder_agent(ep: &Arc<Endpoint>, b: &Arc<Space>) -> Arc<Agent> {
+        let a = Agent::new_root(42, 64);
+        let mut cs = a.cspace.lock();
+        assert_eq!(
+            cs.insert(Cap::new(Object::Endpoint(ep.clone()), Rights::ALL)),
+            Ok(0)
+        );
+        let space = Cap::new(
+            Object::Space(b.clone()),
+            Rights::CREATE.union(Rights::SIGNAL),
+        );
+        assert_eq!(cs.insert(space), Ok(1));
+        drop(cs);
+        a
+    }
+
+    fn wait_reply(r: &Reply) -> [u64; 4] {
+        loop {
+            if let Some(w) = r.lock().take() {
+                return w;
+            }
+            Task::yield_now();
+        }
+    }
+
+    #[ktest]
+    fn thread_create_ring3_holder_runs_thread_in_other_space() {
+        install_space_switch();
+        let ep = Endpoint::new();
+        let b_owner = Agent::new_root(2, 0);
+        let (b, b_img) = spinner_space(&b_owner);
+        let a = holder_agent(&ep, &b);
+        let a_img = load_image(user_image!("thread_create")).unwrap();
+
+        let (reply, exit) = ring3_holder(&a, &a_img, &b_img, 0, &ep);
+        let [slot, tid, interrupted, refused] = wait_reply(&reply);
+        assert_eq!(join(&exit), Exit::Code(0));
+
+        // Slot 0 is the endpoint and slot 1 the Space capability: the new capability is slot 2.
+        assert_eq!(slot, 2);
+        assert_ne!(
+            tid, 0,
+            "the kernel wrote the tid back before the thread ran"
+        );
+        assert_eq!(interrupted, 0);
+        assert_eq!(refused as isize, -abi::errno::EBADF);
+        let cap = a.cspace.lock().get(2).unwrap().resolve(Rights::SIGNAL);
+        assert!(matches!(cap, Ok(Object::Thread(_))));
+        assert_eq!(
+            a.cspace.lock().get(2).unwrap().rights(),
+            Rights::SIGNAL,
+            "the Thread capability carries SIGNAL and nothing else"
+        );
+
+        // The interrupt sent it to the spinner's handler, which exits; the space is empty again.
+        let mut spins = 0usize;
+        while b.live_threads() != 0 {
+            spins += 1;
+            assert!(spins < 1_000_000, "the thread never exited");
+            Task::yield_now();
+        }
+    }
+
+    #[ktest]
+    fn thread_create_writes_tid_or_starts_nothing() {
+        install_space_switch();
+        let ep = Endpoint::new();
+        let b_owner = Agent::new_root(2, 0);
+        let (b, b_img) = spinner_space(&b_owner);
+        let a = holder_agent(&ep, &b);
+        let a_img = load_image(user_image!("thread_create")).unwrap();
+
+        // A valid ThreadCtx in a page the caller can read but the kernel may not write.
+        let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+        let ctx = abi::ThreadCtx {
+            rip: b_img.entry as u64,
+            rsp: USER_STACK_TOP as u64,
+            arg: 1,
+            ..Default::default()
+        };
+        frame.write_bytes(0, &ctx.to_bytes()).unwrap();
+        map_test_page(&a_img.space, frame.into(), PageFlags::R);
+
+        let (reply, exit) = ring3_holder(&a, &a_img, &b_img, 1, &ep);
+        let [result, ..] = wait_reply(&reply);
+        assert_eq!(join(&exit), Exit::Code(0));
+
+        assert_eq!(result as isize, -abi::errno::EFAULT);
+        assert_eq!(b.live_threads(), 0, "nothing started");
+        assert!(
+            a.cspace.lock().get(2).is_err(),
+            "the capability was taken back"
+        );
     }
 }
