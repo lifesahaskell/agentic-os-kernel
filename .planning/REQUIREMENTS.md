@@ -21,7 +21,7 @@ recorded measurement. "Test" below names what would show it worked.
 - [x] **KERN-05**: CSpace grows past the 64-slot B2 limit. Test: install and derive more than 64 capabilities.
 - [x] **KERN-06**: Every kernel write into user memory goes through one `copy_to_user` that breaks CoW and retries. Test: the first `read` into a buffer after `fork` succeeds (written before procmgr exists).
 - [ ] **KERN-07**: An idle task halts the CPU when nothing is runnable. Test: the scheduler runs with all agents blocked and the CPU halts instead of spinning.
-- [ ] **KERN-08**: Destroying a process returns its carved budgets and capabilities to the parent (`charge_pages` gets an inverse) and wakes its futex waiters. Test: a 10,000x fork+exit loop leaves page and capability counts flat.
+- [x] **KERN-08**: Destroying a process returns its carved budgets and capabilities to the parent (`charge_pages` gets an inverse) and wakes its futex waiters. Test: a 10,000x fork+exit loop leaves page and capability counts flat.
 - [x] **KERN-09**: `futex` wait and IPC `recv` accept timeouts, and a timer can deliver a message to an endpoint. Test: timed waits expire within a stated tolerance.
 - [x] **KERN-10**: Thread-exit and exception notifications go to a process endpoint and name the faulting `tid` and `tag`. Test: procmgr can tell which of two forked siblings faulted.
 - [ ] **KERN-11**: Signal redirect saves the full user context on a kernel-held stack and `sigreturn` restores it, with no kernel write to the user stack. Test: all general registers and FPU state survive a redirect and return.
@@ -186,7 +186,7 @@ Each v1 requirement maps to exactly one phase. Rule: the phase that builds its p
 | KERN-05 | Phase 1 | Complete |
 | KERN-06 | Phase 1 | Complete |
 | KERN-07 | Phase 2 | Pending |
-| KERN-08 | Phase 2 | Pending |
+| KERN-08 | Phase 2 | Complete |
 | KERN-09 | Phase 2 | Complete |
 | KERN-10 | Phase 2 | Complete |
 | KERN-11 | Phase 2 | Pending |
