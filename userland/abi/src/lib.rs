@@ -137,3 +137,7 @@ pub const MAX_IMAGE_SIZE: usize = 16 * 1024 * 1024;
 pub const USER_STACK_TOP: usize = 0x7000_0000;
 /// 128 KiB: the null-IPC sample array lives on the stack.
 pub const USER_STACK_PAGES: usize = 32;
+/// Address of the one test data page. The kernel's ktests and boot checks map a RW page here when
+/// a test program needs shared or inspectable memory; `libsys::test_page` reads it. It sits above
+/// any image (`MAX_IMAGE_SIZE` is not reached by the test programs) and below the stack.
+pub const TEST_DATA: usize = 0x50_0000;
