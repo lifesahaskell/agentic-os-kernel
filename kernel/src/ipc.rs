@@ -14,7 +14,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use abi::{IpcArgs, LABEL_CANCEL, MAX_IPC_CAPS};
+use abi::{IpcArgs, LABEL_CANCEL, LABEL_KERNEL_BASE, MAX_IPC_CAPS};
 use ostd::{
     mm::VmSpace,
     sync::{SpinLock, WaitQueue},
@@ -27,6 +27,8 @@ use crate::{
     thread::{BlockError, Thread},
     vm::{copy_from_user, copy_to_user},
 };
+
+pub mod timer;
 
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -304,14 +306,11 @@ impl Endpoint {
         caps: Vec<Cap>,
         reply: Option<Arc<ReplyWait>>,
     ) -> Result<(), IpcError> {
-        if label == LABEL_CANCEL {
+        // The kernel's labels (Cancel, timer, ...) must not be forgeable by a sender.
+        if label >= LABEL_KERNEL_BASE {
             return Err(IpcError::Invalid);
         }
-        let mut q = self.queue.lock();
-        if q.len() >= Self::QUEUE_LEN {
-            return Err(IpcError::Full);
-        }
-        q.push_back(Message {
+        self.enqueue(Message {
             sender: from.agent().credential(),
             tid: from.tid(),
             tag: from.tag(),
@@ -320,7 +319,39 @@ impl Endpoint {
             label,
             caps,
             reply,
-        });
+        })
+    }
+
+    /// Queues a message the kernel makes: `label` is one of its own, `sender` and `tag` are those
+    /// of the agent and thread the message is on behalf of, and `tid` is 0 because no thread sent
+    /// it. Task context only (it takes the queue lock without disabling interrupts). `Full` at
+    /// `QUEUE_LEN`; the message is then dropped and the caller decides whether to retry.
+    pub(crate) fn push_kernel(
+        &self,
+        label: u64,
+        sender: Credential,
+        tag: u64,
+        words: [u64; 4],
+    ) -> Result<(), IpcError> {
+        debug_assert!(label >= LABEL_KERNEL_BASE);
+        self.enqueue(Message {
+            sender,
+            tid: 0,
+            tag,
+            words,
+            data: Vec::new(),
+            label,
+            caps: Vec::new(),
+            reply: None,
+        })
+    }
+
+    fn enqueue(&self, m: Message) -> Result<(), IpcError> {
+        let mut q = self.queue.lock();
+        if q.len() >= Self::QUEUE_LEN {
+            return Err(IpcError::Full);
+        }
+        q.push_back(m);
         drop(q);
         self.wq.wake_one();
         Ok(())
@@ -329,6 +360,12 @@ impl Endpoint {
     /// For a kernel task as the server: the call's `ReplyWait` stays in the message and no Cancel
     /// can reach the task.
     pub fn recv(&self, me: &Thread) -> Result<Message, IpcError> {
+        self.recv_until(me, None)
+    }
+
+    /// `recv` that gives up with `TimedOut` once the absolute `Jiffies` tick `deadline` is
+    /// reached. A queued message beats the deadline, and so does an interrupt (`block_until`).
+    pub fn recv_until(&self, me: &Thread, deadline: Option<u64>) -> Result<Message, IpcError> {
         Ok(me.block_until(
             &self.wq,
             || {
@@ -339,7 +376,7 @@ impl Endpoint {
                 }
                 Some(m)
             },
-            None,
+            deadline,
         )?)
     }
 
@@ -347,8 +384,20 @@ impl Endpoint {
     /// reply table and the returned handle (0 for a plain `send`) answers it. `Full` when the
     /// table has no room; the message then stays queued. A pending Cancel comes first, as a
     /// message labelled `LABEL_CANCEL` whose handle is that of the cancelled call, which stays
-    /// in the table until the server answers it.
+    /// in the table until the server answers it. Only tests wait without a deadline here; the
+    /// syscalls go through `recv_parked_until`.
+    #[cfg(ktest)]
     fn recv_parked(&self, me: &Thread) -> Result<(Message, u64), IpcError> {
+        self.recv_parked_until(me, None)
+    }
+
+    /// `recv_parked` with the deadline of `recv_until`. A pending Cancel or a message already
+    /// queued is returned even when the deadline has passed.
+    pub fn recv_parked_until(
+        &self,
+        me: &Thread,
+        deadline: Option<u64>,
+    ) -> Result<(Message, u64), IpcError> {
         me.block_until(
             &self.wq,
             || {
@@ -370,7 +419,7 @@ impl Endpoint {
                 m.reply = None;
                 Some(Ok((m, handle)))
             },
-            None,
+            deadline,
         )?
     }
 
@@ -597,8 +646,9 @@ fn recv_into(
     ep: &Endpoint,
     args: UserPtr<IpcArgs>,
     recv: UserSlice,
+    deadline: Option<u64>,
 ) -> Result<(), Errno> {
-    let (m, handle) = ep.recv_parked(t)?;
+    let (m, handle) = ep.recv_parked_until(t, deadline)?;
     // Install first: if the space has no room the message goes back and the receiver sees EMFILE.
     let installed = match install_caps(t.agent(), &m.caps) {
         Ok(i) => i,
@@ -625,16 +675,25 @@ fn recv_into(
     delivered
 }
 
-/// `SYS_RECV`: waits for a message on `ep` (needs RECV) and writes it into `args`.
+/// `SYS_RECV`: waits for a message on `ep` (needs RECV) and writes it into `args`. `deadline` is
+/// an absolute `Jiffies` tick; `None` waits until a message or an interrupt. Expiry is `ETIMEDOUT`.
 pub fn sys_recv_args(
     t: &Thread,
     space: &VmSpace,
     ep: Handle,
     args: UserPtr<IpcArgs>,
+    deadline: Option<u64>,
 ) -> Result<(), Errno> {
     let ep = endpoint(t, ep.index(), Rights::RECV)?;
     let a = read_args(space, args)?;
-    recv_into(t, space, &ep, args, user_slice(a.recv_buf, a.recv_len)?)
+    recv_into(
+        t,
+        space,
+        &ep,
+        args,
+        user_slice(a.recv_buf, a.recv_len)?,
+        deadline,
+    )
 }
 
 /// Answers the call parked under `a.reply` in `t`'s own table with `a.words`, the bytes of
@@ -661,18 +720,20 @@ pub fn sys_reply(t: &Thread, space: &VmSpace, args: UserPtr<IpcArgs>) -> Result<
 }
 
 /// `SYS_REPLY_RECV`: `sys_reply`, then `sys_recv_args` into the same block. The endpoint is
-/// resolved first and a failed reply returns before receiving.
+/// resolved first and a failed reply returns before receiving. Only the receive half is timed: a
+/// timeout after a successful reply returns `ETIMEDOUT` with the reply already delivered.
 pub fn sys_reply_recv(
     t: &Thread,
     space: &VmSpace,
     ep: Handle,
     args: UserPtr<IpcArgs>,
+    deadline: Option<u64>,
 ) -> Result<(), Errno> {
     let ep = endpoint(t, ep.index(), Rights::RECV)?;
     let a = read_args(space, args)?;
     let recv = user_slice(a.recv_buf, a.recv_len)?;
     answer(t, space, &a)?;
-    recv_into(t, space, &ep, args, recv)
+    recv_into(t, space, &ep, args, recv, deadline)
 }
 
 #[cfg(ktest)]
@@ -789,6 +850,102 @@ mod test {
             Task::yield_now();
         }
         assert_eq!(result.lock().take().unwrap().unwrap().words[0], 7);
+    }
+
+    /// OD-09: a wait of D ticks ends in [D+1, D+3] ticks on `-smp 1` with nothing else runnable.
+    #[ktest]
+    fn timeout_recv_expires_within_tolerance() {
+        const D: u64 = 10;
+        let (server, _client) = pair();
+        let ep = endpoint(&server, 0, Rights::RECV).unwrap();
+
+        // Warm-up, not measured: the first timed wait registers the deadline callback and runs
+        // every path cold, which under QEMU TCG costs a few extra ticks.
+        let now = Jiffies::elapsed().as_u64();
+        assert_eq!(
+            ep.recv_until(&server, Some(now + 3)).err(),
+            Some(IpcError::TimedOut)
+        );
+
+        let start = Jiffies::elapsed().as_u64();
+        let r = ep.recv_until(&server, Some(start + D + 1));
+        let elapsed = Jiffies::elapsed().as_u64() - start;
+        println!("aok: timeout_recv kernel D={} elapsed={} ticks", D, elapsed);
+        assert_eq!(r.err(), Some(IpcError::TimedOut));
+        assert!((D + 1..=D + 3).contains(&elapsed), "elapsed {elapsed}");
+
+        let start = Jiffies::elapsed().as_u64();
+        let r = ep.recv_parked_until(&server, Some(start + D + 1));
+        let elapsed = Jiffies::elapsed().as_u64() - start;
+        assert_eq!(r.err(), Some(IpcError::TimedOut));
+        assert!(
+            (D + 1..=D + 3).contains(&elapsed),
+            "parked elapsed {elapsed}"
+        );
+        assert_eq!(crate::thread::pending_deadlines(), 0);
+    }
+
+    #[ktest]
+    fn timeout_recv_message_beats_deadline() {
+        let (server, client) = pair();
+        let ep = endpoint(&server, 0, Rights::RECV).unwrap();
+        let far = || Some(Jiffies::elapsed().as_u64() + 50);
+
+        // Queued before the call: returned at once, and the deadline entry does not linger.
+        sys_send(&client, 0, [5, 0, 0, 0]).unwrap();
+        let m = ep.recv_until(&server, far()).unwrap();
+        assert_eq!(m.words[0], 5);
+        assert_eq!(crate::thread::pending_deadlines(), 0);
+
+        sys_send(&client, 0, [6, 0, 0, 0]).unwrap();
+        let (m, handle) = ep.recv_parked_until(&server, far()).unwrap();
+        assert_eq!((m.words[0], handle), (6, 0));
+        assert_eq!(crate::thread::pending_deadlines(), 0);
+
+        // Sent while the receiver is blocked, well inside the deadline.
+        let result: Arc<SpinLock<Option<Result<Message, IpcError>>>> =
+            Arc::new(SpinLock::new(None));
+        let (t, e, r, due) = (server.clone(), ep.clone(), result.clone(), far());
+        TaskOptions::new(move || *r.lock() = Some(e.recv_until(&t, due)))
+            .spawn()
+            .unwrap();
+        wait_blocked(&server);
+        sys_send(&client, 0, [7, 0, 0, 0]).unwrap();
+        while result.lock().is_none() {
+            Task::yield_now();
+        }
+        assert_eq!(result.lock().take().unwrap().unwrap().words[0], 7);
+        assert_eq!(crate::thread::pending_deadlines(), 0);
+    }
+
+    #[ktest]
+    fn timeout_recv_ring3_never_early() {
+        let agent = Agent::new_root(1, 64);
+        let slot = agent
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Endpoint(Endpoint::new()), Rights::RECV))
+            .unwrap();
+        assert_eq!(slot, 0);
+        let img = load_image(user_image!("timeout")).unwrap();
+        let t = Thread::new(agent);
+
+        let start = Jiffies::elapsed().as_u64();
+        let exit = spawn_image(&t, &img, 1);
+        // A program still waiting after 200 ticks has no working timeout: free it so the test
+        // fails instead of hanging.
+        while exit.lock().is_none() && Jiffies::elapsed().as_u64() - start < 200 {
+            Task::yield_now();
+        }
+        let elapsed = Jiffies::elapsed().as_u64() - start;
+        if exit.lock().is_none() {
+            t.interrupt(img.handler);
+        }
+        let code = join(&exit);
+        println!("aok: timeout_recv ring3 20 ms elapsed={} ticks", elapsed);
+
+        assert_eq!(code, Exit::Code(0));
+        assert!((20..=40).contains(&elapsed), "elapsed {elapsed}");
     }
 
     type Log = Arc<SpinLock<Vec<(u64, [u64; 4])>>>;
@@ -951,7 +1108,7 @@ mod test {
         let elsewhere = VmSpace::new();
         let args = UserPtr::new(0x1000).unwrap();
         let none = user_slice(0, 0).unwrap();
-        assert!(recv_into(&s, &elsewhere, &ep, args, none).is_err());
+        assert!(recv_into(&s, &elsewhere, &ep, args, none, None).is_err());
         let m = ep.recv(&s).unwrap();
         assert_eq!(m.label, 6);
         m.reply.unwrap().reply([1, 2, 3, 4]);
@@ -1357,7 +1514,7 @@ mod test {
         let args = UserPtr::new(0x1000).unwrap();
         let none = user_slice(0, 0).unwrap();
         assert_eq!(
-            recv_into(&receiver, &elsewhere, &ep, args, none),
+            recv_into(&receiver, &elsewhere, &ep, args, none, None),
             Err(Errno::EMFILE)
         );
         assert_eq!(receiver.agent().cspace.lock().room(), 2);
@@ -1368,7 +1525,7 @@ mod test {
         receiver.agent().cspace.lock().remove(1).unwrap();
         receiver.agent().cspace.lock().remove(2).unwrap();
         assert_eq!(receiver.agent().cspace.lock().room(), 4);
-        assert!(recv_into(&receiver, &elsewhere, &ep, args, none).is_err());
+        assert!(recv_into(&receiver, &elsewhere, &ep, args, none, None).is_err());
         assert_eq!(receiver.agent().cspace.lock().room(), 4);
         assert_eq!(ep.queue.lock().len(), 1);
 

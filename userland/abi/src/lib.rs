@@ -12,6 +12,9 @@ pub const SYS_CALL: usize = 0x100;
 pub const SYS_RECV: usize = 0x101;
 pub const SYS_REPLY: usize = 0x102;
 pub const SYS_REPLY_RECV: usize = 0x103;
+/// `timer_arm(ep, delay_ms, cookie)`: after `delay_ms` the kernel sends one `LABEL_TIMER` message
+/// to the endpoint in slot `ep` (needs SEND) and the call returns the timer id.
+pub const SYS_TIMER_ARM: usize = 0x106;
 
 /// Linux errno values. A syscall returns `-errno` in `rax` on failure.
 pub mod errno {
@@ -116,6 +119,40 @@ impl IpcArgs {
     }
 }
 
+/// A relative timeout, as `FUTEX_WAIT` reads it from `a[3]`: `sec >= 0` and `0 <= nsec < 1e9`,
+/// otherwise the call is `EINVAL`. The kernel rounds up to whole 1 ms ticks.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Timespec {
+    pub sec: i64,
+    pub nsec: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<Timespec>() == 16);
+
+impl Timespec {
+    /// The wire form: two little-endian i64, which is the `repr(C)` layout.
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.sec.to_le_bytes());
+        out[8..].copy_from_slice(&self.nsec.to_le_bytes());
+        out
+    }
+
+    pub fn from_bytes(b: &[u8; 16]) -> Self {
+        let (s, n) = b.split_at(8);
+        Self {
+            sec: i64::from_le_bytes(s.try_into().unwrap()),
+            nsec: i64::from_le_bytes(n.try_into().unwrap()),
+        }
+    }
+}
+
+/// Longest timeout, in milliseconds, for a timed `recv`, a timed `reply_recv` and `SYS_TIMER_ARM`
+/// (ten minutes). A larger value is `EINVAL`. A futex timespec is not capped: its tick count
+/// saturates.
+pub const MAX_TIMEOUT_MS: u64 = 600_000;
+
 /// First address above user space on x86-64 (47-bit canonical lower half).
 pub const USER_TOP: usize = 0x0000_8000_0000_0000;
 /// Largest byte count the kernel copies for one syscall buffer.
@@ -126,6 +163,16 @@ pub const MAX_IPC_CAPS: usize = 4;
 /// received, `reply` is the handle of that call. Only the kernel sends it; a ring-3 `call` with
 /// this label is EINVAL.
 pub const LABEL_CANCEL: u64 = u64::MAX;
+
+/// Labels at or above this are the kernel's: `send` and `call` refuse them with EINVAL, so a
+/// receiver can trust one. `LABEL_CANCEL` is `u64::MAX`; the timer takes `u64::MAX - 1`; plan 02-05
+/// takes two more and SIG-03 one (OD-12). The rest of the range stays free.
+pub const LABEL_KERNEL_BASE: u64 = u64::MAX - 15;
+
+/// The label of a timer message. `words` are `[cookie, due, now, id]`: the cookie given to
+/// `timer_arm`, the tick it was due, the tick it was sent, and the timer id. The sender credential
+/// is the arming agent's, `tid` is 0 and `tag` is the arming thread's.
+pub const LABEL_TIMER: u64 = u64::MAX - 1;
 
 /// Flat image: `userland/link.ld` puts five little-endian u64 at `IMAGE_BASE`: magic, entry,
 /// handler, `rx_end`, `mem_end`. Pages below `rx_end` map RX, pages up to `mem_end` map RW and

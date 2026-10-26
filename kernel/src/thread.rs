@@ -54,6 +54,12 @@ fn arm_deadline_timer() {
     });
 }
 
+/// Ktest-only: how many deadline waiters are registered. A wait that ended leaves none behind.
+#[cfg(ktest)]
+pub(crate) fn pending_deadlines() -> usize {
+    DEADLINES.lock().len()
+}
+
 /// Ktest-only hook for forcing a wake-versus-interrupt interleaving inside `block_until`: the
 /// closure runs on the blocking thread when execution reaches the numbered point (1: waker
 /// published; 2: condition false, about to sleep; 3: wait over, waker not yet cleared).
