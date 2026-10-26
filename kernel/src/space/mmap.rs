@@ -10,17 +10,20 @@
 //! guard that a page-table cursor needs, never after. Each helper below makes its own cursor and
 //! drops it before returning: two live cursors over overlapping ranges would deadlock.
 
-use alloc::collections::BTreeMap;
+use alloc::{collections::BTreeMap, vec::Vec};
 use core::ops::Range;
 
-use abi::{MAP_FIXED, MMAP_BASE, MMAP_TOP, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE};
+use abi::{MAP_FIXED, MMAP_BASE, MMAP_TOP, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE, USER_TOP};
 use ostd::{
-    mm::{CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmSpace},
+    mm::{
+        CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmSpace,
+        tlb::TlbFlushOp, vm_space::VmQueriedItem,
+    },
     task::disable_preempt,
 };
 
 use super::Space;
-use crate::{agent::Payer, syscall::Errno};
+use crate::{agent::Payer, syscall::Errno, vm::COW};
 
 /// Most mapping records one space holds. A call that would add one past it is `ENOMEM`, Linux's
 /// `max_map_count` result; a `munmap` that splits a record counts as adding one. Bounds the kernel
@@ -32,7 +35,6 @@ pub const MAX_MAPS_PER_SPACE: usize = 1024;
 #[derive(Clone, Copy, Debug)]
 struct Rec {
     end: Vaddr,
-    #[allow(dead_code, reason = "read by mprotect, which lands in the next task")]
     prot: usize,
 }
 
@@ -127,6 +129,108 @@ fn place(
     }
 }
 
+/// The records that overlap `range`, in address order.
+fn overlapping(recs: &BTreeMap<Vaddr, Rec>, range: &Range<Vaddr>) -> Vec<(Vaddr, Rec)> {
+    let mut v: Vec<_> = recs
+        .range(..range.end)
+        .rev()
+        .take_while(|(_, r)| r.end > range.start)
+        .map(|(s, r)| (*s, *r))
+        .collect();
+    v.reverse();
+    v
+}
+
+/// How many records exist once `range` is cut out of them: each overlapping record is replaced by
+/// what is left of it outside `range`, plus its part inside when `keep_inside` (`mprotect`
+/// reprotects it; `munmap` drops it). Only the first and last overlapping records can leave a
+/// remainder.
+fn len_after_cut(recs: &BTreeMap<Vaddr, Rec>, range: &Range<Vaddr>, keep_inside: bool) -> usize {
+    let over = overlapping(recs, range);
+    let left = over.first().is_some_and(|(s, _)| *s < range.start);
+    let right = over.last().is_some_and(|(_, r)| r.end > range.end);
+    let inside = if keep_inside { over.len() } else { 0 };
+    recs.len() - over.len() + inside + usize::from(left) + usize::from(right)
+}
+
+/// Cuts `range` out of the records: what lies outside it stays, with its old protection; what lies
+/// inside is dropped, or given `prot` when one is passed. The caller checked `len_after_cut`.
+fn cut(recs: &mut BTreeMap<Vaddr, Rec>, range: &Range<Vaddr>, prot: Option<usize>) {
+    for (start, rec) in overlapping(recs, range) {
+        recs.remove(&start);
+        if start < range.start {
+            recs.insert(
+                start,
+                Rec {
+                    end: range.start,
+                    prot: rec.prot,
+                },
+            );
+        }
+        if rec.end > range.end {
+            recs.insert(
+                range.end,
+                Rec {
+                    end: rec.end,
+                    prot: rec.prot,
+                },
+            );
+        }
+        if let Some(prot) = prot {
+            recs.insert(
+                start.max(range.start),
+                Rec {
+                    end: rec.end.min(range.end),
+                    prot,
+                },
+            );
+        }
+    }
+}
+
+/// `range` split into the parts a record covers (`true`) and the parts none does (`false`).
+fn segments(recs: &BTreeMap<Vaddr, Rec>, range: &Range<Vaddr>) -> Vec<(Range<Vaddr>, bool)> {
+    let mut out = Vec::new();
+    let mut at = range.start;
+    for (start, rec) in overlapping(recs, range) {
+        let (s, e) = (start.max(range.start), rec.end.min(range.end));
+        if s > at {
+            out.push((at..s, false));
+        }
+        out.push((s..e, true));
+        at = e;
+    }
+    if at < range.end {
+        out.push((at..range.end, false));
+    }
+    out
+}
+
+/// The maximal runs of `range` where no page is mapped in the page table.
+fn holes(vm: &VmSpace, range: &Range<Vaddr>) -> Vec<Range<Vaddr>> {
+    let mut out = Vec::new();
+    let mut cur = range.start;
+    while cur < range.end {
+        match first_mapped(vm, &(cur..range.end)) {
+            Some(va) => {
+                if va > cur {
+                    out.push(cur..va);
+                }
+                cur = va + PAGE_SIZE;
+            }
+            None => {
+                out.push(cur..range.end);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn pages_in(runs: &[Range<Vaddr>]) -> usize {
+    runs.iter().map(|r| r.len() / PAGE_SIZE).sum()
+}
+
 impl Space {
     /// Maps `pages` zeroed frames at the cursor's position with `prop`. Returns how many it
     /// mapped: fewer than `pages` when the frame allocator ran dry.
@@ -144,16 +248,13 @@ impl Space {
         pages
     }
 
-    /// Charges `range`'s pages in one call, then allocates and maps a zeroed frame for each with
-    /// `flags`. The range must be free (`is_free`). A refused charge is `ENOMEM` before any frame
-    /// exists; a failed allocation unmaps what this call mapped, refunds the whole count and is
-    /// `ENOMEM`. Either way nothing is left behind.
-    fn populate(&self, range: Range<Vaddr>, flags: PageFlags) -> Result<(), Errno> {
+    /// Allocates and maps a zeroed frame for each page of `range` with `flags`, charging nothing.
+    /// The range must hold no mapped page. A failed allocation unmaps what this call mapped and is
+    /// `ENOMEM`.
+    fn map_pages(&self, range: &Range<Vaddr>, flags: PageFlags) -> Result<(), Errno> {
         let pages = range.len() / PAGE_SIZE;
-        self.charge_pages(pages).map_err(|_| Errno::ENOMEM)?;
         let guard = disable_preempt();
-        let Ok(mut c) = self.vm.cursor_mut(&guard, &range) else {
-            self.uncharge_pages(pages);
+        let Ok(mut c) = self.vm.cursor_mut(&guard, range) else {
             return Err(Errno::ENOMEM);
         };
         let prop = PageProperty::new_user(flags, CachePolicy::Writeback);
@@ -163,17 +264,72 @@ impl Space {
                 // `unmap` flushes the TLB itself.
                 c.unmap(done * PAGE_SIZE);
             }
-            self.uncharge_pages(pages);
             return Err(Errno::ENOMEM);
         }
         Ok(())
+    }
+
+    /// Charges `range`'s pages in one call, then maps a zeroed frame for each with `flags`. A
+    /// refused charge is `ENOMEM` before any frame exists; a failed allocation refunds the whole
+    /// count. Either way nothing is left behind.
+    fn populate(&self, range: Range<Vaddr>, flags: PageFlags) -> Result<(), Errno> {
+        let pages = range.len() / PAGE_SIZE;
+        self.charge_pages(pages).map_err(|_| Errno::ENOMEM)?;
+        self.map_pages(&range, flags).inspect_err(|_| {
+            self.uncharge_pages(pages);
+        })
+    }
+
+    /// Unmaps every page in `range`, whatever mapped it, and refunds them. Returns the count.
+    fn unmap_range(&self, range: &Range<Vaddr>) -> usize {
+        let guard = disable_preempt();
+        let Ok(mut c) = self.vm.cursor_mut(&guard, range) else {
+            return 0;
+        };
+        let n = c.unmap(range.len());
+        drop(c);
+        if n > 0 {
+            self.uncharge_pages(n);
+        }
+        n
+    }
+
+    /// Changes the protection of every page mapped in `range`. A page whose frame another
+    /// mapping shares gets `COW` in place of `W` (the rule `vm::cow_clone` keeps).
+    fn protect_range(&self, range: &Range<Vaddr>, prot: usize) {
+        let guard = disable_preempt();
+        let Ok(mut c) = self.vm.cursor_mut(&guard, range) else {
+            return;
+        };
+        let want = prop_flags(prot);
+        while c.virt_addr() < range.end {
+            if c.find_next(range.end - c.virt_addr()).is_none() {
+                break;
+            }
+            let shared = matches!(
+                c.query(),
+                Ok((_, Some(VmQueriedItem::MappedRam { frame, .. }))) if frame.reference_count() > 1
+            );
+            let flags = if want.contains(PageFlags::W) && shared {
+                (want - PageFlags::W) | COW
+            } else {
+                want
+            };
+            c.protect_next(PAGE_SIZE, |f, _| {
+                *f = (*f - (PageFlags::R | PageFlags::W | PageFlags::X | COW)) | flags;
+            });
+        }
+        c.flusher()
+            .issue_tlb_flush(TlbFlushOp::for_range(range.clone()));
+        c.flusher().dispatch_tlb_flush();
     }
 
     /// `mmap(addr, len, prot, flags, off)` for anonymous private memory in this space; the
     /// arguments were checked by `syscall::decode`. Returns the address.
     ///
     /// `ENOMEM`: the space is dying, the record limit is reached, no gap is free, or the budget
-    /// or the frame allocator refused the pages. `MAP_FIXED` is `ENOTSUP` until it is built.
+    /// or the frame allocator refused the pages. `MAP_FIXED` replaces whatever is there, as on
+    /// Linux; if the new pages then cannot be had, the old ones stay gone.
     pub fn mmap(
         &self,
         addr: Vaddr,
@@ -188,19 +344,30 @@ impl Space {
         let size = len
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::ENOMEM)?;
-        if flags & MAP_FIXED != 0 {
-            return Err(Errno::ENOTSUP);
-        }
         let mut mm = self.mm.lock();
         // Under the lock teardown holds, so nothing is charged after its uncharge.
         if self.is_dying() {
             return Err(Errno::ENOMEM);
         }
-        if mm.recs.len() >= MAX_MAPS_PER_SPACE {
-            return Err(Errno::ENOMEM);
-        }
-        let start = place(&self.vm, &mm.recs, addr, size)?;
-        let end = start + size;
+        let (start, end) = if flags & MAP_FIXED != 0 {
+            let end = addr.checked_add(size).ok_or(Errno::ENOMEM)?;
+            if addr < PAGE_SIZE || end > USER_TOP {
+                return Err(Errno::ENOMEM);
+            }
+            let range = addr..end;
+            if len_after_cut(&mm.recs, &range, false) >= MAX_MAPS_PER_SPACE {
+                return Err(Errno::ENOMEM);
+            }
+            self.unmap_range(&range);
+            cut(&mut mm.recs, &range, None);
+            (addr, end)
+        } else {
+            if mm.recs.len() >= MAX_MAPS_PER_SPACE {
+                return Err(Errno::ENOMEM);
+            }
+            let start = place(&self.vm, &mm.recs, addr, size)?;
+            (start, start + size)
+        };
         if prot != PROT_NONE {
             self.populate(start..end, prop_flags(prot))?;
         }
@@ -208,14 +375,96 @@ impl Space {
         Ok(start)
     }
 
-    /// `munmap(addr, len)`: returns the pages removed. Not built yet.
-    pub fn munmap(&self, _addr: Vaddr, _len: usize) -> Result<usize, Errno> {
-        Err(Errno::ENOSYS)
+    /// `munmap(addr, len)`: unmaps every page in the range, whatever mapped it, refunds them and
+    /// returns how many. A range with nothing mapped is `Ok(0)`, as on Linux.
+    ///
+    /// `EINVAL`: an unaligned address, `len` 0, or a range that leaves user space. `ENOMEM`: the
+    /// space is dying, or a split would pass `MAX_MAPS_PER_SPACE`.
+    pub fn munmap(&self, addr: Vaddr, len: usize) -> Result<usize, Errno> {
+        if !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .and_then(|size| addr.checked_add(size))
+            .filter(|&end| end <= USER_TOP)
+            .ok_or(Errno::EINVAL)?;
+        let range = addr..end;
+        let mut mm = self.mm.lock();
+        if self.is_dying() {
+            return Err(Errno::ENOMEM);
+        }
+        if len_after_cut(&mm.recs, &range, false) > MAX_MAPS_PER_SPACE {
+            return Err(Errno::ENOMEM);
+        }
+        let n = self.unmap_range(&range);
+        cut(&mut mm.recs, &range, None);
+        Ok(n)
     }
 
-    /// `mprotect(addr, len, prot)`. Not built yet.
-    pub fn mprotect(&self, _addr: Vaddr, _len: usize, _prot: usize) -> Result<(), Errno> {
-        Err(Errno::ENOSYS)
+    /// `mprotect(addr, len, prot)`. Every page of the range must be mapped or inside a record.
+    /// Pages of a record that were never populated (a `PROT_NONE` reservation) are charged and
+    /// populated when `prot` grants access, and stay unpopulated for `PROT_NONE`.
+    ///
+    /// `EINVAL`: an unaligned address, unknown `prot` bits, or a range that leaves user space.
+    /// `ENOMEM`: part of the range is neither mapped nor reserved, the space is dying, the record
+    /// limit would be passed, or the budget or the frame allocator refused the pages. A refusal
+    /// changes nothing.
+    pub fn mprotect(&self, addr: Vaddr, len: usize, prot: usize) -> Result<(), Errno> {
+        if !addr.is_multiple_of(PAGE_SIZE) || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let end = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .and_then(|size| addr.checked_add(size))
+            .filter(|&end| end <= USER_TOP)
+            .ok_or(Errno::EINVAL)?;
+        let range = addr..end;
+        let mut mm = self.mm.lock();
+        if self.is_dying() {
+            return Err(Errno::ENOMEM);
+        }
+        // First pass: change nothing, find the pages a reservation still owes.
+        let mut owed = Vec::new();
+        for (seg, reserved) in segments(&mm.recs, &range) {
+            let gaps = holes(&self.vm, &seg);
+            if reserved {
+                owed.extend(gaps);
+            } else if !gaps.is_empty() {
+                return Err(Errno::ENOMEM);
+            }
+        }
+        if len_after_cut(&mm.recs, &range, true) > MAX_MAPS_PER_SPACE {
+            return Err(Errno::ENOMEM);
+        }
+        // Second pass. Populate first, so a failure leaves the old protection in place.
+        let missing = pages_in(&owed);
+        if prot != PROT_NONE && missing > 0 {
+            self.charge_pages(missing).map_err(|_| Errno::ENOMEM)?;
+            let flags = prop_flags(prot);
+            for (i, run) in owed.iter().enumerate() {
+                if self.map_pages(run, flags).is_err() {
+                    for done in &owed[..i] {
+                        self.unmap_range(done);
+                    }
+                    self.uncharge_pages(missing - pages_in(&owed[..i]));
+                    return Err(Errno::ENOMEM);
+                }
+            }
+        }
+        self.protect_range(&range, prot);
+        cut(&mut mm.recs, &range, Some(prot));
+        Ok(())
+    }
+
+    /// The protection the record covering `addr` last got, if one does.
+    pub fn prot_at(&self, addr: Vaddr) -> Option<usize> {
+        let mm = self.mm.lock();
+        let (_, rec) = mm.recs.range(..=addr).next_back()?;
+        (rec.end > addr).then_some(rec.prot)
     }
 
     /// Mapping records the space holds.
@@ -406,7 +655,10 @@ mod test {
         let base = s.mmap(0, 8 * PAGE_SIZE, NONE, ANON, 0).unwrap();
         assert_eq!(a.mem_used_pages(), used, "a reservation costs no pages");
         assert!(!any_mapped(s.vm(), base..base + 8 * PAGE_SIZE));
+        assert_eq!(s.prot_at(base), Some(PROT_NONE));
         assert_eq!(s.mprotect(base, 2 * PAGE_SIZE, RW), Ok(()));
+        assert_eq!(s.prot_at(base), Some(RW));
+        assert_eq!(s.prot_at(base + 2 * PAGE_SIZE), Some(PROT_NONE));
         assert_eq!(a.mem_used_pages(), used + 2);
         assert_eq!(s.mprotect(base, 8 * PAGE_SIZE, RW), Ok(()));
         assert_eq!(a.mem_used_pages(), used + 8, "six more, never eight");
@@ -461,6 +713,7 @@ mod test {
         );
         let flags = prop_at(s.vm(), base).unwrap().flags;
         assert!(flags.contains(PageFlags::W), "nothing changed");
+        assert_eq!(s.prot_at(base), Some(RW));
         assert_eq!(a.mem_used_pages(), used);
         assert_eq!(s.map_count(), 1);
     }

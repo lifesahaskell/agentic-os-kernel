@@ -660,6 +660,71 @@ mod test {
     const KERNEL_HALF: usize = 0xffff_8000_0000_0000;
 
     #[ktest]
+    fn decode_self_memory_calls() {
+        use abi::{MAP_FIXED, MAP_PRIVATE, PROT_NONE, PROT_READ};
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+        let m = |addr, len, prot, flags, off| {
+            decode(SYS_MMAP, [addr, len, prot, flags, usize::MAX, off])
+        };
+        assert_eq!(
+            m(0, 5000, PROT_READ, anon, 0),
+            Ok(Syscall::Mmap {
+                addr: 0,
+                len: 5000,
+                prot: PROT_READ,
+                flags: anon,
+                off: 0
+            })
+        );
+        assert_eq!(m(0, 0, PROT_READ, anon, 0), Err(Errno::EINVAL));
+        assert_eq!(m(0, 1, 8, anon, 0), Err(Errno::EINVAL));
+        assert_eq!(m(0, 1, PROT_READ, MAP_ANONYMOUS, 0), Err(Errno::EINVAL));
+        assert_eq!(
+            m(0, 1, PROT_READ, MAP_SHARED | MAP_ANONYMOUS, 0),
+            Err(Errno::ENOTSUP)
+        );
+        assert_eq!(m(0, 1, PROT_READ, MAP_PRIVATE, 0), Err(Errno::ENODEV));
+        assert_eq!(m(0, 1, PROT_READ, anon, 1), Err(Errno::EINVAL));
+        assert_eq!(m(1, 1, PROT_READ, anon | MAP_FIXED, 0), Err(Errno::EINVAL));
+        // A hint need not be aligned; only MAP_FIXED needs it.
+        assert!(m(1, 1, PROT_READ, anon, 0).is_ok());
+        assert_eq!(m(0, usize::MAX, PROT_READ, anon, 0), Err(Errno::ENOMEM));
+
+        assert_eq!(
+            decode(SYS_MPROTECT, [0x1000, 4096, PROT_NONE, 0, 0, 0]),
+            Ok(Syscall::Mprotect {
+                addr: 0x1000,
+                len: 4096,
+                prot: PROT_NONE
+            })
+        );
+        assert_eq!(
+            decode(SYS_MPROTECT, [0x1001, 4096, 0, 0, 0, 0]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            decode(SYS_MPROTECT, [0x1000, 4096, 8, 0, 0, 0]),
+            Err(Errno::EINVAL)
+        );
+
+        assert_eq!(
+            decode(SYS_MUNMAP, [0x1000, 1, 0, 0, 0, 0]),
+            Ok(Syscall::Munmap {
+                addr: 0x1000,
+                len: 1
+            })
+        );
+        assert_eq!(
+            decode(SYS_MUNMAP, [0x1001, 1, 0, 0, 0, 0]),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            decode(SYS_MUNMAP, [0x1000, 0, 0, 0, 0, 0]),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[ktest]
     fn decode_rejects_bad_numbers_pointers_and_lengths() {
         let z = [0usize; 6];
         let err = |nr, a| decode(nr, a).err();
