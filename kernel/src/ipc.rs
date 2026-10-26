@@ -329,6 +329,12 @@ impl Endpoint {
     /// For a kernel task as the server: the call's `ReplyWait` stays in the message and no Cancel
     /// can reach the task.
     pub fn recv(&self, me: &Thread) -> Result<Message, IpcError> {
+        self.recv_until(me, None)
+    }
+
+    /// `recv` that gives up with `TimedOut` once the absolute `Jiffies` tick `deadline` is
+    /// reached. A queued message beats the deadline, and so does an interrupt (`block_until`).
+    pub fn recv_until(&self, me: &Thread, deadline: Option<u64>) -> Result<Message, IpcError> {
         Ok(me.block_until(
             &self.wq,
             || {
@@ -339,7 +345,7 @@ impl Endpoint {
                 }
                 Some(m)
             },
-            None,
+            deadline,
         )?)
     }
 
@@ -349,6 +355,16 @@ impl Endpoint {
     /// message labelled `LABEL_CANCEL` whose handle is that of the cancelled call, which stays
     /// in the table until the server answers it.
     fn recv_parked(&self, me: &Thread) -> Result<(Message, u64), IpcError> {
+        self.recv_parked_until(me, None)
+    }
+
+    /// `recv_parked` with the deadline of `recv_until`. A pending Cancel or a message already
+    /// queued is returned even when the deadline has passed.
+    pub fn recv_parked_until(
+        &self,
+        me: &Thread,
+        deadline: Option<u64>,
+    ) -> Result<(Message, u64), IpcError> {
         me.block_until(
             &self.wq,
             || {
@@ -370,21 +386,8 @@ impl Endpoint {
                 m.reply = None;
                 Some(Ok((m, handle)))
             },
-            None,
+            deadline,
         )?
-    }
-
-    // RED stubs: the deadline is not honoured yet.
-    pub fn recv_until(&self, _me: &Thread, _deadline: Option<u64>) -> Result<Message, IpcError> {
-        Err(IpcError::Invalid)
-    }
-
-    pub fn recv_parked_until(
-        &self,
-        _me: &Thread,
-        _deadline: Option<u64>,
-    ) -> Result<(Message, u64), IpcError> {
-        Err(IpcError::Invalid)
     }
 
     /// Undoes a `recv_parked` whose delivery to ring 3 failed, so the call is not lost.
@@ -610,8 +613,9 @@ fn recv_into(
     ep: &Endpoint,
     args: UserPtr<IpcArgs>,
     recv: UserSlice,
+    deadline: Option<u64>,
 ) -> Result<(), Errno> {
-    let (m, handle) = ep.recv_parked(t)?;
+    let (m, handle) = ep.recv_parked_until(t, deadline)?;
     // Install first: if the space has no room the message goes back and the receiver sees EMFILE.
     let installed = match install_caps(t.agent(), &m.caps) {
         Ok(i) => i,
@@ -638,16 +642,25 @@ fn recv_into(
     delivered
 }
 
-/// `SYS_RECV`: waits for a message on `ep` (needs RECV) and writes it into `args`.
+/// `SYS_RECV`: waits for a message on `ep` (needs RECV) and writes it into `args`. `deadline` is
+/// an absolute `Jiffies` tick; `None` waits until a message or an interrupt. Expiry is `ETIMEDOUT`.
 pub fn sys_recv_args(
     t: &Thread,
     space: &VmSpace,
     ep: Handle,
     args: UserPtr<IpcArgs>,
+    deadline: Option<u64>,
 ) -> Result<(), Errno> {
     let ep = endpoint(t, ep.index(), Rights::RECV)?;
     let a = read_args(space, args)?;
-    recv_into(t, space, &ep, args, user_slice(a.recv_buf, a.recv_len)?)
+    recv_into(
+        t,
+        space,
+        &ep,
+        args,
+        user_slice(a.recv_buf, a.recv_len)?,
+        deadline,
+    )
 }
 
 /// Answers the call parked under `a.reply` in `t`'s own table with `a.words`, the bytes of
@@ -674,18 +687,20 @@ pub fn sys_reply(t: &Thread, space: &VmSpace, args: UserPtr<IpcArgs>) -> Result<
 }
 
 /// `SYS_REPLY_RECV`: `sys_reply`, then `sys_recv_args` into the same block. The endpoint is
-/// resolved first and a failed reply returns before receiving.
+/// resolved first and a failed reply returns before receiving. Only the receive half is timed: a
+/// timeout after a successful reply returns `ETIMEDOUT` with the reply already delivered.
 pub fn sys_reply_recv(
     t: &Thread,
     space: &VmSpace,
     ep: Handle,
     args: UserPtr<IpcArgs>,
+    deadline: Option<u64>,
 ) -> Result<(), Errno> {
     let ep = endpoint(t, ep.index(), Rights::RECV)?;
     let a = read_args(space, args)?;
     let recv = user_slice(a.recv_buf, a.recv_len)?;
     answer(t, space, &a)?;
-    recv_into(t, space, &ep, args, recv)
+    recv_into(t, space, &ep, args, recv, deadline)
 }
 
 #[cfg(ktest)]
@@ -1060,7 +1075,7 @@ mod test {
         let elsewhere = VmSpace::new();
         let args = UserPtr::new(0x1000).unwrap();
         let none = user_slice(0, 0).unwrap();
-        assert!(recv_into(&s, &elsewhere, &ep, args, none).is_err());
+        assert!(recv_into(&s, &elsewhere, &ep, args, none, None).is_err());
         let m = ep.recv(&s).unwrap();
         assert_eq!(m.label, 6);
         m.reply.unwrap().reply([1, 2, 3, 4]);
@@ -1466,7 +1481,7 @@ mod test {
         let args = UserPtr::new(0x1000).unwrap();
         let none = user_slice(0, 0).unwrap();
         assert_eq!(
-            recv_into(&receiver, &elsewhere, &ep, args, none),
+            recv_into(&receiver, &elsewhere, &ep, args, none, None),
             Err(Errno::EMFILE)
         );
         assert_eq!(receiver.agent().cspace.lock().room(), 2);
@@ -1477,7 +1492,7 @@ mod test {
         receiver.agent().cspace.lock().remove(1).unwrap();
         receiver.agent().cspace.lock().remove(2).unwrap();
         assert_eq!(receiver.agent().cspace.lock().room(), 4);
-        assert!(recv_into(&receiver, &elsewhere, &ep, args, none).is_err());
+        assert!(recv_into(&receiver, &elsewhere, &ep, args, none, None).is_err());
         assert_eq!(receiver.agent().cspace.lock().room(), 4);
         assert_eq!(ep.queue.lock().len(), 1);
 

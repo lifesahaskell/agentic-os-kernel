@@ -8,8 +8,8 @@
 use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
-    IpcArgs, MAX_IPC_BYTES, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV,
-    SYS_SCHED_YIELD, Timespec, USER_TOP, errno,
+    IpcArgs, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_RECV, SYS_REPLY,
+    SYS_REPLY_RECV, SYS_SCHED_YIELD, Timespec, USER_TOP, errno,
 };
 use ostd::{mm::VmSpace, task::Task, timer::Jiffies};
 
@@ -233,6 +233,15 @@ const FUTEX_CMP_REQUEUE: usize = 4;
 /// Ignored: futexes are keyed by physical address, so private and shared behave the same.
 const FUTEX_PRIVATE_FLAG: usize = 128;
 
+/// A receive timeout in milliseconds: 0 (no timeout) up to `MAX_TIMEOUT_MS`, else `EINVAL`.
+fn bounded_timeout(ms: usize) -> Result<u64, Errno> {
+    let ms = ms as u64;
+    if ms > MAX_TIMEOUT_MS {
+        return Err(Errno::EINVAL);
+    }
+    Ok(ms)
+}
+
 /// Decodes `rax` and the six argument registers. An unknown number or futex op is `ENOSYS`; a
 /// pointer, length or slot outside its bound is `EFAULT`, `EINVAL` or `EBADF`.
 pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
@@ -275,7 +284,7 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
         SYS_RECV => Syscall::Recv {
             ep: Handle::new(a[0])?,
             args: UserPtr::new(a[1])?,
-            timeout_ms: a[2] as u64,
+            timeout_ms: bounded_timeout(a[2])?,
         },
         SYS_REPLY => Syscall::Reply {
             args: UserPtr::new(a[0])?,
@@ -283,7 +292,7 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
         SYS_REPLY_RECV => Syscall::ReplyRecv {
             ep: Handle::new(a[0])?,
             args: UserPtr::new(a[1])?,
-            timeout_ms: a[2] as u64,
+            timeout_ms: bounded_timeout(a[2])?,
         },
         _ => return Err(Errno::ENOSYS),
     })
@@ -314,8 +323,16 @@ fn timespec_ms(ts: Timespec) -> Result<u64, Errno> {
         .saturating_add((ts.nsec as u64).div_ceil(1_000_000)))
 }
 
-/// `FUTEX_WAIT`. With a timeout of `ms` the deadline is `now + ms + 1` ticks: the extra tick covers
-/// the part of the current tick already elapsed, so the wait is never early. A zero timeout reads
+/// The absolute `Jiffies` deadline for a wait of `ms`: `now + ms + 1` ticks. The extra tick covers
+/// the part of the current tick already elapsed, so the wait is never early.
+fn deadline_in(ms: u64) -> u64 {
+    Jiffies::elapsed()
+        .as_u64()
+        .saturating_add(ms)
+        .saturating_add(1)
+}
+
+/// `FUTEX_WAIT`. A timeout of `ms` becomes the deadline `deadline_in(ms)`. A zero timeout reads
 /// the word and never blocks.
 fn futex_wait(
     t: &Thread,
@@ -334,16 +351,12 @@ fn futex_wait(
     if ms == 0 {
         return Ok(futex::probe(t, space, addr.addr(), val)?);
     }
-    let deadline = Jiffies::elapsed()
-        .as_u64()
-        .saturating_add(ms)
-        .saturating_add(1);
     Ok(futex::wait_until(
         t,
         space,
         addr.addr(),
         val,
-        Some(deadline),
+        Some(deadline_in(ms)),
     )?)
 }
 
@@ -374,10 +387,22 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
                 .map_err(Errno::from),
         ),
         Syscall::Call { ep, args } => ret(ipc::sys_call(t, space, ep, args).map(|()| 0)),
-        Syscall::Recv { ep, args, .. } => ret(ipc::sys_recv_args(t, space, ep, args).map(|()| 0)),
+        Syscall::Recv {
+            ep,
+            args,
+            timeout_ms,
+        } => {
+            let deadline = (timeout_ms != 0).then(|| deadline_in(timeout_ms));
+            ret(ipc::sys_recv_args(t, space, ep, args, deadline).map(|()| 0))
+        }
         Syscall::Reply { args } => ret(ipc::sys_reply(t, space, args).map(|()| 0)),
-        Syscall::ReplyRecv { ep, args, .. } => {
-            ret(ipc::sys_reply_recv(t, space, ep, args).map(|()| 0))
+        Syscall::ReplyRecv {
+            ep,
+            args,
+            timeout_ms,
+        } => {
+            let deadline = (timeout_ms != 0).then(|| deadline_in(timeout_ms));
+            ret(ipc::sys_reply_recv(t, space, ep, args, deadline).map(|()| 0))
         }
     }
 }
