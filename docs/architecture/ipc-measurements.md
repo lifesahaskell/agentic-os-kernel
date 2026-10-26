@@ -63,6 +63,20 @@ The time column is cycles divided by the reported frequency. Under TCG the TSC d
 correspond to executed guest work in any fixed way, so treat it as a label for the unit, not a
 latency a KVM or bare-metal run would reproduce.
 
+## Which gates ran where (2026-10-26)
+
+`.github/workflows/check.yml` runs `sh scripts/check.sh` in full mode only when `/dev/kvm` is
+writable on the runner, and `sh scripts/check.sh --no-kvm` otherwise. In `--no-kvm` mode CI runs
+the unsafe-ledger self-test and check, the userland build, fmt and clippy, the kernel fmt and
+clippy, and `cargo osdk build`. The ktests (`cargo osdk test`) and the boot checks
+(`cargo osdk run`: `aok: fpu preemption check passed`, `aok: cpu budget check passed`) are
+LOCAL-ONLY in that mode. This branch had not been pushed when this was written, so no CI run
+exists for it: I did not verify which mode the hosted runner takes. On 2026-10-26 every gate ran
+locally, in full mode with no `--no-kvm`, ending `check: all gates passed` (67 ktests passed,
+both boot checks passed). That host has no `/dev/kvm`, so "full mode" here means the gates that
+`check.sh` labels as needing KVM ran under QEMU TCG. The ktest and boot results are therefore
+TCG results, and the measurements above carry the same label.
+
 ## B2 comparison
 
 None. `b2-spike-report.md` records no IPC timing figure, so there is nothing to compare against.
