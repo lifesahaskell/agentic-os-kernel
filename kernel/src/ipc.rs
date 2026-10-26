@@ -28,6 +28,8 @@ use crate::{
     vm::{copy_from_user, copy_to_user},
 };
 
+pub mod timer;
+
 #[derive(Clone, Debug)]
 pub struct Message {
     pub sender: Credential,

@@ -3,6 +3,7 @@
 //!
 //! 0: `FUTEX_WAIT` on a stack word holding 0 with a 20 ms timespec: `-ETIMEDOUT`.
 //! 1: `RECV` on slot 0 (an endpoint nothing sends to) with a 20 ms timeout: `-ETIMEDOUT`.
+//! 2: `TIMER_ARM` 20 ms on slot 0 (SEND), then `RECV` that timer message on slot 1 (RECV).
 
 #![no_std]
 #![no_main]
@@ -10,7 +11,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use abi::{IpcArgs, SYS_FUTEX, SYS_RECV, Timespec, errno};
+use abi::{IpcArgs, LABEL_TIMER, SYS_FUTEX, SYS_RECV, SYS_TIMER_ARM, Timespec, errno};
 use libsys::raw::syscall6;
 
 const FUTEX_WAIT: usize = 0;
@@ -58,10 +59,38 @@ fn recv_timeout() -> u64 {
     verdict(r, errno::ETIMEDOUT)
 }
 
+const COOKIE: usize = 0xFEED;
+
+/// `timer_arm` 20 ms on slot 0 (SEND), then `recv` on slot 1 (RECV, the same endpoint) with a
+/// 200 ms guard: the message must carry `LABEL_TIMER` and the cookie, and the call must return
+/// the timer id (1 or more).
+fn timer_roundtrip() -> u64 {
+    let id = syscall6(SYS_TIMER_ARM, [0, 20, COOKIE, 0, 0, 0]);
+    if id < 1 {
+        return 100 + (-id) as u64;
+    }
+    let mut args = IpcArgs::default();
+    let r = syscall6(
+        SYS_RECV,
+        [1, &mut args as *mut IpcArgs as usize, 200, 0, 0, 0],
+    );
+    if r < 0 {
+        return 100 + (-r) as u64;
+    }
+    if args.label != LABEL_TIMER {
+        return 98;
+    }
+    if args.words[0] != COOKIE as u64 || args.words[3] != id as u64 {
+        return 97;
+    }
+    0
+}
+
 fn main(arg: u64) -> u64 {
     match arg {
         0 => futex_timeout(),
         1 => recv_timeout(),
+        2 => timer_roundtrip(),
         _ => 200,
     }
 }

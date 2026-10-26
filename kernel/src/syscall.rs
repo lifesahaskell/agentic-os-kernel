@@ -9,7 +9,7 @@ use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
     IpcArgs, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_RECV, SYS_REPLY,
-    SYS_REPLY_RECV, SYS_SCHED_YIELD, Timespec, USER_TOP, errno,
+    SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_TIMER_ARM, Timespec, USER_TOP, errno,
 };
 use ostd::{mm::VmSpace, task::Task, timer::Jiffies};
 
@@ -224,6 +224,12 @@ pub enum Syscall {
         /// As for `Recv`; the reply half is never timed.
         timeout_ms: u64,
     },
+    /// Sends `LABEL_TIMER` with `cookie` to `ep` after `delay_ms`.
+    TimerArm {
+        ep: Handle,
+        delay_ms: u64,
+        cookie: u64,
+    },
 }
 
 const FUTEX_WAIT: usize = 0;
@@ -293,6 +299,12 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
             ep: Handle::new(a[0])?,
             args: UserPtr::new(a[1])?,
             timeout_ms: bounded_timeout(a[2])?,
+        },
+        // The delay is range-checked by `timer::arm`, after the slot resolves.
+        SYS_TIMER_ARM => Syscall::TimerArm {
+            ep: Handle::new(a[0])?,
+            delay_ms: a[1] as u64,
+            cookie: a[2] as u64,
         },
         _ => return Err(Errno::ENOSYS),
     })
@@ -404,6 +416,13 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
             let deadline = (timeout_ms != 0).then(|| deadline_in(timeout_ms));
             ret(ipc::sys_reply_recv(t, space, ep, args, deadline).map(|()| 0))
         }
+        Syscall::TimerArm {
+            ep,
+            delay_ms,
+            cookie,
+        } => ret(ipc::timer::sys_timer_arm(t, ep.index(), delay_ms, cookie)
+            .map(|id| id as usize)
+            .map_err(Errno::from)),
     }
 }
 
@@ -683,7 +702,7 @@ mod test {
 
         // Each decode and copy error path once, with its exact errno.
         let z = [0usize; 6];
-        let targeted: [(usize, [usize; 6], isize); 14] = [
+        let targeted: [(usize, [usize; 6], isize); 16] = [
             (0xFFFF, z, errno::ENOSYS),
             (SYS_FUTEX, [mapped, 99, 0, 0, 0, 0], errno::ENOSYS),
             // The timeout pointer is address 1, which is unmapped.
@@ -706,6 +725,9 @@ mod test {
             (SYS_CALL, [0, mapped, 0, 0, 0, 0], errno::EINTR),
             // A receive timeout above the cap is refused at decode, before any slot is looked up.
             (SYS_RECV, [1, mapped, 600_001, 0, 0, 0], errno::EINVAL),
+            // A timer delay of 0 is refused, and an empty slot is EBADF whatever the delay.
+            (SYS_TIMER_ARM, [0, 0, 7, 0, 0, 0], errno::EINVAL),
+            (SYS_TIMER_ARM, [5, 10, 7, 0, 0, 0], errno::EBADF),
         ];
         for (i, (nr, a, want)) in targeted.into_iter().enumerate() {
             assert_eq!(
@@ -742,6 +764,7 @@ mod test {
             SYS_RECV,
             SYS_REPLY,
             SYS_REPLY_RECV,
+            SYS_TIMER_ARM,
         ];
         let (mut enosys, mut efault, mut einval, mut ebadf, mut eintr) = (0, 0, 0, 0, 0);
         for i in 0..ITERATIONS {
@@ -784,6 +807,9 @@ mod test {
             }
         }
         t.take_redirect();
+        // Random arms that got through must not outlive the test: a pending timer holds a
+        // deadline registration that other tests assert is empty.
+        crate::ipc::timer::disarm_all();
         println!(
             "aok: fuzz n={} enosys={} efault={} einval={} ebadf={} eintr={}",
             ITERATIONS, enosys, efault, einval, ebadf, eintr
