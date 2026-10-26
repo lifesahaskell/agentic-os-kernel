@@ -20,6 +20,7 @@ pub mod vm;
 use alloc::sync::Arc;
 
 use ostd::{
+    mm::{FrameAllocOptions, PageFlags},
     power::{ExitCode, poweroff},
     prelude::*,
     sync::SpinLock,
@@ -30,7 +31,7 @@ use ostd::{
 use crate::{
     agent::{Agent, CPU_PERIOD_TICKS},
     thread::Thread,
-    user::{Exit, prog, user_image},
+    user::{Exit, user_image},
 };
 
 #[ostd::main]
@@ -93,26 +94,32 @@ fn cpu_budget_check() {
     let child = root.spawn_child(&[], 0, CHILD_QUOTA).unwrap();
 
     let start = Jiffies::elapsed().as_u64();
-    let spinners = [(root.clone(), 0x40_0000), (child.clone(), 0x60_0000)].map(|(agent, code)| {
+    // Each agent runs its own copy of `spinner` with its own test page and an id the program
+    // re-reads on every iteration. Both images sit at the same addresses, so a thread resumed
+    // under the other space's page tables does not fault: it reads the foreign id and exits 1.
+    let spinners = [(root.clone(), 1u64), (child.clone(), 2)].map(|(agent, id)| {
+        let img = user::load_image(user_image!("spinner")).unwrap();
+        user::map_test_page(
+            &img.space,
+            FrameAllocOptions::new().alloc_frame().unwrap().into(),
+            PageFlags::RW,
+        );
         let t = Thread::new(agent);
         let exit: Arc<SpinLock<Option<Exit>>> = Arc::new(SpinLock::new(None));
-        let (t2, e) = (t.clone(), exit.clone());
-        TaskOptions::new(move || {
-            let space = user::load(code);
-            *e.lock() = Some(user::run(&t2, &space, code + prog::SPINNER));
-        })
-        .data(t.clone())
-        .spawn()
-        .unwrap();
-        (t, code, exit)
+        let (t2, i2, e) = (t.clone(), img.clone(), exit.clone());
+        TaskOptions::new(move || *e.lock() = Some(user::start(&t2, &i2, id)))
+            .data(t.clone())
+            .spawn()
+            .unwrap();
+        (t, img, exit)
     });
 
     // This task is never budgeted, so it is also the idle fallback when both agents are out.
     while Jiffies::elapsed().as_u64() < start + RUN_TICKS {
         Task::yield_now();
     }
-    for (t, code, _) in &spinners {
-        t.interrupt(code + prog::HANDLER);
+    for (t, img, _) in &spinners {
+        t.interrupt(img.handler);
     }
     while spinners.iter().any(|(_, _, e)| e.lock().is_none()) {
         Task::yield_now();
@@ -124,12 +131,11 @@ fn cpu_budget_check() {
         "aok: {} periods: root agent {} ticks (quota 8), child {} (quota {})",
         periods, root_ticks, child_ticks, CHILD_QUOTA
     );
-    // Exiting through HANDLER with the pc inside its own SPINNER proves each thread was
-    // running in its own address space when redirected; the wrong space faults instead.
-    let mut ok = spinners.iter().all(|(_, code, e)| {
-        let spin = code + prog::SPINNER..code + prog::SPINNER + 10;
-        matches!(*e.lock(), Some(Exit::Code(pc)) if spin.contains(&pc))
-    });
+    // Exiting through the handler with the pc inside the image text proves the spinner never saw
+    // a foreign id, so each thread was running in its own address space when redirected.
+    let mut ok = spinners
+        .iter()
+        .all(|(_, img, e)| matches!(*e.lock(), Some(Exit::Code(pc)) if img.text.contains(&pc)));
     ok &= child_ticks <= CHILD_QUOTA * periods
         && root_ticks <= (CPU_PERIOD_TICKS - CHILD_QUOTA) * periods;
     ok &= child_ticks > 0 && root_ticks > child_ticks;

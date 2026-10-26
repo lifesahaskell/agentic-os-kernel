@@ -1436,4 +1436,44 @@ mod test {
             assert!(is_endpoint(cs.get(*slot).unwrap(), &obj));
         }
     }
+
+    /// IPC-06: 10,000 null calls (zero words, no data, no caps) timed by `rdtsc` in ring 3. Reports
+    /// only; the assertions check that the run completed, never a ceiling. Cycle counts come from
+    /// whatever the TSC is under the emulator, so they are not a hardware baseline.
+    #[ktest]
+    fn null_ipc_round_trip_is_recorded() {
+        let (null_ep, report_ep) = (Endpoint::new(), Endpoint::new());
+        let server_agent = agent_with(&null_ep);
+        let client_agent = Agent::new_root(43, 64);
+        for ep in [&null_ep, &report_ep] {
+            let cap = Cap::new(Object::Endpoint(ep.clone()), Rights::SEND);
+            client_agent.cspace.lock().insert(cap).unwrap();
+        }
+        let server_img = load_image(user_image!("nullsrv")).unwrap();
+        let client_img = load_image(user_image!("nullipc")).unwrap();
+        let (server, client) = (Thread::new(server_agent), Thread::new(client_agent));
+        let server_exit = spawn_image(&server, &server_img, 0);
+        let client_exit = spawn_image(&client, &client_img, 0);
+
+        // The kernel thread answering the client's one report call.
+        let reporter = Thread::new(Agent::new_root(44, 0));
+        let m = report_ep.recv(&reporter).unwrap();
+        let [n, median, p99, max] = m.words;
+        m.reply.unwrap().reply([0; 4]);
+        assert_eq!(join(&client_exit), Exit::Code(0));
+
+        server.interrupt(server_img.handler);
+        assert!(matches!(
+            join(&server_exit),
+            Exit::Code(pc) if server_img.text.contains(&(pc as usize))
+        ));
+
+        println!(
+            "aok: null-ipc n={} median={} p99={} max={} cycles",
+            n, median, p99, max
+        );
+        println!("aok: null-ipc tsc_freq={} Hz", ostd::arch::tsc_freq());
+        assert_eq!(n, 10_000);
+        assert!(median > 0);
+    }
 }

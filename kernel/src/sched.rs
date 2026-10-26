@@ -151,6 +151,7 @@ mod test {
     use alloc::vec::Vec;
 
     use ostd::{
+        mm::{FrameAllocOptions, PageFlags},
         prelude::*,
         task::{Task, TaskOptions},
     };
@@ -158,7 +159,11 @@ mod test {
     use super::*;
     use crate::{
         agent::{Agent, CPU_PERIOD_TICKS},
-        user::{self, Exit, prog},
+        user::{
+            self, Exit,
+            testkit::{join, spawn_image},
+            user_image,
+        },
     };
 
     fn task(thread: Option<Arc<Thread>>) -> Arc<Task> {
@@ -208,30 +213,22 @@ mod test {
 
     #[ktest]
     fn each_task_resumes_in_its_own_address_space() {
-        install_space_switch();
-        // The code sits at a different address in each space, so a thread resumed under the
-        // other space's page table faults on its next instruction fetch.
-        let codes = [0x40_0000, 0x60_0000];
-        let results: Vec<Arc<SpinLock<Option<Exit>>>> = codes
-            .iter()
-            .map(|_| Arc::new(SpinLock::new(None)))
-            .collect();
-        for (&code, r) in codes.iter().zip(&results) {
-            let t = Thread::new(Agent::new_root(1, 0));
-            let (t2, r) = (t.clone(), r.clone());
-            TaskOptions::new(move || {
-                let space = user::load(code);
-                *r.lock() = Some(user::run(&t2, &space, code + prog::YIELDER));
+        // Both images sit at the same addresses, so a thread resumed under the other space's page
+        // tables would not fault. `yielder` counts on its own test page and exits 1 when the count
+        // is not the one it expects, so mixed-up spaces fail the exit code.
+        let results: Vec<_> = (0..2)
+            .map(|_| {
+                let img = user::load_image(user_image!("yielder")).unwrap();
+                user::map_test_page(
+                    &img.space,
+                    FrameAllocOptions::new().alloc_frame().unwrap().into(),
+                    PageFlags::RW,
+                );
+                spawn_image(&Thread::new(Agent::new_root(1, 0)), &img, 0)
             })
-            .data(t)
-            .spawn()
-            .unwrap();
-        }
-        while results.iter().any(|r| r.lock().is_none()) {
-            Task::yield_now();
-        }
+            .collect();
         for r in &results {
-            assert_eq!(r.lock().take(), Some(Exit::Code(0)));
+            assert_eq!(join(r), Exit::Code(0));
         }
     }
 }
