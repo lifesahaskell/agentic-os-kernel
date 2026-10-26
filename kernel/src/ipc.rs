@@ -384,7 +384,9 @@ impl Endpoint {
     /// reply table and the returned handle (0 for a plain `send`) answers it. `Full` when the
     /// table has no room; the message then stays queued. A pending Cancel comes first, as a
     /// message labelled `LABEL_CANCEL` whose handle is that of the cancelled call, which stays
-    /// in the table until the server answers it.
+    /// in the table until the server answers it. Only tests wait without a deadline here; the
+    /// syscalls go through `recv_parked_until`.
+    #[cfg(ktest)]
     fn recv_parked(&self, me: &Thread) -> Result<(Message, u64), IpcError> {
         self.recv_parked_until(me, None)
     }
