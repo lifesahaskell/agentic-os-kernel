@@ -82,6 +82,17 @@ impl Space {
         *self.notify.lock() = Some(cap);
     }
 
+    /// Sets the notify capability only if none is set, `Denied` otherwise. The test and the store
+    /// share one lock acquisition.
+    fn set_notify_cap_once(&self, cap: Cap) -> Result<(), SpaceError> {
+        let mut notify = self.notify.lock();
+        if notify.is_some() {
+            return Err(SpaceError::Denied);
+        }
+        *notify = Some(cap);
+        Ok(())
+    }
+
     /// The endpoint notes go to: `None` when none is set, when the capability was revoked, or
     /// when it no longer resolves to an endpoint with SEND. Resolved at each use.
     pub fn notify_ep(&self) -> Option<Arc<Endpoint>> {
@@ -258,10 +269,42 @@ pub fn thread_interrupt(caller: &Thread, slot: usize, entry: usize) -> Result<()
 }
 
 /// Makes the Endpoint in `ep_slot` of the caller's agent (needs SEND) the notify endpoint of the
-/// space named by `target`.
-// RED stub: replaced by the real implementation in the next commit.
-pub fn set_notify(_caller: &Thread, _target: Target, _ep_slot: usize) -> Result<(), SpaceError> {
-    Err(SpaceError::Invalid)
+/// space named by `target`; the capability is kept, so revoking it later stops the notes.
+///
+/// Checked in this order: the target (`SelfSpace` is the caller's own space, `Dead` without one;
+/// `Slot` needs SIGNAL and a Space), the endpoint slot (SEND and an Endpoint), then the self rule.
+/// A holder of a Space capability may replace the endpoint at any time. A thread naming its own
+/// space may set it only while none is set (`Denied`), so it cannot redirect the notes its parent
+/// arranged (OD-18); the test and the store happen under one lock, so two racing self-sets cannot
+/// both succeed.
+pub fn set_notify(caller: &Thread, target: Target, ep_slot: usize) -> Result<(), SpaceError> {
+    let space = match target {
+        Target::SelfSpace => caller.process().ok_or(SpaceError::Dead)?,
+        Target::Slot(slot) => {
+            let obj = caller
+                .agent()
+                .cspace
+                .lock()
+                .get(slot)?
+                .resolve(Rights::SIGNAL)?;
+            match obj {
+                Object::Space(s) => s,
+                _ => return Err(SpaceError::WrongType),
+            }
+        }
+    };
+    let cap = caller.agent().cspace.lock().get(ep_slot)?.clone();
+    match cap.resolve(Rights::SEND)? {
+        Object::Endpoint(_) => {}
+        _ => return Err(SpaceError::WrongType),
+    }
+    match target {
+        Target::SelfSpace => space.set_notify_cap_once(cap),
+        Target::Slot(_) => {
+            space.set_notify_cap(cap);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(ktest)]

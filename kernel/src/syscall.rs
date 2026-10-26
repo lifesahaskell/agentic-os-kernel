@@ -9,8 +9,9 @@ use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
     IpcArgs, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SPACE_SELF, SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_RECV,
-    SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_THREAD_CREATE, SYS_THREAD_INTERRUPT,
-    SYS_TIMER_ARM, THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP, errno,
+    SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_SPACE_NOTIFY, SYS_THREAD_CREATE,
+    SYS_THREAD_INTERRUPT, SYS_TIMER_ARM, THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP,
+    errno,
 };
 use ostd::{mm::VmSpace, task::Task, timer::Jiffies};
 
@@ -257,6 +258,11 @@ pub enum Syscall {
         thread: Handle,
         entry: usize,
     },
+    /// Makes the Endpoint in slot `ep` the notify endpoint of a space.
+    SpaceNotify {
+        target: Target,
+        ep: Handle,
+    },
 }
 
 const FUTEX_WAIT: usize = 0;
@@ -346,6 +352,14 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
         SYS_THREAD_INTERRUPT => Syscall::ThreadInterrupt {
             thread: Handle::new(a[0])?,
             entry: a[1],
+        },
+        SYS_SPACE_NOTIFY => Syscall::SpaceNotify {
+            target: if a[0] as u64 == SPACE_SELF {
+                Target::SelfSpace
+            } else {
+                Target::Slot(Handle::new(a[0])?.index())
+            },
+            ep: Handle::new(a[1])?,
         },
         _ => return Err(Errno::ENOSYS),
     })
@@ -506,6 +520,9 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
                 .map(|()| 0)
                 .map_err(Errno::from))
         }
+        Syscall::SpaceNotify { target, ep } => ret(space::set_notify(t, target, ep.index())
+            .map(|()| 0)
+            .map_err(Errno::from)),
     }
 }
 
@@ -700,6 +717,28 @@ mod test {
             Some(Errno::EBADF)
         );
         assert_eq!(
+            decode(SYS_SPACE_NOTIFY, [4, 2, 0, 0, 0, 0]),
+            Ok(Syscall::SpaceNotify {
+                target: Target::Slot(4),
+                ep: Handle::new(2).unwrap(),
+            })
+        );
+        assert_eq!(
+            decode(SYS_SPACE_NOTIFY, [SPACE_SELF as usize, 0, 0, 0, 0, 0]),
+            Ok(Syscall::SpaceNotify {
+                target: Target::SelfSpace,
+                ep: Handle::new(0).unwrap(),
+            })
+        );
+        assert_eq!(
+            err(SYS_SPACE_NOTIFY, [Handle::LIMIT, 0, 0, 0, 0, 0]),
+            Some(Errno::EBADF)
+        );
+        assert_eq!(
+            err(SYS_SPACE_NOTIFY, [0, Handle::LIMIT, 0, 0, 0, 0]),
+            Some(Errno::EBADF)
+        );
+        assert_eq!(
             decode(SYS_FUTEX, [0x1000, 4 | 128, 2, 5, 0x2000, 9]),
             Ok(Syscall::FutexRequeue {
                 addr: UserPtr::new(0x1000).unwrap(),
@@ -821,7 +860,7 @@ mod test {
 
         // Each decode and copy error path once, with its exact errno.
         let z = [0usize; 6];
-        let targeted: [(usize, [usize; 6], isize); 21] = [
+        let targeted: [(usize, [usize; 6], isize); 24] = [
             (0xFFFF, z, errno::ENOSYS),
             (SYS_FUTEX, [mapped, 99, 0, 0, 0, 0], errno::ENOSYS),
             // The timeout pointer is address 1, which is unmapped.
@@ -878,6 +917,17 @@ mod test {
                 [0, KERNEL_HALF, 0, 0, 0, 0],
                 errno::EINVAL,
             ),
+            // This thread has no Space, so it has no own space to name.
+            (
+                SYS_SPACE_NOTIFY,
+                [SPACE_SELF as usize, 0, 0, 0, 0, 0],
+                errno::ESRCH,
+            ),
+            // An empty space slot is EBADF.
+            (SYS_SPACE_NOTIFY, [5, 0, 0, 0, 0, 0], errno::EBADF),
+            // Slot 0 holds an Endpoint with SEND only: the rights check on the space slot comes
+            // before its type check.
+            (SYS_SPACE_NOTIFY, [0, 1, 0, 0, 0, 0], errno::EPERM),
         ];
         for (i, (nr, a, want)) in targeted.into_iter().enumerate() {
             assert_eq!(
@@ -907,7 +957,7 @@ mod test {
 
         let mut rng = Rng(0x9E3779B97F4A7C15);
         // No Space capability and no Space-bearing thread exist in this setup, so a random
-        // `thread_create` or `thread_interrupt` can only be refused. The success paths are the
+        // `thread_create`, `thread_interrupt` or `space_notify` can only be refused. The success paths are the
         // ktests in `space`.
         let numbers = [
             SYS_EXIT,
@@ -920,6 +970,7 @@ mod test {
             SYS_TIMER_ARM,
             SYS_THREAD_CREATE,
             SYS_THREAD_INTERRUPT,
+            SYS_SPACE_NOTIFY,
         ];
         let (mut enosys, mut efault, mut einval, mut ebadf, mut eintr) = (0, 0, 0, 0, 0);
         for i in 0..ITERATIONS {
