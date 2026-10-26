@@ -439,6 +439,36 @@ mod test {
         assert_eq!(start(&t, &img, 0), Exit::Fault(DATA));
     }
 
+    /// Like `start`, but with the initial `rsp` chosen by the caller.
+    fn start_with_sp(thread: &Thread, img: &Image, sp: usize) -> Exit {
+        let mut ctx = UserContext::default();
+        ctx.set_rip(img.entry);
+        ctx.set_rsp(sp);
+        ctx.set_rdi(0);
+        run_ctx(thread, &img.space, ctx)
+    }
+
+    /// CR-01: `_start` aligns `rsp` and `call`s, and the call's return-address push is an 8-byte
+    /// ring-3 store to `rsp - 8`. With `rsp` in the kernel half that store is a write fault the
+    /// kernel must report as `Exit::Fault`, not die on.
+    #[ktest]
+    fn ring3_store_to_kernel_half_is_a_fault() {
+        let img = load_image(user_image!("kpush")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 4));
+        assert_eq!(
+            start_with_sp(&t, &img, 0xffff_8000_0000_0010),
+            Exit::Fault(0xffff_8000_0000_0008)
+        );
+        // The top page, where `page + PAGE_SIZE` overflows.
+        assert_eq!(
+            start_with_sp(&t, &img, 0),
+            Exit::Fault(0xffff_ffff_ffff_fff8)
+        );
+        // The kernel survived and still runs ring 3.
+        assert_eq!(start(&t, &img, 0), Exit::Code(0x5afe));
+        assert_eq!(t.agent().mem_used_pages(), 0);
+    }
+
     #[ktest]
     fn timer_interrupt_redirects_a_running_thread() {
         let img = load_image(user_image!("spin")).unwrap();
