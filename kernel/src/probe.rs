@@ -5,9 +5,7 @@
 //! page moves from the free count to the slab count when the heap grows, so the sum is stable
 //! across slab growth and moves only when a frame leaves the pair, which is what a leak does.
 //!
-//! What it misses: heap allocations too large for a slab (A3). Those bypass the slab and come
-//! straight out of the frame allocator, so they do show as a frame delta, but a large object that
-//! the heap keeps cached is invisible. The kernel-side counters in 02-07 cover that gap.
+//! What it misses: non-slab heap allocations (A3), which the kernel counters in 02-07 cover.
 //!
 //! The counters are the OSDK base crate's own: `aok` names the same two crates, and cargo unifies
 //! them to one copy, so the statics the base crate registers as the kernel's allocators are the
@@ -22,13 +20,52 @@ pub fn free() -> usize {
     osdk_frame_allocator::load_total_free_size() + osdk_heap_allocator::load_total_slab_size()
 }
 
+// RED stubs: the protocol has the right signatures and does nothing yet.
+pub const SETTLE_ROUNDS: usize = 8;
+
+pub fn settle(_rounds: usize) {}
+
+pub fn park_activation() {}
+
+pub fn settled() -> usize {
+    free()
+}
+
 #[cfg(ktest)]
 mod test {
-    use alloc::{boxed::Box, vec::Vec};
+    use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
-    use ostd::{mm::FrameAllocOptions, prelude::*};
+    use ostd::{
+        mm::{
+            CachePolicy, FrameAllocOptions, PageFlags, PageProperty, Vaddr, VmSpace,
+            tlb::TlbFlushOp,
+        },
+        prelude::*,
+        task::disable_preempt,
+    };
 
     use super::*;
+
+    const PAGE: Vaddr = 0x40_0000;
+
+    /// A fresh space with one fresh frame mapped at `PAGE`. The mapping holds the only
+    /// reference to the frame.
+    fn space_with_one_page() -> VmSpace {
+        let space = VmSpace::new();
+        let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+        let guard = disable_preempt();
+        let mut c = space.cursor_mut(&guard, &(PAGE..PAGE + PAGE_SIZE)).unwrap();
+        c.map(
+            frame.into(),
+            PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback),
+        );
+        drop(c);
+        space
+    }
+
+    fn delta(base: usize) -> isize {
+        base as isize - free() as isize
+    }
 
     #[ktest]
     fn frame_probe_spike_counts_one_frame() {
@@ -65,5 +102,44 @@ mod test {
         assert_eq!(free(), b, "slab growth moved the probe");
         drop(held);
         assert_eq!(free(), b, "slab release moved the probe");
+    }
+
+    #[ktest]
+    fn frame_probe_settle_returns_an_unmapped_frame() {
+        let b = settled();
+        {
+            let space = space_with_one_page();
+            let guard = disable_preempt();
+            let range = PAGE..PAGE + PAGE_SIZE;
+            let mut c = space.cursor_mut(&guard, &range).unwrap();
+            c.unmap(PAGE_SIZE);
+            c.flusher()
+                .issue_tlb_flush(TlbFlushOp::for_range(range.clone()));
+            c.flusher().dispatch_tlb_flush();
+            drop(c);
+            drop(guard);
+        }
+        // The space is dropped here. Count the rounds it takes for every frame to come back.
+        let mut rounds = 0;
+        for step in [1, 1, 2, 4, 8] {
+            settle(step);
+            rounds += step;
+            println!("frame_probe: settle rounds={} delta={}", rounds, delta(b));
+        }
+        assert!(rounds >= SETTLE_ROUNDS);
+        assert_eq!(delta(b), 0, "frames still missing after {} rounds", rounds);
+    }
+
+    #[ktest]
+    fn frame_probe_activation_pin_released() {
+        let b = settled();
+        let space = Arc::new(space_with_one_page());
+        space.activate();
+        drop(space);
+        // The per-CPU activated-space slot still holds the space, so its page-table nodes and
+        // frame are expected to be missing here. An observation, not an assertion.
+        settle(SETTLE_ROUNDS);
+        println!("frame_probe: pinned delta={}", delta(b));
+        assert_eq!(settled(), b, "the park did not release the pinned space");
     }
 }
