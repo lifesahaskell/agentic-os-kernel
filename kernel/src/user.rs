@@ -643,6 +643,59 @@ mod test {
         assert_eq!(t.frame_depth(), 0);
     }
 
+    /// Runs the `sigframe` probe with a timer-driven interrupt: the probe has no syscalls to
+    /// yield in, and the scheduler does not preempt, so the interrupt must come from the tick.
+    /// The delay is long enough that the probe is spinning with every register loaded.
+    fn run_sigframe() -> Exit {
+        let img = load_image(user_image!("sigframe")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 0));
+        let alarm: Arc<SpinLock<Option<Arc<Thread>>, LocalIrqDisabled>> =
+            Arc::new(SpinLock::new(Some(t.clone())));
+        let deadline = Jiffies::elapsed().as_u64() + 30;
+        let a = alarm.clone();
+        let handler = img.handler;
+        register_callback_on_cpu(move || {
+            if Jiffies::elapsed().as_u64() >= deadline {
+                if let Some(t) = a.lock().take() {
+                    t.interrupt(handler);
+                }
+            }
+        });
+        let exit = start(&t, &img, 0);
+        assert!(alarm.lock().is_none(), "the interrupt never fired");
+        assert_eq!(t.frame_depth(), 0);
+        exit
+    }
+
+    /// Resets `CORRUPT_FRAME` when a control test ends, however it ends.
+    struct Uncorrupt;
+    impl Drop for Uncorrupt {
+        fn drop(&mut self) {
+            crate::thread::CORRUPT_FRAME.store(0, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[ktest]
+    fn sigreturn_restores_all_gprs_fpu_and_leaves_the_user_stack_untouched() {
+        assert_eq!(run_sigframe(), Exit::Code(0));
+    }
+
+    /// Negative control: a restore that corrupts rbx must make the probe report rbx (1 + 1).
+    #[ktest]
+    fn sigreturn_probe_detects_a_corrupted_rbx() {
+        let _guard = Uncorrupt;
+        crate::thread::CORRUPT_FRAME.store(1, core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(run_sigframe(), Exit::Code(2));
+    }
+
+    /// Negative control: a restore that skips the FPU write leaves the handler's zeroed xmm0.
+    #[ktest]
+    fn sigreturn_probe_detects_a_skipped_fpu_restore() {
+        let _guard = Uncorrupt;
+        crate::thread::CORRUPT_FRAME.store(2, core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(run_sigframe(), Exit::Code(20));
+    }
+
     /// A data frame whose first byte is `first`.
     fn data_frame(first: u8) -> UFrame {
         let f = FrameAllocOptions::new().alloc_frame().unwrap();

@@ -136,6 +136,12 @@ static FPU_OWNER: SpinLock<Option<SharedFpu>, LocalIrqDisabled> = SpinLock::new(
 pub(crate) static FPU_SWAP_DISABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Ktest-only fault injection for `restore_frame`, so a test can prove the register probe would
+/// notice: 1 adds one to the saved `rbx`, 2 skips the FPU write, 0 is the real behaviour.
+#[cfg(ktest)]
+pub(crate) static CORRUPT_FRAME: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
 /// The next thread id. Never reused, so a tid names one thread for the life of the kernel.
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
