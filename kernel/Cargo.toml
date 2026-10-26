@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 abi = { package = "aok-abi", path = "../userland/abi" }
+# Read-only counters for the ktest free-frame probe (src/probe.rs). The OSDK base crate already
+# links both and registers them as the kernel's allocators; these lines only name the same crates
+# so `aok` can call their counter functions. Pinned with OSTD (tools/pin_check.sh).
+osdk-frame-allocator = "=0.19.0"
+osdk-heap-allocator = "=0.19.0"
 
 [dependencies.ostd]
 version = "=0.19.0"
