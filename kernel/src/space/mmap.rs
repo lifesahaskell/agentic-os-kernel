@@ -13,7 +13,9 @@
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::ops::Range;
 
-use abi::{MAP_FIXED, MMAP_BASE, MMAP_TOP, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE, USER_TOP};
+use abi::{
+    BRK_MAX, MAP_FIXED, MMAP_BASE, MMAP_TOP, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE, USER_TOP,
+};
 use ostd::{
     mm::{
         CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, Vaddr, VmSpace,
@@ -38,14 +40,15 @@ struct Rec {
     prot: usize,
 }
 
-/// A space's mapping records. The image, the stack and the brk area are not records: they sit in
-/// the page table only.
+/// A space's mapping records and program break. The image, the stack and the brk area are not
+/// records: they sit in the page table only.
 #[derive(Default)]
 pub struct Maps {
     recs: BTreeMap<Vaddr, Rec>,
-    #[allow(dead_code, reason = "read by brk, which lands in a later task")]
+    /// Where the break started: 0 until the space has an image, and then `brk` is inert.
     brk_base: Vaddr,
-    #[allow(dead_code, reason = "read by brk, which lands in a later task")]
+    /// The break the program asked for, byte-exact. The pages behind it are mapped up to its next
+    /// page boundary.
     brk_cur: Vaddr,
 }
 
@@ -460,12 +463,56 @@ impl Space {
         Ok(())
     }
 
-    /// Sets where the program break starts. Not built yet.
-    pub fn set_brk_base(&self, _va: Vaddr) {}
+    /// Sets where the program break starts: the first page past the image. Does nothing once a
+    /// base is set, so the break never moves out from under a program that already grew it.
+    pub fn set_brk_base(&self, va: Vaddr) {
+        let mut mm = self.mm.lock();
+        if mm.brk_base == 0 {
+            mm.brk_base = va;
+            mm.brk_cur = va;
+        }
+    }
 
-    /// `brk(want)`: the raw Linux call. Not built yet.
-    pub fn brk(&self, _want: Vaddr) -> Vaddr {
-        0
+    /// `brk(want)`, the raw Linux call: moves the break to `want` and returns the new break. `want`
+    /// 0 asks for the current one. Every failure returns the break unchanged, and charges nothing:
+    /// `want` below the base or more than `BRK_MAX` above it, a grow into a mapped page or a
+    /// reservation, the budget or the frame allocator refusing the pages, a dying space. A space
+    /// with no image has no break and answers 0.
+    ///
+    /// Pages are mapped to the next page boundary at or above `want`. A shrink unmaps and refunds
+    /// every page above it, whatever mapped it.
+    pub fn brk(&self, want: Vaddr) -> Vaddr {
+        let mut mm = self.mm.lock();
+        let (base, cur) = (mm.brk_base, mm.brk_cur);
+        if base == 0 || want == 0 || self.is_dying() {
+            return cur;
+        }
+        if want < base || want - base > BRK_MAX {
+            return cur;
+        }
+        // Both are at most `base + BRK_MAX`, far below `usize::MAX`.
+        let (new_top, cur_top) = (
+            want.next_multiple_of(PAGE_SIZE),
+            cur.next_multiple_of(PAGE_SIZE),
+        );
+        if new_top > cur_top {
+            let range = cur_top..new_top;
+            if !is_free(&self.vm, &mm.recs, &range)
+                || self.populate(range, PageFlags::R | PageFlags::W).is_err()
+            {
+                return cur;
+            }
+        } else if new_top < cur_top {
+            let range = new_top..cur_top;
+            // A MAP_FIXED mapping may have replaced brk pages; cutting its record can split it.
+            if len_after_cut(&mm.recs, &range, false) > MAX_MAPS_PER_SPACE {
+                return cur;
+            }
+            self.unmap_range(&range);
+            cut(&mut mm.recs, &range, None);
+        }
+        mm.brk_cur = want;
+        want
     }
 
     /// The protection the record covering `addr` last got, if one does.

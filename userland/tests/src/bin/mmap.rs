@@ -119,7 +119,7 @@ fn brk(addr: usize) -> usize {
 /// The four steps of mode 3. Returns the first failing step number, or 0.
 fn brk_steps() -> u64 {
     let b0 = brk(0);
-    if b0 == 0 || b0 % PAGE != 0 {
+    if b0 == 0 || !b0.is_multiple_of(PAGE) {
         return 1;
     }
     if brk(b0 + 2 * PAGE) != b0 + 2 * PAGE || probe(b0) != -errno::EAGAIN {
