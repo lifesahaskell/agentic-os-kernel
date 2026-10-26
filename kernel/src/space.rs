@@ -28,10 +28,12 @@ use ostd::{
 use crate::{
     agent::{Agent, AgentError, Payer},
     cap::{Cap, CapError, Object, Rights},
+    futex,
     ipc::Endpoint,
+    syscall::UserSlice,
     thread::Thread,
     user::{self, Exit, Image},
-    vm::{CloneError, cow_clone},
+    vm::{CloneError, copy_to_user, cow_clone},
 };
 
 mod mmap;
@@ -395,8 +397,31 @@ impl Space {
         let _ = ep.push_note(th, NOTE_EXIT, [kind, value, 0, 0], None);
     }
 
-    /// RED stub: the exit-time clear is not implemented yet.
-    pub fn clear_child_tid(&self, _th: &Thread) {}
+    /// The exit-time `clear_tid` step for `th`: writes 0 to the word it named at creation, then
+    /// wakes one futex waiter on it, so a joiner blocked there resumes. Runs once (the address is
+    /// taken), first at both exit points in `user`, before the exit is recorded.
+    ///
+    /// Nothing happens when `th` named no word, when the space is dying (the memory is going away
+    /// and no one is left to wait), or when the word is unmapped or read-only: every error is
+    /// ignored, because the thread is exiting either way. The write and the wake share the `mm`
+    /// lock with teardown, so a space that starts dying in between is not written to. Lock order is
+    /// `mm`, then the copy's charge, then the futex table.
+    pub fn clear_child_tid(&self, th: &Thread) {
+        let va = th.take_clear_tid();
+        if va == 0 {
+            return;
+        }
+        let _mm = self.mm.lock();
+        if self.is_dying() {
+            return;
+        }
+        let Ok(word) = UserSlice::new(va, size_of::<u32>()) else {
+            return;
+        };
+        if copy_to_user(self.vm(), self, word, &0u32.to_le_bytes()).is_ok() {
+            let _ = futex::wake(th, self.vm(), va, 1);
+        }
+    }
 
     /// Threads registered and still referenced.
     pub fn live_threads(&self) -> usize {
@@ -2526,7 +2551,7 @@ mod test {
     #[ktest]
     fn lifecycle_clear_tid_skipped_inside_exit_unmap_range() {
         use crate::syscall::{Outcome, Syscall, dispatch};
-        let (a, space, img) = lifecycle_world(4);
+        let (a, _space, img) = lifecycle_world(4);
         let base = 0x1_0000_0000usize;
         let call = || Syscall::ExitUnmap {
             addr: base,

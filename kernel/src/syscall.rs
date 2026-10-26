@@ -704,8 +704,17 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
         }
         // The unmap's result is ignored, as musl's unmap-then-exit sequence ignores it: a split
         // refused at the record limit leaves the pages charged, and teardown returns them. The
-        // kernel touches no user memory after this, and the thread never re-enters ring 3.
+        // thread never re-enters ring 3. Its exit still zeroes and wakes the `clear_tid` word, so
+        // a word inside the range being freed is dropped first: the unmap is about to take that
+        // page away, and a write to it would fault or hit whatever the range is mapped to next.
         Syscall::ExitUnmap { addr, len, code } => {
+            let span = len
+                .checked_next_multiple_of(PAGE_SIZE)
+                .unwrap_or(usize::MAX);
+            let end = addr.saturating_add(span);
+            if (addr..end).contains(&t.clear_tid()) {
+                t.set_clear_tid(0);
+            }
             if let Some(p) = t.process() {
                 let _ = p.munmap(addr, len);
             }
