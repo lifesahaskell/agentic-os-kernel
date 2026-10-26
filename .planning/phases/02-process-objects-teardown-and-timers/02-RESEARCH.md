@@ -175,7 +175,7 @@ pub fn halt_cpu() {
 ```
 [VERIFIED: ostd task/preempt/mod.rs:23-37; re-exported as `ostd::task::halt_cpu`, task/mod.rs:27 per earlier read]. No `unsafe` in our crate, no OSTD patch.
 **Scheduler protocol the idle must respect** (ostd `task/scheduler/mod.rs` lines 198-224, 360-401, read this session): `pick_next` is only called after `update_current` returned true; an empty queue means `update_current` must return false; a Wait with a non-empty queue means true. `dequeue_current` must call `schedule_info().cpu.set_to_none()` (as `sched.rs` does).
-**Policy in `BudgetScheduler`** (`sched.rs`, 237 lines):
+**Policy in `BudgetScheduler`** (`sched.rs`, 234 lines):
 - `eligible(task, now)` is `thread_of(task).is_none_or(|t| t.agent().has_cpu(now))`, so kernel tasks are never budgeted. The idle task must be distinguished from other kernel tasks (the ktest runner is a kernel task too), by a marker in `Task::data()`. `[ASSUMED]` marker approach; any tag works.
 - `pick`: first eligible non-idle task; else idle. Never return `None` and never return the running task after `update_current` asked for a switch (B2 friction 4).
 - `update_current`: if idle is current, return true as soon as any non-idle task is eligible (so Tick preempts idle); for a non-idle current with only idle left, `Wait`/`Exit` return true (idle is runnable), `Tick` returns false unless a better candidate exists. Idle must not count in "others".

@@ -20,14 +20,14 @@ All analog paths were confirmed git-tracked (`git ls-files kernel userland scrip
 | `kernel/src/agent.rs` (`uncharge_pages`, carve return, parent link) | model | CRUD | itself, `charge_pages` 101-109, `spawn_child` 144-175 | exact |
 | `kernel/src/futex.rs` (timeout, per-thread waiter tracking) | service | request-response | itself, `TABLE` 77, `wait` 123 | exact |
 | `kernel/src/vm.rs` (unmap_all, mmap charge) | service | CRUD | itself, `handle_cow_fault` 63 | exact |
-| `kernel/src/user.rs` (`deliver` tid/tag, exit notify, signal frame, FS base) | service | request-response | itself, `deliver` 233-268, `run_ctx` 276+ | exact |
+| `kernel/src/user.rs` (`deliver` tid/tag, exit notify, signal frame, FS base) | service | request-response | itself, `deliver` 205+, `run_ctx` 236+ | exact |
 | `kernel/src/syscall.rs` (thread_create, sigreturn, timer_arm, mmap, timeouts) | controller | request-response | itself, `dispatch` 292-322 | exact |
 | `kernel/src/ipc.rs` (recv timeout, reply-table drain) | service | request-response | itself (read 1-780 only) | exact |
 | `kernel/src/lib.rs` (idle halt boot check) | boot check | batch | `fpu_preemption_check` 45-83, `cpu_budget_check` 88-144 | exact |
 | `scripts/check.sh` (new grep lines) | config | batch | itself, line 30 | exact |
 | `userland/abi/src/lib.rs` (syscall nos, errnos, ESRCH) | config | transform | itself (`errno`, `SYS_*`) | exact |
 | `userland/libsys/src/lib.rs` (wrappers) | utility | request-response | itself, `recv` 39-45 | exact |
-| `userland/tests/src/bin/*.rs` new bins (fork_exit, thread_create, sigreturn, mmap_over, timeout) | test bin | request-response | `park_srv.rs`, `fpu.rs`, `sibling.rs` | role-match |
+| `userland/tests/src/bin/*.rs` new bins (fork_exit, thread_create, sigreturn, mmap, timeout) | test bin | request-response | `park_srv.rs`, `fpu.rs`, `sibling.rs` | role-match |
 | `docs/architecture/...` AGNT-05 record, `.planning/PROJECT.md` wording | doc | n/a | none | none |
 
 ## Pattern Assignments
@@ -111,9 +111,9 @@ Use `checked_sub`/saturating for uncharge. **Carve return:** inverse of `spawn_c
 
 ### `kernel/src/user.rs` (service, request-response) - slices B, E
 
-**`deliver`** (233-268): change `ep.send(thread, [vector, addr, rip, err])` so the message names `thread.tid`/`tag` (numeric option recommended in RESEARCH decision 6); delete the `shortcut:` (237-238). Keep the `fatal()` closure and `clear_exception_reply`/`wait_exception_reply` flow.
+**`deliver`** (from line 205): change `ep.send(thread, [vector, addr, rip, err])` so the message names `thread.tid`/`tag` (numeric option recommended in RESEARCH decision 6); delete the `shortcut:` (203-204). Keep the `fatal()` closure and `clear_exception_reply`/`wait_exception_reply` flow.
 **Exit notification:** reuse `Exit{Code,Fault,Budget,Exception}` classification; send on thread exit through the same `exception_handler()` endpoint path.
-**Redirect** (`run_ctx` ~326, `take_redirect`): replace `ctx.set_rdi(ctx.rip()); ctx.set_rip(handler)` with push-frame (`ctx.clone()`, FPU clone, FS base) then the same set.
+**Redirect** (`run_ctx` ~236+, `take_redirect`): replace `ctx.set_rdi(ctx.rip()); ctx.set_rip(handler)` with push-frame (`ctx.clone()`, FPU clone, FS base) then the same set.
 **Image loading style to use (not B2):** `user::load_image(user_image!("fpu"))` then `user::start(&t, &img, arg)` (`lib.rs:45-57`). **[01-07 REMOVES]** `user::load`, `user::run(.., code + prog::X)`.
 
 ### `kernel/src/syscall.rs` (controller, request-response) - slices B, C, E
@@ -144,7 +144,7 @@ Keep `#![deny(unsafe_code)]`; asm stays in `raw.rs`/`rt.rs`/`fpu.rs` (ledger U-0
 
 **Header and entry** (`park_srv.rs` 6-13, 48; `fpu.rs` 7-9, 45): `#![no_std] #![no_main] #![deny(unsafe_code)]`, `fn main(arg: u64) -> u64`, `libsys::entry!(main);` or `libsys::entry!(main, handler);` for a redirect/signal handler. Exit code = number of the first failing step, 0 on success (`park_srv.rs` doc and returns 1..6). Bins:
 - `fork_exit`: copy `sibling.rs` (15 lines, tiny exit-code bin) as the workload for the 10,000x loop; the loop driver is a kernel ktest.
-- `thread_create`, `mmap_over`, `timeout`: `park_srv.rs` step-numbered returns, `recv`/`reply` style wrappers, `errno` compare as `reply(&mut b) != Err(errno::EBADF)`.
+- `thread_create`, `mmap`, `timeout`: `park_srv.rs` step-numbered returns, `recv`/`reply` style wrappers, `errno` compare as `reply(&mut b) != Err(errno::EBADF)`.
 - `sigreturn`: copy `fpu.rs`: `hold(seed, ..)`, `pattern(seed)`, `handler_xmm()`, handler returns 0 or `10 + i` on first mismatching register; extend with GPR pattern and a stack-bytes check.
 Registration: `userland/tests/build.rs` (7 lines) and `user_image!("name")` in the kernel; confirm both after 01-07.
 
