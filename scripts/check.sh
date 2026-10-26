@@ -11,6 +11,10 @@ echo "== unsafe_check self-test"
 python3 -I tools/unsafe_check.py --self-test
 echo "== unsafe_check"
 python3 -I tools/unsafe_check.py
+echo "== pin_check self-test"
+sh tools/pin_check.sh --self-test
+echo "== pin_check"
+sh tools/pin_check.sh
 
 cd kernel
 echo "== userland build, fmt, clippy; kernel fmt, clippy"
