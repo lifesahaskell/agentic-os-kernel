@@ -395,6 +395,9 @@ impl Space {
         let _ = ep.push_note(th, NOTE_EXIT, [kind, value, 0, 0], None);
     }
 
+    /// RED stub: the exit-time clear is not implemented yet.
+    pub fn clear_child_tid(&self, _th: &Thread) {}
+
     /// Threads registered and still referenced.
     pub fn live_threads(&self) -> usize {
         self.threads
@@ -465,7 +468,8 @@ pub struct ThreadStart {
     /// Lands in `rdi`.
     pub arg: u64,
     pub fs_base: u64,
-    /// Must be 0 until a thread's exit has a futex wake to deliver (plan 02-10).
+    /// 0 for none, else the 4-aligned user address of a `u32` that `Space::clear_child_tid` zeroes
+    /// and futex-wakes once when the thread exits.
     pub clear_tid: u64,
 }
 
@@ -503,6 +507,11 @@ impl From<CapError> for SpaceError {
     }
 }
 
+/// A `clear_tid` word: 4-aligned and wholly inside user space above page 0.
+fn clear_tid_addr(a: u64) -> bool {
+    a % 4 == 0 && (PAGE_SIZE as u64..=USER_TOP as u64 - 4).contains(&a)
+}
+
 fn user_addr(a: u64) -> bool {
     (PAGE_SIZE as u64..USER_TOP as u64).contains(&a)
 }
@@ -525,7 +534,7 @@ pub fn thread_create(
     if !user_addr(start.rip)
         || !user_addr(start.rsp)
         || start.fs_base >= USER_TOP as u64
-        || start.clear_tid != 0
+        || !(start.clear_tid == 0 || clear_tid_addr(start.clear_tid))
     {
         return Err(SpaceError::Invalid);
     }
@@ -567,6 +576,7 @@ pub fn thread_create(
         space.unregister(th.tid());
         return Err(e);
     }
+    th.set_clear_tid(start.clear_tid as usize);
     user::spawn_thread(&space, th.clone(), start);
     Ok((slot, th))
 }
@@ -648,7 +658,7 @@ mod test {
     use crate::{
         ipc::{IpcError, Message},
         sched::install_space_switch,
-        syscall::Errno,
+        syscall::{Errno, UserSlice},
         user::{
             Image, load_image, map_stack, map_test_page, spawn_thread,
             testkit::{self, join, join_thread, recv_note, spawn_image, spawn_image_in},
@@ -957,9 +967,30 @@ mod test {
                 },
             ),
             (
-                "clear_tid set",
+                "clear_tid unaligned",
                 ThreadStart {
                     clear_tid: 1,
+                    ..good
+                },
+            ),
+            (
+                "clear_tid in page 0",
+                ThreadStart {
+                    clear_tid: 8,
+                    ..good
+                },
+            ),
+            (
+                "clear_tid in the kernel half",
+                ThreadStart {
+                    clear_tid: 0xffff_8000_0000_0000,
+                    ..good
+                },
+            ),
+            (
+                "clear_tid straddling USER_TOP",
+                ThreadStart {
+                    clear_tid: top - 2,
                     ..good
                 },
             ),
@@ -2462,5 +2493,90 @@ mod test {
         assert_eq!(dispatch(&t, &img.space, call), Outcome::Exit(9));
         assert_eq!(a.mem_used_pages(), used);
         assert_eq!(space.charged(), img.pages);
+    }
+
+    #[ktest]
+    fn lifecycle_clear_tid_zeroed_and_woken_at_exit() {
+        let (a, space, img) = lifecycle_world(4);
+        // Code 0 only if the waiter in the bin was woken by the exit (not timed out) and the word
+        // reads 0.
+        assert_eq!(run_lifecycle(&a, &space, &img, 4), Exit::Code(0));
+        assert_eq!(a.mem_used_pages(), 0);
+    }
+
+    #[ktest]
+    fn lifecycle_clear_tid_bad_pointer_is_ignored_at_exit() {
+        let (a, space, img) = lifecycle_world(4);
+        let (_, caller) = holder_of(&space, Rights::ALL);
+        let start = ThreadStart {
+            rip: img.entry as u64,
+            rsp: USER_STACK_TOP as u64,
+            arg: 0,
+            fs_base: 0,
+            // User space, aligned, nothing mapped there.
+            clear_tid: 0x2000_0000,
+        };
+        let (_, th) = thread_create(&caller, Target::Slot(0), start, 0, ok).unwrap();
+        // The exit still happens as the thread chose, and the space is still torn down.
+        assert_eq!(join_thread(&th), Exit::Code(0));
+        wait_reaped(&space);
+        assert_eq!(a.mem_used_pages(), 0);
+    }
+
+    #[ktest]
+    fn lifecycle_clear_tid_skipped_inside_exit_unmap_range() {
+        use crate::syscall::{Outcome, Syscall, dispatch};
+        let (a, space, img) = lifecycle_world(4);
+        let base = 0x1_0000_0000usize;
+        let call = || Syscall::ExitUnmap {
+            addr: base,
+            len: 4 * PAGE_SIZE,
+            code: 0,
+        };
+        // The word lies in the range the call unmaps: the exit must not write there.
+        let inside = Thread::new(a.clone());
+        inside.set_clear_tid(base + PAGE_SIZE);
+        assert_eq!(dispatch(&inside, &img.space, call()), Outcome::Exit(0));
+        assert_eq!(inside.clear_tid(), 0);
+        // One page past the end is outside the range and keeps its word.
+        let outside = Thread::new(a.clone());
+        outside.set_clear_tid(base + 4 * PAGE_SIZE);
+        assert_eq!(dispatch(&outside, &img.space, call()), Outcome::Exit(0));
+        assert_eq!(outside.clear_tid(), base + 4 * PAGE_SIZE);
+        // The last byte of the range counts as inside, the byte before the range as outside.
+        let edge = Thread::new(a.clone());
+        edge.set_clear_tid(base + 4 * PAGE_SIZE - 4);
+        assert_eq!(dispatch(&edge, &img.space, call()), Outcome::Exit(0));
+        assert_eq!(edge.clear_tid(), 0);
+        let before = Thread::new(a.clone());
+        before.set_clear_tid(base - 4);
+        assert_eq!(dispatch(&before, &img.space, call()), Outcome::Exit(0));
+        assert_eq!(before.clear_tid(), base - 4);
+    }
+
+    #[ktest]
+    fn lifecycle_clear_tid_skipped_on_a_dying_space() {
+        use crate::vm::{copy_from_user, copy_to_user};
+        let (a, space, _img) = lifecycle_world(4);
+        let word = USER_STACK_TOP - 8;
+        let slice = UserSlice::new(word, 4).unwrap();
+        space.vm().activate();
+        copy_to_user(space.vm(), &*space, slice, &1u32.to_le_bytes()).unwrap();
+
+        let t = Thread::new(a.clone());
+        space.register(&t).unwrap();
+        t.set_clear_tid(word);
+        space.kill();
+        assert!(space.is_dying());
+        let charged = space.charged();
+        space.clear_child_tid(&t);
+
+        let mut got = [0u8; 4];
+        copy_from_user(space.vm(), &mut got, slice).unwrap();
+        assert_eq!(u32::from_le_bytes(got), 1, "a dying space is left alone");
+        assert_eq!(space.charged(), charged);
+        // The last reap tears the space down.
+        space.reap(t.tid());
+        assert_eq!(a.mem_used_pages(), 0);
     }
 }

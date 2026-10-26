@@ -19,17 +19,27 @@
 //!
 //! Mode 3: `SYS_EXIT_UNMAP` with an unaligned address, a zero length and a range that leaves user
 //! space must each return `-EINVAL` and leave this thread running. Exits 0, or the step number.
+//!
+//! Mode 4: starts a thread whose `clear_tid` is the address of a static word holding 1, then
+//! `FUTEX_WAIT`s on the word with a 1 s timeout. The thread yields 50 times and exits; the kernel
+//! must zero the word and wake this thread, so the wait returns 0 and the word reads 0. Exits 0, or
+//! the number of the first failing step: 1 the stack mmap, 2 `thread_create`, 3 the wait timed out,
+//! 4 the wait returned another value (`-EAGAIN` means the word was cleared before the wait began),
+//! 5 the word did not read 0 after the wait.
 
 #![no_std]
 #![no_main]
 #![deny(unsafe_code)]
 
-use core::hint::black_box;
+use core::{
+    hint::black_box,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use abi::{
     ARCH_GET_FS, ARCH_SET_FS, FUTEX_WAIT, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE,
     SPACE_SELF, SYS_ARCH_PRCTL, SYS_EXIT_UNMAP, SYS_FUTEX, SYS_MMAP, SYS_THREAD_CREATE, ThreadCtx,
-    USER_TOP, errno,
+    Timespec, USER_TOP, errno,
 };
 use libsys::{exit, raw::syscall6, sched_yield};
 
@@ -178,12 +188,60 @@ fn exit_unmap_refuses_bad_ranges() -> u64 {
     0
 }
 
+/// The word mode 4's thread names as its `clear_tid`.
+static WORD: AtomicU32 = AtomicU32::new(1);
+
+/// The entry of the thread mode 4 starts: lets the main thread reach its wait, then exits.
+extern "C" fn yield_then_exit(_: usize) -> ! {
+    for _ in 0..50 {
+        sched_yield();
+    }
+    exit(0)
+}
+
+fn clear_tid_wakes_the_waiter() -> u64 {
+    let base = mmap(4);
+    if base < 0 {
+        return 1;
+    }
+    let base = base as usize;
+    let word = &WORD as *const AtomicU32 as usize;
+    let entry = yield_then_exit as *const () as usize;
+    if spawn(entry, base + 4 * PAGE - 8, 0, word) < 0 {
+        return 2;
+    }
+    let timeout = Timespec { sec: 1, nsec: 0 };
+    let r = syscall6(
+        SYS_FUTEX,
+        [
+            word,
+            FUTEX_WAIT,
+            1,
+            &timeout as *const Timespec as usize,
+            0,
+            0,
+        ],
+    );
+    black_box(&timeout);
+    if r == -errno::ETIMEDOUT {
+        return 3;
+    }
+    if r != 0 {
+        return 4;
+    }
+    if WORD.load(Ordering::SeqCst) != 0 {
+        return 5;
+    }
+    0
+}
+
 fn main(arg: u64) -> u64 {
     match arg & 0xff {
         0 => 0,
         1 => fs_base_round_trip(arg >> 8),
         2 => exit_unmap_frees_the_stack(),
         3 => exit_unmap_refuses_bad_ranges(),
+        4 => clear_tid_wakes_the_waiter(),
         _ => 98,
     }
 }
