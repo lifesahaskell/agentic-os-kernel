@@ -36,7 +36,7 @@ ring-3 test binaries. Where a requirement names an os-test suite (`process`, `si
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Userland, syscall ABI and IPC v2** - Rust ring-3 toolchain, FPU gate, fuzz-safe syscalls, call/reply IPC with stamped identity
+- [x] **Phase 1: Userland, syscall ABI and IPC v2** - Rust ring-3 toolchain, FPU gate, fuzz-safe syscalls, call/reply IPC with stamped identity (completed 2026-10-26)
 - [ ] **Phase 2: Process objects, teardown and timers** - Space and Thread capabilities, saved-context signals, leak-free exit, idle task, timers
 - [ ] **Phase 3: Bootstrap, server runtime and vfs** - Root-authority bootstrap, `server-rt`, vfs with per-domain namespaces, OFDs, pipes
 - [ ] **Phase 4: exec and procmgr** - Static exec, fork/spawn/wait, process state machine, credential inheritance, libc ADR
@@ -61,7 +61,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 **Research:** research-phase AND spike. Read the OSTD 0.19.0 source (docs.rs failed for 0.19.0): user-mode FPU/SSE enablement and per-thread save (highest-risk unknown; a musl binary cannot run without it), OSDK initramfs key and `boot_info()` contents, serial RX, custom target flags, LLVM 21 in the image. Spike: frame-level cross-space copy and CoW-break order (inferred, never run), the cancel-then-wait protocol (no tested precedent here), whether `VmSpace::activate` keeps TLB entries.
 **Decisions due:** `libaok` sits on `posix-client`; Linux syscall numbers stop at `libaok` and server protocols are POSIX-operation granular. Per-thread `tid`/`tag` is the process identity, badged endpoints only for server-to-server delegation. Cancel semantics replace the older "interrupt aborts blocked IPC" wording; abort-at-once stays for a blocked `recv`. One custom user target JSON for all user code.
-**Plans:** 8/8 plans executed
+**Plans:** 8/8 plans complete
 
 Plans:
 **Wave 1**
@@ -217,7 +217,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7.
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Userland, syscall ABI and IPC v2 | 8/8 | In Progress | - |
+| 1. Userland, syscall ABI and IPC v2 | 8/8 | Complete    | 2026-10-26 |
 | 2. Process objects, teardown and timers | 0/0 | Not started | - |
 | 3. Bootstrap, server runtime and vfs | 0/0 | Not started | - |
 | 4. exec and procmgr | 0/0 | Not started | - |
