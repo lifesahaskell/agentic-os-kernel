@@ -14,10 +14,13 @@ use alloc::{
     vec::Vec,
 };
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use ostd::{
-    mm::{PAGE_SIZE, VmSpace},
+    mm::{PAGE_SIZE, Vaddr, VmSpace},
     sync::SpinLock,
     task::disable_preempt,
 };
@@ -28,6 +31,7 @@ use crate::{
     ipc::Endpoint,
     thread::Thread,
     user::{self, Exit, Image},
+    vm::{CloneError, cow_clone},
 };
 
 /// Most live threads one space holds. The 65th `thread_create` is refused (`Limit`).
@@ -97,6 +101,23 @@ impl Space {
     pub fn from_image(img: &Image, owner: Arc<Agent>) -> Result<Arc<Space>, AgentError> {
         owner.charge_pages(img.pages)?;
         Ok(Space::build(img.space.clone(), owner, img.pages, true))
+    }
+
+    /// A space over a copy-on-write clone of `parent` in `range`, owned by `owner`. The clone's
+    /// page-table node frames are charged to `owner` and recorded in the ledger, so teardown
+    /// refunds them. `Err` leaves `owner` as it was (see `cow_clone`).
+    pub fn from_clone(
+        parent: &VmSpace,
+        range: Range<Vaddr>,
+        owner: Arc<Agent>,
+    ) -> Result<Arc<Space>, CloneError> {
+        let tally = Tally {
+            payer: &*owner,
+            pages: AtomicUsize::new(0),
+        };
+        let vm = cow_clone(parent, range, &tally)?;
+        let charged = tally.pages.load(Ordering::Acquire);
+        Ok(Space::build(Arc::new(vm), owner, charged, true))
     }
 
     pub fn vm(&self) -> &Arc<VmSpace> {
@@ -259,6 +280,25 @@ impl Space {
             .iter()
             .filter(|(_, w)| w.strong_count() > 0)
             .count()
+    }
+}
+
+/// Counts what a clone charges through `payer`, so `from_clone` can seed the new space's ledger.
+struct Tally<'a> {
+    payer: &'a dyn Payer,
+    pages: AtomicUsize,
+}
+
+impl Payer for Tally<'_> {
+    fn charge_pages(&self, pages: usize) -> Result<(), AgentError> {
+        self.payer.charge_pages(pages)?;
+        self.pages.fetch_add(pages, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn uncharge_pages(&self, pages: usize) {
+        self.pages.fetch_sub(pages, Ordering::AcqRel);
+        self.payer.uncharge_pages(pages);
     }
 }
 
@@ -1369,16 +1409,14 @@ mod test {
 
     /// A child space over a copy-on-write clone of `parent`'s image range, with a fresh stack.
     fn cow_space(parent: &Image, owner: &Arc<Agent>) -> Arc<Space> {
-        let vm = Arc::new(
-            cow_clone(
-                &parent.space,
-                IMAGE_BASE..TEST_DATA + PAGE_SIZE,
-                &*Agent::new_root(1, 64),
-            )
-            .expect("cow_clone"),
-        );
-        map_stack(&vm).unwrap();
-        Space::new(vm, owner.clone())
+        let space = Space::from_clone(
+            &parent.space,
+            IMAGE_BASE..TEST_DATA + PAGE_SIZE,
+            owner.clone(),
+        )
+        .expect("from_clone");
+        map_stack(space.vm()).unwrap();
+        space
     }
 
     #[ktest]

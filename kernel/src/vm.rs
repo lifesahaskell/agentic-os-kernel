@@ -32,37 +32,93 @@ pub enum CloneError {
     Budget,
 }
 
+/// Page-table node frames a clone allocates to map `va`, given the previously mapped `prev`: 3
+/// for the first page (one node per level below the root), otherwise one for each of the 2 MiB,
+/// 1 GiB and 512 GiB windows whose index differs from `prev`'s.
+fn nodes_for(prev: Option<Vaddr>, va: Vaddr) -> usize {
+    match prev {
+        None => 3,
+        Some(p) => [21, 30, 39]
+            .into_iter()
+            .filter(|s| p >> s != va >> s)
+            .count(),
+    }
+}
+
 /// Clones the mappings of `parent` in `range` into a new space. Writable pages become read-only
 /// and copy-on-write in both spaces; nothing is copied until a write faults.
-// shortcut: 4 KiB pages only (asserted); huge pages need splitting before protect.
+///
+/// The child's page-table node frames are charged to `payer` as the walk allocates them: one for
+/// the root, then `nodes_for` per mapped page. The caller owns the returned total through
+/// whatever ledger `payer` keeps. Known gap (D-07): the data frames the child shares with the
+/// parent stay charged to the parent, so the clone under-charges data, never leaks it.
+///
+/// A failed clone is undone: the parent's TLB is flushed (the walk may already have
+/// write-protected pages, which stay copy-on-write and are taken back by the sole-owner takeover
+/// on their next fault), every node charge is refunded, and the half-built child is dropped.
+/// `Range`: the range is not page-aligned, is empty or inverted, or ends above `abi::USER_TOP`.
+/// `Unsupported`: a huge page or an MMIO mapping. `Budget`: a node charge was refused.
 pub fn cow_clone(
     parent: &VmSpace,
     range: Range<Vaddr>,
     payer: &dyn Payer,
 ) -> Result<VmSpace, CloneError> {
-    // RED stub: the fallible walk is the GREEN step.
-    let _ = payer;
+    let aligned = |a: Vaddr| a & (PAGE_SIZE - 1) == 0;
+    if !aligned(range.start)
+        || !aligned(range.end)
+        || range.start >= range.end
+        || range.end > abi::USER_TOP
+    {
+        return Err(CloneError::Range);
+    }
+    payer.charge_pages(1).map_err(|_| CloneError::Budget)?;
+    let mut charged = 1;
     let child = VmSpace::new();
     let guard = disable_preempt();
-    let mut pc = parent.cursor_mut(&guard, &range).unwrap();
-    let mut cc = child.cursor_mut(&guard, &range).unwrap();
+    let (Ok(mut pc), Ok(mut cc)) = (
+        parent.cursor_mut(&guard, &range),
+        child.cursor_mut(&guard, &range),
+    ) else {
+        payer.uncharge_pages(charged);
+        return Err(CloneError::Range);
+    };
 
+    let mut failed = None;
+    let mut prev = None;
     while let Some(va) = pc.find_next(range.end - pc.virt_addr()) {
-        let (r, item) = pc.query().unwrap();
-        let Some(VmQueriedItem::MappedRam { frame, mut prop }) = item else {
-            panic!("cow_clone: MMIO in a user range at {va:#x}");
+        let Ok((r, item)) = pc.query() else {
+            failed = Some(CloneError::Range);
+            break;
         };
-        assert_eq!(r.len(), PAGE_SIZE, "cow_clone: huge page at {va:#x}");
+        let Some(VmQueriedItem::MappedRam { frame, mut prop }) = item else {
+            failed = Some(CloneError::Unsupported(va));
+            break;
+        };
+        if r.len() != PAGE_SIZE {
+            failed = Some(CloneError::Unsupported(va));
+            break;
+        }
         let frame: UFrame = (*frame).clone();
+        let n = nodes_for(prev, va);
+        if n > 0 && payer.charge_pages(n).is_err() {
+            failed = Some(CloneError::Budget);
+            break;
+        }
+        charged += n;
+        prev = Some(va);
         // The source cursor cannot jump to `range.end`, so the last page ends the walk.
         let last = va + PAGE_SIZE >= range.end;
         if prop.flags.contains(PageFlags::W) {
             prop.flags = (prop.flags - PageFlags::W) | COW;
             pc.protect_next(PAGE_SIZE, |f, _| *f = (*f - PageFlags::W) | COW);
-        } else if !last {
-            pc.jump(va + PAGE_SIZE).unwrap();
+        } else if !last && pc.jump(va + PAGE_SIZE).is_err() {
+            failed = Some(CloneError::Range);
+            break;
         }
-        cc.jump(va).unwrap();
+        if cc.jump(va).is_err() {
+            failed = Some(CloneError::Range);
+            break;
+        }
         cc.map(frame, prop);
         if last || pc.virt_addr() >= range.end {
             break;
@@ -72,7 +128,14 @@ pub fn cow_clone(
     pc.flusher().issue_tlb_flush(TlbFlushOp::for_range(range));
     pc.flusher().dispatch_tlb_flush();
     drop((pc, cc));
-    Ok(child)
+    match failed {
+        Some(e) => {
+            payer.uncharge_pages(charged);
+            drop(child);
+            Err(e)
+        }
+        None => Ok(child),
+    }
 }
 
 /// Resolves a write fault at `addr` if it hit a copy-on-write page. Returns `Ok(false)` for any
@@ -80,8 +143,9 @@ pub fn cow_clone(
 /// to `payer`.
 ///
 /// `addr` comes straight from a ring-3 fault and can be anything. Once it is below `USER_TOP` and
-/// `cursor_mut` accepted the page, the `query` and `jump` unwraps below cannot fail: the page is
-/// inside the user page table.
+/// `cursor_mut` accepted the page, the `query` and the re-`jump` below cannot fail: the page is
+/// inside the cursor's own range. If either does anyway, the query declines the fault and the
+/// re-`jump` refunds its charge and answers `NoMemory`, instead of panicking.
 pub fn handle_cow_fault(
     space: &VmSpace,
     payer: &dyn Payer,
@@ -99,7 +163,10 @@ pub fn handle_cow_fault(
     let Ok(mut c) = space.cursor_mut(&guard, &(page..page + PAGE_SIZE)) else {
         return Ok(false);
     };
-    let (mut prop, old) = match c.query().unwrap().1 {
+    let Ok((_, item)) = c.query() else {
+        return Ok(false);
+    };
+    let (mut prop, old) = match item {
         Some(VmQueriedItem::MappedRam { frame, prop }) if prop.flags.contains(COW) => {
             // Read before cloning: the count includes page-table mappings, so 1 means this
             // mapping is the last one and the frame can be taken over instead of copied.
@@ -125,7 +192,10 @@ pub fn handle_cow_fault(
     payer.charge_pages(1)?;
     new.writer().write(&mut old.reader());
     c.unmap(PAGE_SIZE);
-    c.jump(page).unwrap();
+    if c.jump(page).is_err() {
+        payer.uncharge_pages(1);
+        return Err(AgentError::NoMemory);
+    }
     c.map(new.into(), prop);
     Ok(true)
 }
