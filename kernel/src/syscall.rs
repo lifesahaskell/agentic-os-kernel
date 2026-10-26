@@ -883,7 +883,7 @@ mod test {
 
         // Each decode and copy error path once, with its exact errno.
         let z = [0usize; 6];
-        let targeted: [(usize, [usize; 6], isize); 24] = [
+        let targeted: [(usize, [usize; 6], isize); 25] = [
             (0xFFFF, z, errno::ENOSYS),
             (SYS_FUTEX, [mapped, 99, 0, 0, 0, 0], errno::ENOSYS),
             // The timeout pointer is address 1, which is unmapped.
@@ -951,6 +951,8 @@ mod test {
             // Slot 0 holds an Endpoint with SEND only: the rights check on the space slot comes
             // before its type check.
             (SYS_SPACE_NOTIFY, [0, 1, 0, 0, 0, 0], errno::EPERM),
+            // No redirect has been applied to this thread, so its frame stack is empty.
+            (SYS_SIGRETURN, z, errno::EINVAL),
         ];
         for (i, (nr, a, want)) in targeted.into_iter().enumerate() {
             assert_eq!(
@@ -994,6 +996,7 @@ mod test {
             SYS_THREAD_CREATE,
             SYS_THREAD_INTERRUPT,
             SYS_SPACE_NOTIFY,
+            SYS_SIGRETURN,
         ];
         let (mut enosys, mut efault, mut einval, mut ebadf, mut eintr) = (0, 0, 0, 0, 0);
         for i in 0..ITERATIONS {

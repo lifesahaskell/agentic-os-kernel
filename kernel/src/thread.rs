@@ -363,6 +363,8 @@ impl Thread {
             w.fail(IpcError::Dead);
         }
         self.cancels.lock().clear();
+        // A dead thread holds no FPU snapshots: the frames are kernel heap, `MAX_FRAMES` at most.
+        self.frames.lock().clear();
         let mut owner = FPU_OWNER.lock();
         if owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, &self.fpu)) {
             *owner = None;

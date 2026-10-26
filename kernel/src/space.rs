@@ -475,7 +475,8 @@ pub enum SpaceError {
     WrongType,
     /// The caller has no space, or the thread has exited or no longer exists.
     Dead,
-    /// The space already holds `MAX_THREADS_PER_SPACE` threads.
+    /// The space already holds `MAX_THREADS_PER_SPACE` threads, or the thread already holds
+    /// `MAX_FRAMES` redirect frames that it has not returned from.
     Limit,
     Invalid,
     /// A thread named its own space for a notify endpoint, and the space already has one.
@@ -579,7 +580,8 @@ pub fn thread_interrupt(caller: &Thread, slot: usize, entry: usize) -> Result<()
     if th.exit_status().is_some() {
         return Err(SpaceError::Dead);
     }
-    th.interrupt(entry);
+    // A full frame stack (`MAX_FRAMES` redirects not yet returned from) is EAGAIN.
+    th.try_interrupt(entry).map_err(|_| SpaceError::Limit)?;
     Ok(())
 }
 

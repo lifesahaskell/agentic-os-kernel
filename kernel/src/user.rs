@@ -746,7 +746,11 @@ mod test {
         let full = thread_interrupt(&caller, slot, img.handler).err();
         assert_eq!(full, Some(SpaceError::Limit));
         assert_eq!(Errno::from(SpaceError::Limit), Errno::EAGAIN);
-        assert_eq!(th.frame_depth(), crate::thread::MAX_FRAMES, "the refusal pushed nothing");
+        assert_eq!(
+            th.frame_depth(),
+            crate::thread::MAX_FRAMES,
+            "the refusal pushed nothing"
+        );
 
         space.kill();
         assert_eq!(join_thread(&th), Exit::Killed);
