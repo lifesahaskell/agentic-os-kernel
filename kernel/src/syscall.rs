@@ -9,11 +9,11 @@ use alloc::boxed::Box;
 use core::{marker::PhantomData, mem::size_of};
 
 use abi::{
-    IpcArgs, MAP_ANONYMOUS, MAP_SHARED, MAX_IPC_BYTES, MAX_TIMEOUT_MS, SPACE_SELF, SYS_BRK,
-    SYS_CALL, SYS_EXIT, SYS_FUTEX, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_RECV, SYS_REPLY,
-    SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_SIGRETURN, SYS_SPACE_NOTIFY, SYS_THREAD_CREATE,
-    SYS_THREAD_INTERRUPT, SYS_TIMER_ARM, THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP,
-    errno,
+    ARCH_GET_FS, ARCH_SET_FS, IpcArgs, MAP_ANONYMOUS, MAP_SHARED, MAX_IPC_BYTES, MAX_TIMEOUT_MS,
+    SPACE_SELF, SYS_ARCH_PRCTL, SYS_BRK, SYS_CALL, SYS_EXIT, SYS_EXIT_UNMAP, SYS_FUTEX, SYS_MMAP,
+    SYS_MPROTECT, SYS_MUNMAP, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD, SYS_SIGRETURN,
+    SYS_SPACE_NOTIFY, SYS_THREAD_CREATE, SYS_THREAD_INTERRUPT, SYS_TIMER_ARM,
+    THREAD_CTX_TID_OFFSET, ThreadCtx, Timespec, USER_TOP, errno,
 };
 use ostd::{
     mm::{PAGE_SIZE, VmSpace},
@@ -310,6 +310,23 @@ pub enum Syscall {
     Brk {
         addr: usize,
     },
+    /// `arch_prctl` on the caller's own FS base.
+    ArchPrctl(FsOp),
+    /// Unmaps `[addr, addr + len)` from the caller's own space, then exits the thread with `code`.
+    ExitUnmap {
+        addr: usize,
+        len: usize,
+        code: u64,
+    },
+}
+
+/// The two `arch_prctl` codes this kernel implements.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FsOp {
+    /// `ARCH_SET_FS`: the new base, already checked to lie below `USER_TOP`.
+    SetFs(usize),
+    /// `ARCH_GET_FS`: where to store the base as a `u64`.
+    GetFs(UserPtr<u64>),
 }
 
 const FUTEX_WAIT: usize = 0;
@@ -421,6 +438,30 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
             }
         }
         SYS_BRK => Syscall::Brk { addr: a[0] },
+        // Linux's result for an `ARCH_SET_FS` base past `TASK_SIZE_MAX` is EPERM. The GS codes
+        // are EINVAL here, though Linux accepts them (OD-03): nothing in musl or BusyBox uses them.
+        // munmap's EINVAL rules, returned to a thread that keeps running: its stack is still
+        // mapped, so returning is safe.
+        SYS_EXIT_UNMAP => {
+            let in_user = a[1]
+                .checked_next_multiple_of(PAGE_SIZE)
+                .and_then(|size| a[0].checked_add(size))
+                .is_some_and(|end| end <= USER_TOP);
+            if !a[0].is_multiple_of(PAGE_SIZE) || a[1] == 0 || !in_user {
+                return Err(Errno::EINVAL);
+            }
+            Syscall::ExitUnmap {
+                addr: a[0],
+                len: a[1],
+                code: a[2] as u64,
+            }
+        }
+        SYS_ARCH_PRCTL => Syscall::ArchPrctl(match a[0] {
+            ARCH_SET_FS if a[1] >= USER_TOP => return Err(Errno::EPERM),
+            ARCH_SET_FS => FsOp::SetFs(a[1]),
+            ARCH_GET_FS => FsOp::GetFs(UserPtr::new(a[1])?),
+            _ => return Err(Errno::EINVAL),
+        }),
         SYS_MUNMAP => {
             if !a[0].is_multiple_of(PAGE_SIZE) || a[1] == 0 {
                 return Err(Errno::EINVAL);
@@ -656,6 +697,35 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
         // A break is never negative, and a failure is the old break, not an errno: musl's wrapper
         // turns "the break did not move" into ENOMEM itself.
         Syscall::Brk { addr } => Outcome::Return(t.process().map_or(0, |p| p.brk(addr)) as isize),
+        // `pre_user_run` loads the stored base on the next entry to ring 3.
+        Syscall::ArchPrctl(FsOp::SetFs(base)) => {
+            t.set_fs_base(base);
+            Outcome::Return(0)
+        }
+        // The unmap's result is ignored, as musl's unmap-then-exit sequence ignores it: a split
+        // refused at the record limit leaves the pages charged, and teardown returns them. The
+        // thread never re-enters ring 3. Its exit still zeroes and wakes the `clear_tid` word, so
+        // a word inside the range being freed is dropped first: the unmap is about to take that
+        // page away, and a write to it would fault or hit whatever the range is mapped to next.
+        Syscall::ExitUnmap { addr, len, code } => {
+            let span = len
+                .checked_next_multiple_of(PAGE_SIZE)
+                .unwrap_or(usize::MAX);
+            let end = addr.saturating_add(span);
+            if (addr..end).contains(&t.clear_tid()) {
+                t.set_clear_tid(0);
+            }
+            if let Some(p) = t.process() {
+                let _ = p.munmap(addr, len);
+            }
+            Outcome::Exit(code)
+        }
+        Syscall::ArchPrctl(FsOp::GetFs(p)) => {
+            let bytes = (t.fs_base() as u64).to_le_bytes();
+            ret(UserSlice::new(p.addr(), bytes.len())
+                .and_then(|dst| copy_to_user(space, &*t.payer(), dst, &bytes))
+                .map(|()| 0))
+        }
     }
 }
 
@@ -731,6 +801,68 @@ mod test {
             decode(SYS_MUNMAP, [0x1000, 0, 0, 0, 0, 0]),
             Err(Errno::EINVAL)
         );
+    }
+
+    #[ktest]
+    fn decode_arch_prctl() {
+        let call = |code: usize, arg: usize| decode(SYS_ARCH_PRCTL, [code, arg, 0, 0, 0, 0]);
+        assert_eq!(
+            call(ARCH_SET_FS, 0x1_2345_0000),
+            Ok(Syscall::ArchPrctl(FsOp::SetFs(0x1_2345_0000)))
+        );
+        // Zero is a legal base: it is how a thread clears it.
+        assert_eq!(call(ARCH_SET_FS, 0), Ok(Syscall::ArchPrctl(FsOp::SetFs(0))));
+        assert_eq!(
+            call(ARCH_SET_FS, USER_TOP - 1),
+            Ok(Syscall::ArchPrctl(FsOp::SetFs(USER_TOP - 1)))
+        );
+        assert_eq!(
+            call(ARCH_GET_FS, 0x1000),
+            Ok(Syscall::ArchPrctl(FsOp::GetFs(
+                UserPtr::new(0x1000).unwrap()
+            )))
+        );
+        assert_eq!(call(ARCH_SET_FS, USER_TOP), Err(Errno::EPERM));
+        assert_eq!(call(ARCH_SET_FS, KERNEL_HALF), Err(Errno::EPERM));
+        assert_eq!(call(ARCH_GET_FS, KERNEL_HALF), Err(Errno::EFAULT));
+        assert_eq!(call(ARCH_GET_FS, USER_TOP - 4), Err(Errno::EFAULT));
+        // The GS codes and anything else: EINVAL, where Linux accepts the GS pair (OD-03).
+        for code in [0x1001, 0x1004, 0, usize::MAX] {
+            assert_eq!(call(code, 0), Err(Errno::EINVAL), "code {code:#x}");
+        }
+    }
+
+    #[ktest]
+    fn decode_exit_unmap() {
+        let call = |addr: usize, len: usize| decode(SYS_EXIT_UNMAP, [addr, len, 9, 0, 0, 0]);
+        assert_eq!(
+            call(0x1_0000_0000, 4096),
+            Ok(Syscall::ExitUnmap {
+                addr: 0x1_0000_0000,
+                len: 4096,
+                code: 9
+            })
+        );
+        // The length is not rounded in the variant; the unmap rounds it.
+        assert_eq!(
+            call(0x1000, 1),
+            Ok(Syscall::ExitUnmap {
+                addr: 0x1000,
+                len: 1,
+                code: 9
+            })
+        );
+        // The last page of user space is a legal range.
+        assert!(call(USER_TOP - PAGE_SIZE, PAGE_SIZE).is_ok());
+        assert_eq!(call(0x1_0000_0001, 4096), Err(Errno::EINVAL));
+        assert_eq!(call(0x1_0000_0000, 0), Err(Errno::EINVAL));
+        assert_eq!(
+            call(USER_TOP - PAGE_SIZE, PAGE_SIZE + 1),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(call(USER_TOP, PAGE_SIZE), Err(Errno::EINVAL));
+        assert_eq!(call(0x1000, usize::MAX), Err(Errno::EINVAL));
+        assert_eq!(call(KERNEL_HALF, PAGE_SIZE), Err(Errno::EINVAL));
     }
 
     #[ktest]
@@ -1061,7 +1193,7 @@ mod test {
         // Each decode and copy error path once, with its exact errno.
         let z = [0usize; 6];
         let anon = abi::MAP_PRIVATE | MAP_ANONYMOUS;
-        let targeted: [(usize, [usize; 6], isize); 33] = [
+        let targeted: [(usize, [usize; 6], isize); 39] = [
             (0xFFFF, z, errno::ENOSYS),
             (SYS_FUTEX, [mapped, 99, 0, 0, 0, 0], errno::ENOSYS),
             // The timeout pointer is address 1, which is unmapped.
@@ -1150,6 +1282,24 @@ mod test {
                 errno::EINVAL,
             ),
             (SYS_MUNMAP, [0x1001, 4096, 0, 0, 0, 0], errno::EINVAL),
+            (
+                SYS_ARCH_PRCTL,
+                [ARCH_SET_FS, USER_TOP, 0, 0, 0, 0],
+                errno::EPERM,
+            ),
+            (
+                SYS_ARCH_PRCTL,
+                [ARCH_GET_FS, KERNEL_HALF, 0, 0, 0, 0],
+                errno::EFAULT,
+            ),
+            (SYS_ARCH_PRCTL, [0x1001, 0, 0, 0, 0, 0], errno::EINVAL),
+            (SYS_EXIT_UNMAP, [0x1001, 4096, 0, 0, 0, 0], errno::EINVAL),
+            (SYS_EXIT_UNMAP, [0x1000, 0, 0, 0, 0, 0], errno::EINVAL),
+            (
+                SYS_EXIT_UNMAP,
+                [USER_TOP - 4096, 8192, 0, 0, 0, 0],
+                errno::EINVAL,
+            ),
             (SYS_MPROTECT, [0x1000, 4096, 8, 0, 0, 0], errno::EINVAL),
             // Valid, but this thread has no process to map into.
             (SYS_MMAP, [0, 4096, 3, anon, usize::MAX, 0], errno::ENOMEM),
@@ -1201,6 +1351,8 @@ mod test {
             SYS_MPROTECT,
             SYS_MUNMAP,
             SYS_BRK,
+            SYS_ARCH_PRCTL,
+            SYS_EXIT_UNMAP,
         ];
         let (mut enosys, mut efault, mut einval, mut ebadf, mut eintr) = (0, 0, 0, 0, 0);
         for i in 0..ITERATIONS {

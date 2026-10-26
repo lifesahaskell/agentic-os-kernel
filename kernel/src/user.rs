@@ -189,7 +189,10 @@ fn run_registered(thread: &Thread, space: &Arc<Space>, ctx: UserContext) -> Exit
         .register(thread)
         .expect("the space has room for this thread");
     let exit = run_ctx(thread, space, ctx);
-    // Recorded, then announced while the space still counts the thread, then reaped.
+    // The `clear_tid` word is zeroed and woken first, so a joiner woken by it finds the thread
+    // still registered and the exit not yet recorded. Then recorded, announced while the space
+    // still counts the thread, and reaped.
+    space.clear_child_tid(thread);
     thread.set_exit(exit);
     space.note_exit(thread, exit);
     thread.retire();
@@ -208,8 +211,9 @@ pub fn spawn_thread(space: &Arc<Space>, th: Arc<Thread>, start: ThreadStart) {
     let (space, t) = (space.clone(), th.clone());
     TaskOptions::new(move || {
         let exit = run_ctx(&t, &space, ctx);
-        // Record the exit, announce it while the space still counts the thread, then reap. A
+        // Zero and wake the `clear_tid` word first. Record the exit, announce it while the space still counts the thread, then reap. A
         // joiner that sees the exit may therefore still see the thread registered for an instant.
+        space.clear_child_tid(&t);
         t.set_exit(exit);
         space.note_exit(&t, exit);
         t.retire();

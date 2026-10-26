@@ -181,6 +181,9 @@ pub struct Thread {
     fpu: SharedFpu,
     /// The user-mode FS base: saved after every return from ring 3, loaded before every entry.
     fs_base: AtomicUsize,
+    /// The user address of the `u32` the kernel zeroes and futex-wakes when this thread exits, 0
+    /// for none. Set at creation from `ThreadCtx.clear_tid`; taken (swapped to 0) at the exit.
+    clear_tid: AtomicUsize,
     /// The signal stack: one frame per redirect applied and not yet returned from, at most
     /// `MAX_FRAMES`. IRQ-safe like `state`, because a timer callback may call `try_interrupt`.
     /// Lock order: `frames`, then `state`. Boxed so a frame is built (and `SYS_SIGRETURN` hands it
@@ -220,6 +223,7 @@ impl Thread {
             cancels: SpinLock::new(VecDeque::new()),
             fpu: Arc::new(SpinLock::new(FpuContext::default())),
             fs_base: AtomicUsize::new(0),
+            clear_tid: AtomicUsize::new(0),
             frames: SpinLock::new(Vec::with_capacity(MAX_FRAMES)),
             exited: SpinLock::new(None),
             killed: AtomicBool::new(false),
@@ -282,6 +286,20 @@ impl Thread {
 
     pub fn fs_base(&self) -> usize {
         self.fs_base.load(Ordering::Relaxed)
+    }
+
+    pub fn set_clear_tid(&self, va: usize) {
+        self.clear_tid.store(va, Ordering::Relaxed);
+    }
+
+    pub fn clear_tid(&self) -> usize {
+        self.clear_tid.load(Ordering::Relaxed)
+    }
+
+    /// Returns the `clear_tid` address and leaves 0 behind, so the exit-time clear runs at most
+    /// once per thread.
+    pub(crate) fn take_clear_tid(&self) -> usize {
+        self.clear_tid.swap(0, Ordering::Relaxed)
     }
 
     /// Records how the thread's run ended.

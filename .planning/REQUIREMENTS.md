@@ -17,7 +17,7 @@ recorded measurement. "Test" below names what would show it worked.
 - [x] **KERN-01**: User-mode FPU/SSE state is enabled under OSTD 0.19.0 and saved and restored per thread across context switches and signal delivery. Try a safe OSTD route first, then a contained `unsafe` block (see SAFE-01). Only if neither works, or the fix needs an OSTD patch, B3 stops and the Redox-fork re-score in ADR 0002 is triggered. Test: a ring-3 program keeps an XMM value across a yield and a signal redirect.
 - [x] **KERN-02**: A ring-3 syscall ABI exists (`syscall.rs`) with a typed decode layer. Test: a fuzz-style ktest feeds malformed numbers, pointers and lengths and gets errno returns, never a kernel panic.
 - [x] **KERN-03**: User code (servers, tests, bootstrap) builds as Rust `no_std` for a custom `x86_64-aok-user.json` target inside the Docker image and loads from a flat bootstrap image. Test: a Rust ring-3 test crate replaces the hand-assembled B2 test programs.
-- [ ] **KERN-04**: `Object::Space` and `Object::Thread` capability types exist, with `thread_create(space, ctx, tag)` gated by the Space capability. Test: a holder can create and signal a thread in another space; a non-holder cannot.
+- [x] **KERN-04**: `Object::Space` and `Object::Thread` capability types exist, with `thread_create(space, ctx, tag)` gated by the Space capability. Test: a holder can create and signal a thread in another space; a non-holder cannot.
 - [x] **KERN-05**: CSpace grows past the 64-slot B2 limit. Test: install and derive more than 64 capabilities.
 - [x] **KERN-06**: Every kernel write into user memory goes through one `copy_to_user` that breaks CoW and retries. Test: the first `read` into a buffer after `fork` succeeds (written before procmgr exists).
 - [ ] **KERN-07**: An idle task halts the CPU when nothing is runnable. Test: the scheduler runs with all agents blocked and the CPU halts instead of spinning.
@@ -182,7 +182,7 @@ Each v1 requirement maps to exactly one phase. Rule: the phase that builds its p
 | SAFE-01 | Phase 1 | Complete |
 | KERN-02 | Phase 1 | Complete |
 | KERN-03 | Phase 1 | Complete |
-| KERN-04 | Phase 2 | Pending |
+| KERN-04 | Phase 2 | Complete |
 | KERN-05 | Phase 1 | Complete |
 | KERN-06 | Phase 1 | Complete |
 | KERN-07 | Phase 2 | Pending |

@@ -19,6 +19,15 @@ pub const SYS_MUNMAP: usize = 11;
 /// `brk(addr)`: the raw Linux call. Returns the new break, or the old one on any failure; 0 as
 /// `addr` asks for the current break.
 pub const SYS_BRK: usize = 12;
+/// `arch_prctl(code, arg)`, at Linux's number. `ARCH_SET_FS` sets the caller's FS base to `arg`
+/// (`EPERM` at or above `USER_TOP`, Linux's result past `TASK_SIZE_MAX`); `ARCH_GET_FS` stores it
+/// as a `u64` at the pointer `arg` (`EFAULT` for a bad pointer). Both return 0. Every other code,
+/// including Linux's GS codes, is `EINVAL`.
+pub const SYS_ARCH_PRCTL: usize = 158;
+/// The `SYS_ARCH_PRCTL` code that sets the FS base.
+pub const ARCH_SET_FS: usize = 0x1002;
+/// The `SYS_ARCH_PRCTL` code that reads the FS base.
+pub const ARCH_GET_FS: usize = 0x1003;
 pub const SYS_SCHED_YIELD: usize = 24;
 pub const SYS_EXIT: usize = 60;
 pub const SYS_FUTEX: usize = 202;
@@ -51,6 +60,11 @@ pub const SYS_SPACE_NOTIFY: usize = 0x107;
 /// supplies nothing, so there is no frame to forge. Does not return to the caller on success.
 /// `EINVAL` when no redirect is outstanding.
 pub const SYS_SIGRETURN: usize = 0x108;
+/// `exit_unmap(addr, len, code)`: unmaps `[addr, addr + len)` from the caller's own space, then
+/// exits the calling thread with `code`; it does not return. A detached thread uses it to free the
+/// stack it is standing on. `EINVAL`, with the thread still running, for an unaligned `addr`, a
+/// zero `len` or a range that leaves user space. A `clear_tid` word inside the range is dropped.
+pub const SYS_EXIT_UNMAP: usize = 0x109;
 
 /// `thread_create`'s `space` argument for "the caller's own space". No slot can hold this value:
 /// slots are below `CSpace::MAX_SLOTS`.
@@ -163,8 +177,9 @@ impl IpcArgs {
 }
 
 /// The block `thread_create` reads from the pointer in `rsi`: where the new thread starts. The
-/// kernel writes `tid` back, so the creator can name the thread before it runs. `clear_tid` must
-/// be 0 for now.
+/// kernel writes `tid` back, so the creator can name the thread before it runs. `clear_tid` is 0
+/// for none, else the 4-aligned user address of a `u32` the kernel zeroes and futex-wakes once when
+/// the thread exits.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct ThreadCtx {
