@@ -1,6 +1,6 @@
 //! Ring-3 runtime: the syscall stub, process entry and panic handler. The only ring-3 crate
-//! with `unsafe`, confined to `raw.rs`, `rt.rs`, `fpu.rs` and the three small modules below
-//! (ledger rows U-01 to U-06).
+//! with `unsafe`, confined to `raw.rs`, `rt.rs`, `fpu.rs`, `regs.rs` and the three small modules
+//! below (ledger rows U-01 to U-07).
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -8,6 +8,7 @@
 pub mod fpu;
 pub mod ledger;
 pub mod raw;
+pub mod regs;
 pub mod rt;
 
 use abi::{IpcArgs, SYS_CALL, SYS_EXIT, SYS_RECV, SYS_REPLY, SYS_REPLY_RECV, SYS_SCHED_YIELD};

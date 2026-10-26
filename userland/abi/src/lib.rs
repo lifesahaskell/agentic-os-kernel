@@ -8,6 +8,8 @@
 pub const SYS_SCHED_YIELD: usize = 24;
 pub const SYS_EXIT: usize = 60;
 pub const SYS_FUTEX: usize = 202;
+/// The `SYS_FUTEX` operation (`a[1]`) that sleeps while the word at `a[0]` still holds `a[2]`.
+pub const FUTEX_WAIT: usize = 0;
 pub const SYS_CALL: usize = 0x100;
 pub const SYS_RECV: usize = 0x101;
 pub const SYS_REPLY: usize = 0x102;
@@ -30,6 +32,11 @@ pub const SYS_THREAD_INTERRUPT: usize = 0x105;
 /// a thread naming its own space may set it only once (`EPERM` when one is already set), so a
 /// thread cannot redirect the notes its parent arranged (OD-18).
 pub const SYS_SPACE_NOTIFY: usize = 0x107;
+/// `sigreturn()`: ends a redirect handler. The kernel pops the newest frame it saved when it
+/// applied the redirect and restores the registers, FPU/SSE state and FS base from it; the handler
+/// supplies nothing, so there is no frame to forge. Does not return to the caller on success.
+/// `EINVAL` when no redirect is outstanding.
+pub const SYS_SIGRETURN: usize = 0x108;
 
 /// `thread_create`'s `space` argument for "the caller's own space". No slot can hold this value:
 /// slots are below `CSpace::MAX_SLOTS`.

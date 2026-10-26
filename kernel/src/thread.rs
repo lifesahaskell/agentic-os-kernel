@@ -3,8 +3,14 @@
 //! `interrupt` aborts a blocking IPC (the call returns `Interrupted`, i.e. EINTR) and leaves a
 //! pending redirect. The thread applies the redirect itself between `UserMode::execute` calls, so
 //! the register rewrite can never race syscall entry.
+//!
+//! Applying a redirect pushes a `RedirectFrame` (the full user context, the FPU state and the FS
+//! base) onto a stack the kernel holds for the thread, and `SYS_SIGRETURN` pops it. Nothing is
+//! written to user memory either way, and user code never supplies the context that comes back
+//! (OD-01, OD-16).
 
 use alloc::{
+    boxed::Box,
     collections::VecDeque,
     sync::{Arc, Weak},
     vec::Vec,
@@ -12,7 +18,7 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use ostd::{
-    arch::cpu::context::{FpuContext, FsBase},
+    arch::cpu::context::{FpuContext, FsBase, UserContext},
     irq::DisabledLocalIrqGuard,
     mm::{Vaddr, VmSpace},
     sync::{LocalIrqDisabled, SpinLock, WaitQueue, Waiter, Waker},
@@ -68,6 +74,45 @@ pub(crate) type FailHook = Arc<dyn Fn(&Thread) + Send + Sync>;
 pub(crate) static FAILPOINT: SpinLock<Option<(u8, FailHook)>, LocalIrqDisabled> =
     SpinLock::new(None);
 
+/// The most frames a thread's signal stack holds (OD-01). One more `try_interrupt` is refused.
+pub const MAX_FRAMES: usize = 8;
+
+/// The bytes below `rsp` that a leaf function may use without moving `rsp` (System V red zone). A
+/// handler's stack starts below them (OD-16).
+pub const RED_ZONE: usize = 128;
+
+/// `try_interrupt` found the frame stack at `MAX_FRAMES`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FramesFull;
+
+/// What a redirect saved: everything `SYS_SIGRETURN` needs to put the thread back exactly as it
+/// was. Lives in kernel memory only.
+pub struct RedirectFrame {
+    ctx: UserContext,
+    fpu: FpuContext,
+    fs_base: usize,
+}
+
+impl core::fmt::Debug for RedirectFrame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RedirectFrame")
+            .field("rip", &self.ctx.rip())
+            .field("rsp", &self.ctx.rsp())
+            .field("fs_base", &self.fs_base)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A frame equals only itself: the contexts it holds have no meaningful comparison, and this lets
+/// `Outcome` keep its derives.
+impl PartialEq for RedirectFrame {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self, other)
+    }
+}
+
+impl Eq for RedirectFrame {}
+
 struct State {
     /// Where to resume user code, set by `interrupt`, consumed by `take_redirect`.
     redirect: Option<Vaddr>,
@@ -90,6 +135,12 @@ static FPU_OWNER: SpinLock<Option<SharedFpu>, LocalIrqDisabled> = SpinLock::new(
 #[cfg(ktest)]
 pub(crate) static FPU_SWAP_DISABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// Ktest-only fault injection for `restore_frame`, so a test can prove the register probe would
+/// notice: 1 adds one to the saved `rbx`, 2 skips the FPU write, 0 is the real behaviour.
+#[cfg(ktest)]
+pub(crate) static CORRUPT_FRAME: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
 
 /// The next thread id. Never reused, so a tid names one thread for the life of the kernel.
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
@@ -130,6 +181,12 @@ pub struct Thread {
     fpu: SharedFpu,
     /// The user-mode FS base: saved after every return from ring 3, loaded before every entry.
     fs_base: AtomicUsize,
+    /// The signal stack: one frame per redirect applied and not yet returned from, at most
+    /// `MAX_FRAMES`. IRQ-safe like `state`, because a timer callback may call `try_interrupt`.
+    /// Lock order: `frames`, then `state`. Boxed so a frame is built (and `SYS_SIGRETURN` hands it
+    /// over) without a copy or an allocation under this IRQ-disabled lock.
+    #[allow(clippy::vec_box)]
+    frames: SpinLock<Vec<Box<RedirectFrame>>, LocalIrqDisabled>,
     /// How the thread's run ended; `None` while it can still run.
     exited: SpinLock<Option<Exit>, LocalIrqDisabled>,
     /// Set by `kill`, never cleared: every blocking wait gives up and ring 3 is never entered
@@ -163,6 +220,7 @@ impl Thread {
             cancels: SpinLock::new(VecDeque::new()),
             fpu: Arc::new(SpinLock::new(FpuContext::default())),
             fs_base: AtomicUsize::new(0),
+            frames: SpinLock::new(Vec::with_capacity(MAX_FRAMES)),
             exited: SpinLock::new(None),
             killed: AtomicBool::new(false),
             state: SpinLock::new(State {
@@ -248,17 +306,33 @@ impl Thread {
         self.state.lock().blocked.is_some()
     }
 
-    /// Aborts any blocking IPC and makes the thread resume at `entry` before it next runs
-    /// user code.
-    pub fn interrupt(&self, entry: Vaddr) {
+    /// Aborts any blocking IPC and makes the thread resume at `entry` before it next runs user
+    /// code, with its interrupted context pushed on its signal stack. `FramesFull` when the stack
+    /// already holds `MAX_FRAMES`; nothing changes then. A redirect not yet applied is replaced, so
+    /// frames plus the pending redirect never exceed `MAX_FRAMES`.
+    pub fn try_interrupt(&self, entry: Vaddr) -> Result<(), FramesFull> {
         let waker = {
+            let frames = self.frames.lock();
+            if frames.len() >= MAX_FRAMES {
+                return Err(FramesFull);
+            }
             let mut s = self.state.lock();
             s.redirect = Some(entry);
-            s.blocked.clone()
+            let waker = s.blocked.clone();
+            drop(s);
+            drop(frames);
+            waker
         };
         if let Some(w) = waker {
             w.wake_up();
         }
+        Ok(())
+    }
+
+    /// `try_interrupt` for kernel-side callers (ktests, boot checks) that have no errno to return:
+    /// a full signal stack drops the redirect. Ring-3 paths use `try_interrupt`.
+    pub fn interrupt(&self, entry: Vaddr) {
+        let _ = self.try_interrupt(entry);
     }
 
     /// Kills the thread: every wait it is in, or enters, gives up (`Interrupted`, even an
@@ -289,6 +363,8 @@ impl Thread {
             w.fail(IpcError::Dead);
         }
         self.cancels.lock().clear();
+        // A dead thread holds no FPU snapshots: the frames are kernel heap, `MAX_FRAMES` at most.
+        self.frames.lock().clear();
         let mut owner = FPU_OWNER.lock();
         if owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, &self.fpu)) {
             *owner = None;
@@ -307,6 +383,89 @@ impl Thread {
 
     pub fn take_redirect(&self) -> Option<Vaddr> {
         self.state.lock().redirect.take()
+    }
+
+    /// Applies a pending redirect to `ctx`, the thread's registers between two `execute` calls:
+    /// pushes a frame holding the interrupted context, the FPU state and the FS base, then points
+    /// `ctx` at the handler (`rdi` = the interrupted `rip`) with `rsp` below the red zone. Only
+    /// registers change; no user memory is written. Returns whether a redirect was applied.
+    pub fn apply_redirect(&self, ctx: &mut UserContext) -> bool {
+        // Only this thread takes its own redirect, so one seen pending stays pending.
+        if self.state.lock().redirect.is_none() {
+            return false;
+        }
+        // The kernel is soft-float, so while this thread owns the FPU the CPU still holds its
+        // registers: save them before the copy.
+        let fpu = {
+            let owner = FPU_OWNER.lock();
+            if owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, &self.fpu)) {
+                self.fpu.lock().save();
+            }
+            self.fpu.lock().clone()
+        };
+        let frame = Box::new(RedirectFrame {
+            ctx: ctx.clone(),
+            fpu,
+            fs_base: self.fs_base(),
+        });
+        let mut frames = self.frames.lock();
+        // `try_interrupt` refused at MAX_FRAMES under this lock, so there is room.
+        let Some(handler) = self.state.lock().redirect.take() else {
+            return false;
+        };
+        frames.push(frame);
+        drop(frames);
+        ctx.set_rdi(ctx.rip());
+        ctx.set_rip(handler);
+        // Wrapping: a result outside user space faults in the handler, which is the handler's
+        // problem, not the kernel's.
+        let sp = ctx.rsp().wrapping_sub(RED_ZONE) & !15;
+        ctx.set_rsp(sp.wrapping_sub(8));
+        true
+    }
+
+    /// Pops the newest frame, `None` when no redirect is outstanding (`SYS_SIGRETURN` is then
+    /// `EINVAL`).
+    pub fn pop_frame(&self) -> Option<Box<RedirectFrame>> {
+        self.frames.lock().pop()
+    }
+
+    /// Puts the thread back as `f` saved it: registers (`rax` included), FS base and FPU/SSE
+    /// state. The FPU owner slot is cleared when it points here, so `pre_user_run` loads the
+    /// restored state instead of trusting the registers the handler left in the CPU.
+    pub fn restore_frame(&self, ctx: &mut UserContext, f: Box<RedirectFrame>) {
+        let RedirectFrame {
+            ctx: saved,
+            fpu,
+            fs_base,
+        } = *f;
+        *ctx = saved;
+        self.set_fs_base(fs_base);
+        #[cfg(ktest)]
+        let corrupt = CORRUPT_FRAME.load(Ordering::Relaxed);
+        #[cfg(ktest)]
+        if corrupt == 1 {
+            let regs = ctx.general_regs_mut();
+            regs.rbx = regs.rbx.wrapping_add(1);
+        }
+        let mut owner = FPU_OWNER.lock();
+        #[cfg(ktest)]
+        let skip_fpu = corrupt == 2;
+        #[cfg(not(ktest))]
+        let skip_fpu = false;
+        // Skipping the restore also leaves the owner slot alone, so the handler's registers stay
+        // live: that is the failure the control exists to show.
+        if !skip_fpu {
+            *self.fpu.lock() = fpu;
+            if owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, &self.fpu)) {
+                *owner = None;
+            }
+        }
+    }
+
+    /// Redirects applied and not yet returned from.
+    pub fn frame_depth(&self) -> usize {
+        self.frames.lock().len()
     }
 
     #[cfg(ktest)]
@@ -681,6 +840,49 @@ mod test {
             Err(BlockError::Interrupted)
         );
         t.take_redirect();
+    }
+
+    /// `apply_redirect` on a hand-built context: `rsp` lands below the red zone, 16-aligned minus
+    /// the return-address slot; `rdi` carries the old `rip`; the frame holds the old context, which
+    /// `restore_frame` puts back. No user memory is involved: the stack address is unmapped.
+    #[ktest]
+    fn sigreturn_moves_rsp_below_the_red_zone() {
+        const RSP: usize = 0x7000_0000 - 8;
+        const RIP: usize = 0x40_1234;
+        const HANDLER: usize = 0x40_2000;
+        let t = Thread::new(Agent::new_root(1, 0));
+        t.set_fs_base(0xAB_C000);
+        let mut ctx = UserContext::default();
+        ctx.set_rip(RIP);
+        ctx.set_rsp(RSP);
+        ctx.set_rbx(0x1111);
+        ctx.set_rax(0x2222);
+
+        assert!(!t.apply_redirect(&mut ctx), "nothing pending");
+        assert_eq!(ctx.rip(), RIP);
+
+        t.interrupt(HANDLER);
+        assert!(t.apply_redirect(&mut ctx));
+        assert_eq!(ctx.rsp(), ((RSP - RED_ZONE) & !15) - 8);
+        assert_eq!(ctx.rdi(), RIP);
+        assert_eq!(ctx.rip(), HANDLER);
+        assert_eq!(t.frame_depth(), 1);
+        assert!(!t.apply_redirect(&mut ctx), "the redirect was consumed");
+
+        let frame = t.pop_frame().unwrap();
+        assert_eq!(frame.ctx.rsp(), RSP);
+        assert_eq!(frame.ctx.rip(), RIP);
+        assert_eq!(frame.ctx.rbx(), 0x1111);
+        assert_eq!(frame.fs_base, 0xAB_C000);
+        assert_eq!(t.frame_depth(), 0);
+        assert!(t.pop_frame().is_none());
+
+        t.set_fs_base(0);
+        t.restore_frame(&mut ctx, frame);
+        assert_eq!(ctx.rsp(), RSP);
+        assert_eq!(ctx.rip(), RIP);
+        assert_eq!(ctx.rax(), 0x2222, "rax comes from the frame");
+        assert_eq!(t.fs_base(), 0xAB_C000);
     }
 
     #[ktest]

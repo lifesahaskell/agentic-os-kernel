@@ -328,6 +328,9 @@ fn run_ctx(thread: &Thread, process: &Arc<Space>, ctx: UserContext) -> Exit {
                     Ok(call) => match syscall::dispatch(thread, space, call) {
                         Outcome::Return(v) => ctx.set_rax(v as usize),
                         Outcome::Exit(code) => return Exit::Code(code as usize),
+                        // The frame replaces the whole context, `rax` included: the interrupted
+                        // code resumes exactly as the redirect found it.
+                        Outcome::Sigreturn(f) => thread.restore_frame(ctx, f),
                     },
                 }
             }
@@ -358,11 +361,10 @@ fn run_ctx(thread: &Thread, process: &Arc<Space>, ctx: UserContext) -> Exit {
             },
             ReturnReason::KernelEvent => {}
         }
-        // Signal-style redirect: resume at the handler with the interrupted pc in rdi.
-        if let Some(handler) = thread.take_redirect() {
-            ctx.set_rdi(ctx.rip());
-            ctx.set_rip(handler);
-        }
+        // Signal-style redirect: the interrupted context goes on the thread's kernel-held frame
+        // stack and the thread resumes at the handler with the interrupted pc in rdi. Nothing is
+        // written to user memory; `SYS_SIGRETURN` pops the frame.
+        thread.apply_redirect(ctx);
     }
 }
 
@@ -464,7 +466,9 @@ mod test {
         cap::{Cap, Object, Rights},
         futex,
         ipc::{Endpoint, Message, sys_recv},
-        user::testkit::{join, recv_note, spawn_image, spawn_image_in, wait_blocked},
+        space::{SpaceError, thread_interrupt},
+        syscall::Errno,
+        user::testkit::{join, join_thread, recv_note, spawn_image, spawn_image_in, wait_blocked},
         vm::cow_clone,
     };
 
@@ -615,6 +619,172 @@ mod test {
         };
         assert!(img.text.contains(&pc), "pc {pc:#x} outside the image text");
         assert!(alarm.lock().is_none());
+    }
+
+    /// `sigreturn` mode 1 spins until its handler runs; the handler returns through
+    /// `SYS_SIGRETURN`, so the loop resumes, sees the flag and exits 42.
+    #[ktest]
+    fn sigreturn_resumes_the_interrupted_loop() {
+        let img = load_image(user_image!("sigreturn")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 0));
+        let exit = spawn_image(&t, &img, 1);
+        for _ in 0..50 {
+            Task::yield_now();
+        }
+        t.interrupt(img.handler);
+        assert_eq!(join(&exit), Exit::Code(42));
+        assert_eq!(t.frame_depth(), 0);
+    }
+
+    #[ktest]
+    fn sigreturn_on_an_empty_stack_is_einval() {
+        let img = load_image(user_image!("sigreturn")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 0));
+        let exit = spawn_image(&t, &img, 3);
+        assert_eq!(join(&exit), Exit::Code(abi::errno::EINVAL as usize));
+        assert_eq!(t.frame_depth(), 0);
+    }
+
+    /// Runs the `sigframe` probe with a timer-driven interrupt: the probe has no syscalls to
+    /// yield in, and the scheduler does not preempt, so the interrupt must come from the tick.
+    /// The delay is long enough that the probe is spinning with every register loaded.
+    fn run_sigframe() -> Exit {
+        let img = load_image(user_image!("sigframe")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 0));
+        let alarm: Arc<SpinLock<Option<Arc<Thread>>, LocalIrqDisabled>> =
+            Arc::new(SpinLock::new(Some(t.clone())));
+        let deadline = Jiffies::elapsed().as_u64() + 30;
+        let a = alarm.clone();
+        let handler = img.handler;
+        register_callback_on_cpu(move || {
+            if Jiffies::elapsed().as_u64() >= deadline {
+                if let Some(t) = a.lock().take() {
+                    t.interrupt(handler);
+                }
+            }
+        });
+        let exit = start(&t, &img, 0);
+        assert!(alarm.lock().is_none(), "the interrupt never fired");
+        assert_eq!(t.frame_depth(), 0);
+        exit
+    }
+
+    /// Resets `CORRUPT_FRAME` when a control test ends, however it ends.
+    struct Uncorrupt;
+    impl Drop for Uncorrupt {
+        fn drop(&mut self) {
+            crate::thread::CORRUPT_FRAME.store(0, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[ktest]
+    fn sigreturn_restores_all_gprs_fpu_and_leaves_the_user_stack_untouched() {
+        assert_eq!(run_sigframe(), Exit::Code(0));
+    }
+
+    /// Negative control: a restore that corrupts rbx must make the probe report rbx (1 + 1).
+    #[ktest]
+    fn sigreturn_probe_detects_a_corrupted_rbx() {
+        let _guard = Uncorrupt;
+        crate::thread::CORRUPT_FRAME.store(1, core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(run_sigframe(), Exit::Code(2));
+    }
+
+    /// Negative control: a restore that skips the FPU write leaves the handler's zeroed xmm0.
+    #[ktest]
+    fn sigreturn_probe_detects_a_skipped_fpu_restore() {
+        let _guard = Uncorrupt;
+        crate::thread::CORRUPT_FRAME.store(2, core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(run_sigframe(), Exit::Code(20));
+    }
+
+    /// A `sigreturn` mode 4 thread in a space of its own, and a caller whose capability space
+    /// holds a Thread capability (SIGNAL) for it, as `SYS_THREAD_INTERRUPT` needs.
+    fn mode4_rig() -> (Arc<Space>, Arc<Thread>, Arc<Thread>, usize, Image) {
+        crate::sched::install_space_switch();
+        let img = load_image(user_image!("sigreturn")).unwrap();
+        let owner = Agent::new_root(1, 0);
+        let space = Space::new(img.space.clone(), owner.clone());
+        let th = Thread::new(owner);
+        space.register(&th).unwrap();
+        let start = ThreadStart {
+            rip: img.entry as u64,
+            rsp: USER_STACK_TOP as u64,
+            arg: 4,
+            fs_base: 0,
+            clear_tid: 0,
+        };
+        spawn_thread(&space, th.clone(), start);
+        let holder = Agent::new_root(2, 0);
+        let slot = holder
+            .cspace
+            .lock()
+            .insert(Cap::new(Object::Thread(th.downgrade()), Rights::SIGNAL))
+            .unwrap();
+        (space, th, Thread::new(holder), slot, img)
+    }
+
+    /// Interrupts `th` `n` times, waiting for each handler to start before the next.
+    fn nest(th: &Arc<Thread>, caller: &Thread, slot: usize, handler: usize, n: usize) {
+        for i in 1..=n {
+            thread_interrupt(caller, slot, handler).unwrap();
+            let mut spins = 0usize;
+            while th.frame_depth() < i {
+                spins += 1;
+                assert!(spins < 1000, "redirect {i} never reached its handler");
+                Task::yield_now();
+            }
+        }
+    }
+
+    #[ktest]
+    fn sigreturn_nests_to_depth_8_then_eagain() {
+        let (space, th, caller, slot, img) = mode4_rig();
+        nest(&th, &caller, slot, img.handler, crate::thread::MAX_FRAMES);
+        assert_eq!(th.frame_depth(), crate::thread::MAX_FRAMES);
+
+        let full = thread_interrupt(&caller, slot, img.handler).err();
+        assert_eq!(full, Some(SpaceError::Limit));
+        assert_eq!(Errno::from(SpaceError::Limit), Errno::EAGAIN);
+        assert_eq!(
+            th.frame_depth(),
+            crate::thread::MAX_FRAMES,
+            "the refusal pushed nothing"
+        );
+
+        space.kill();
+        assert_eq!(join_thread(&th), Exit::Killed);
+    }
+
+    /// A blocked call interrupted and then returned from sees `EINTR` in `rax`: the frame saved
+    /// the syscall result, and `SYS_SIGRETURN` gives it back.
+    #[ktest]
+    fn sigreturn_after_a_blocked_call_returns_eintr() {
+        let img = load_image(user_image!("sigreturn")).unwrap();
+        let t = Thread::new(Agent::new_root(1, 0));
+        let exit = spawn_image(&t, &img, 2);
+        wait_blocked(&t, &exit);
+        t.interrupt(img.handler);
+        assert_eq!(join(&exit), Exit::Code(abi::errno::EINTR as usize));
+        assert_eq!(t.frame_depth(), 0);
+    }
+
+    #[ktest]
+    fn sigreturn_frames_dropped_at_kill() {
+        let (space, th, caller, slot, img) = mode4_rig();
+        nest(&th, &caller, slot, img.handler, 3);
+        assert_eq!(th.frame_depth(), 3);
+
+        space.kill();
+        assert_eq!(join_thread(&th), Exit::Killed);
+        // `retire` runs after the exit is recorded; the reap that follows empties the space.
+        let mut spins = 0usize;
+        while space.live_threads() != 0 {
+            spins += 1;
+            assert!(spins < 1_000_000, "the thread was never reaped");
+            Task::yield_now();
+        }
+        assert_eq!(th.frame_depth(), 0, "a dead thread holds no frames");
     }
 
     /// A data frame whose first byte is `first`.
