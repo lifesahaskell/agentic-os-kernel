@@ -36,6 +36,8 @@ pub enum Exit {
     Budget,
     /// A non-page-fault exception (x86 vector) that no handler took.
     Exception(u64),
+    /// Killed from outside (`Space::kill`), not by anything the thread did.
+    Killed,
 }
 
 /// A loaded flat image: the space holds the mapped image and the user stack.

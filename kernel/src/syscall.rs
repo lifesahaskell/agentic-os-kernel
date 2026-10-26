@@ -63,6 +63,7 @@ impl From<IpcError> for Errno {
             IpcError::NoRoom => Errno::EMFILE,
             IpcError::Interrupted => Errno::EINTR,
             IpcError::TimedOut => Errno::ETIMEDOUT,
+            IpcError::Dead => Errno::ESRCH,
         }
     }
 }

@@ -166,6 +166,12 @@ impl ReplyTable {
         Some((generation as u64) << 32 | index as u64)
     }
 
+    /// Ktest-only: how many calls are parked.
+    #[cfg(ktest)]
+    pub(crate) fn len(&self) -> usize {
+        self.slots.iter().flatten().count()
+    }
+
     /// The call named by `handle`, left in place. Unknown and stale handles are `None`.
     fn peek(&self, handle: u64) -> Option<&Arc<ReplyWait>> {
         let slot = self.slots.get((handle & 0xFFFF_FFFF) as usize)?;
@@ -195,6 +201,8 @@ pub enum IpcError {
     Invalid,
     /// The receiver's capability space cannot hold the capabilities the message carries.
     NoRoom,
+    /// The server that held the call died before it answered.
+    Dead,
 }
 
 impl From<CapError> for IpcError {

@@ -6,7 +6,8 @@
 //! another space does not run with the creator's authority (OD-11).
 
 use abi::{
-    NOTE_EXIT, NOTE_KIND_BUDGET, NOTE_KIND_CODE, NOTE_KIND_EXCEPTION, NOTE_KIND_FAULT, USER_TOP,
+    NOTE_EXIT, NOTE_KIND_BUDGET, NOTE_KIND_CODE, NOTE_KIND_EXCEPTION, NOTE_KIND_FAULT,
+    NOTE_KIND_KILLED, USER_TOP,
 };
 use alloc::{
     sync::{Arc, Weak},
@@ -129,6 +130,11 @@ impl Space {
         Ok(())
     }
 
+    /// Kills the process from outside (OD-15; a kernel API, ring 3 gets it with procmgr).
+    pub fn kill(&self) {
+        todo!("Space::kill")
+    }
+
     /// Takes back a registration that never ran. Does not tear the space down.
     pub fn unregister(&self, tid: u64) {
         self.threads.lock().retain(|(t, _)| *t != tid);
@@ -215,6 +221,7 @@ impl Space {
             Exit::Fault(a) => (NOTE_KIND_FAULT, a as u64),
             Exit::Budget => (NOTE_KIND_BUDGET, 0),
             Exit::Exception(v) => (NOTE_KIND_EXCEPTION, v),
+            Exit::Killed => (NOTE_KIND_KILLED, 0),
         };
         let _ = ep.push_note(th, NOTE_EXIT, [kind, value, 0, 0], None);
     }
@@ -439,7 +446,7 @@ pub fn set_notify(caller: &Thread, target: Target, ep_slot: usize) -> Result<(),
 mod test {
     use abi::{IMAGE_BASE, NOTE_FAULT, TEST_DATA, USER_STACK_TOP, errno};
     use ostd::{
-        mm::{FrameAllocOptions, PageFlags, VmIo},
+        mm::{FrameAllocOptions, PageFlags, UFrame, VmIo},
         prelude::*,
         task::{Task, TaskOptions, disable_preempt},
         timer::Jiffies,
@@ -449,6 +456,7 @@ mod test {
     use crate::{
         ipc::{IpcError, Message},
         sched::install_space_switch,
+        syscall::Errno,
         user::{
             Image, load_image, map_stack, map_test_page, spawn_thread,
             testkit::{self, join, join_thread, recv_note, spawn_image, spawn_image_in},
@@ -1465,5 +1473,199 @@ mod test {
         for va in [IMAGE_BASE, TEST_DATA, USER_STACK_TOP - PAGE_SIZE] {
             assert!(mapped(&child.space, va), "the caller still maps {va:#x}");
         }
+    }
+
+    /// A space that owns a loaded `spinner` image over a test page the harness keeps a handle on.
+    fn owned_spinner(owner: &Arc<Agent>) -> (Arc<Space>, Image, UFrame) {
+        let img = load_image(user_image!("spinner")).unwrap();
+        let page: UFrame = FrameAllocOptions::new().alloc_frame().unwrap().into();
+        map_test_page(&img.space, page.clone(), PageFlags::RW);
+        (Space::new(img.space.clone(), owner.clone()), img, page)
+    }
+
+    /// Registers a thread tagged `tag` in `space` and starts it at `start`.
+    fn start_in(
+        space: &Arc<Space>,
+        owner: &Arc<Agent>,
+        tag: u64,
+        start: ThreadStart,
+    ) -> Arc<Thread> {
+        let th = Thread::new_tagged(owner.clone(), tag);
+        space.register(&th).unwrap();
+        spawn_thread(space, th.clone(), start);
+        th
+    }
+
+    #[ktest]
+    fn kill_stops_a_running_spinner() {
+        install_space_switch();
+        let owner = Agent::new_root(1, 0);
+        let (space, img, _page) = owned_spinner(&owner);
+        let ep = Endpoint::new();
+        space.set_notify_cap(Cap::new(Object::Endpoint(ep.clone()), Rights::SEND));
+        let th = start_in(&space, &owner, 0x21, spin_at(&img));
+
+        space.kill();
+        assert_eq!(join_thread(&th), Exit::Killed);
+        let m = recv_note(&ep, &receiver());
+        assert_note_shape(&m, NOTE_EXIT);
+        assert_eq!(m.words, [NOTE_KIND_KILLED, 0, 0, 0]);
+        assert_eq!((m.tid, m.tag), (th.tid(), 0x21));
+        wait_reaped(&space);
+        assert!(!mapped(&img.space, IMAGE_BASE), "the process is torn down");
+        assert_eq!(space.live_threads(), 0);
+    }
+
+    #[ktest]
+    fn kill_wakes_the_dead_process_futex_waiters() {
+        install_space_switch();
+        let owner = Agent::new_root(1, 0);
+        let img = load_image(user_image!("futex_waiter")).unwrap();
+        let word: UFrame = FrameAllocOptions::new().alloc_frame().unwrap().into();
+        word.write_val(0, &0x11u32).unwrap();
+        map_test_page(&img.space, word.clone(), PageFlags::RW);
+        let space = Space::new(img.space.clone(), owner.clone());
+        // Q maps the same frame, so a wake from Q reaches whatever S left in the futex table.
+        let q = VmSpace::new();
+        map_test_page(&q, word, PageFlags::RW);
+
+        let at = |back: usize| ThreadStart {
+            rip: img.entry as u64,
+            rsp: (USER_STACK_TOP - back) as u64,
+            arg: 0,
+            fs_base: 0,
+            clear_tid: 0,
+        };
+        let t1 = start_in(&space, &owner, 0, at(0));
+        let t2 = start_in(&space, &owner, 0, at(PAGE_SIZE));
+        let mut spins = 0usize;
+        while !(t1.is_blocked() && t2.is_blocked()) {
+            spins += 1;
+            assert!(spins < 1_000_000, "the waiters never reached the futex");
+            Task::yield_now();
+        }
+
+        space.kill();
+        assert_eq!(join_thread(&t1), Exit::Killed);
+        assert_eq!(join_thread(&t2), Exit::Killed);
+        let waker = Thread::new(Agent::new_root(2, 0));
+        assert_eq!(
+            crate::futex::wake(&waker, &q, TEST_DATA, 10),
+            Ok(0),
+            "no waiter was left in the table"
+        );
+    }
+
+    #[ktest]
+    fn kill_frees_a_thread_in_an_uninterruptible_reply_wait() {
+        install_space_switch();
+        let ep = Endpoint::new();
+        let agent = Agent::new_root(3, 0);
+        let slot = give_endpoint(&agent, &ep, Rights::SEND);
+        // `nullipc` calls the endpoint in slot `arg` until a call fails.
+        let img = load_image(user_image!("nullipc")).unwrap();
+        let space = Space::new(img.space.clone(), agent.clone());
+        let caller = Thread::new(agent);
+        let exit = spawn_image_in(&caller, &space, &img, slot as u64);
+
+        // A kernel task takes the call and never answers it.
+        let server = receiver();
+        let m = ep.recv(&server).unwrap();
+        let reply = m.reply.clone().expect("a call carries its reply");
+        testkit::wait_blocked(&caller, &exit);
+        caller.interrupt(img.handler);
+        for _ in 0..50 {
+            Task::yield_now();
+        }
+        assert!(
+            caller.is_blocked() && exit.lock().is_none(),
+            "an interrupted caller whose request a server holds waits for the reply"
+        );
+
+        space.kill();
+        assert_eq!(join(&exit), Exit::Killed);
+        assert!(!caller.is_blocked());
+
+        // The server's late answer has nobody to go to and must not panic.
+        reply.reply([1, 2, 3, 4]);
+        assert_eq!(ep.queued(), 0);
+        assert!(!caller.is_blocked());
+    }
+
+    #[ktest]
+    fn dead_server_answers_parked_callers_esrch() {
+        install_space_switch();
+        let ep = Endpoint::new();
+        let agent = Agent::new_root(4, 0);
+        let rx = give_endpoint(&agent, &ep, Rights::RECV);
+        // `park_srv` receives a call, parks it, then waits for a second one.
+        let img = load_image(user_image!("park_srv")).unwrap();
+        let space = Space::new(img.space.clone(), agent.clone());
+        let server = Thread::new(agent);
+        let exit = spawn_image_in(&server, &space, &img, rx as u64);
+
+        let caller = Thread::new(Agent::new_root(5, 0));
+        let out: Arc<SpinLock<Option<Result<[u64; 4], IpcError>>>> = Arc::new(SpinLock::new(None));
+        let (e2, c2, o2) = (ep.clone(), caller.clone(), out.clone());
+        TaskOptions::new(move || *o2.lock() = Some(e2.call(&c2, 7, [7, 0, 0, 0])))
+            .spawn()
+            .unwrap();
+        let mut spins = 0usize;
+        while server.replies.lock().len() < 1 {
+            spins += 1;
+            assert!(spins < 1_000_000, "the server never parked the call");
+            Task::yield_now();
+        }
+        assert!(out.lock().is_none(), "the caller is still waiting");
+
+        space.kill();
+        assert_eq!(join(&exit), Exit::Killed);
+        let answer = loop {
+            if let Some(r) = out.lock().take() {
+                break r;
+            }
+            Task::yield_now();
+        };
+        assert_eq!(answer, Err(IpcError::Dead));
+        assert_eq!(Errno::from(IpcError::Dead), Errno::ESRCH);
+        assert_eq!(
+            server.replies.lock().len(),
+            0,
+            "the dead server holds nothing"
+        );
+    }
+
+    #[ktest]
+    fn kill_before_first_run_never_enters_user_mode() {
+        install_space_switch();
+        let owner = Agent::new_root(1, 0);
+        let (space, img, page) = owned_spinner(&owner);
+        let th = Thread::new(owner.clone());
+        space.register(&th).unwrap();
+        space.kill();
+        spawn_thread(&space, th.clone(), spin_at(&img));
+
+        assert_eq!(join_thread(&th), Exit::Killed);
+        // The spinner stores its id in word 1 and counts in word 0 as soon as it runs.
+        assert_eq!(page.read_val::<u64>(0).unwrap(), 0, "it never ran");
+    }
+
+    #[ktest]
+    fn killed_space_refuses_thread_create() {
+        install_space_switch();
+        let owner = Agent::new_root(2, 0);
+        let (b, img, _page) = owned_spinner(&owner);
+        let (_a, caller) = holder_of(&b, Rights::CREATE.union(Rights::SIGNAL));
+
+        b.kill();
+        assert!(b.is_dying());
+        assert!(
+            !mapped(&img.space, IMAGE_BASE),
+            "killing a space with no live thread tears it down"
+        );
+        let r = thread_create(&caller, Target::Slot(0), spin_at(&img), 0, ok);
+        assert_eq!(r.err(), Some(SpaceError::Dead));
+        assert_eq!(Errno::from(SpaceError::Dead), Errno::ESRCH);
+        assert_eq!(b.live_threads(), 0);
     }
 }
