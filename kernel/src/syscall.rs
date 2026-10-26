@@ -440,6 +440,22 @@ pub fn decode(nr: usize, a: [usize; 6]) -> Result<Syscall, Errno> {
         SYS_BRK => Syscall::Brk { addr: a[0] },
         // Linux's result for an `ARCH_SET_FS` base past `TASK_SIZE_MAX` is EPERM. The GS codes
         // are EINVAL here, though Linux accepts them (OD-03): nothing in musl or BusyBox uses them.
+        // munmap's EINVAL rules, returned to a thread that keeps running: its stack is still
+        // mapped, so returning is safe.
+        SYS_EXIT_UNMAP => {
+            let in_user = a[1]
+                .checked_next_multiple_of(PAGE_SIZE)
+                .and_then(|size| a[0].checked_add(size))
+                .is_some_and(|end| end <= USER_TOP);
+            if !a[0].is_multiple_of(PAGE_SIZE) || a[1] == 0 || !in_user {
+                return Err(Errno::EINVAL);
+            }
+            Syscall::ExitUnmap {
+                addr: a[0],
+                len: a[1],
+                code: a[2] as u64,
+            }
+        }
         SYS_ARCH_PRCTL => Syscall::ArchPrctl(match a[0] {
             ARCH_SET_FS if a[1] >= USER_TOP => return Err(Errno::EPERM),
             ARCH_SET_FS => FsOp::SetFs(a[1]),
@@ -686,8 +702,15 @@ pub fn dispatch(t: &Thread, space: &VmSpace, call: Syscall) -> Outcome {
             t.set_fs_base(base);
             Outcome::Return(0)
         }
-        // RED stub: not implemented yet.
-        Syscall::ExitUnmap { .. } => Outcome::Return(-Errno::ENOSYS.0),
+        // The unmap's result is ignored, as musl's unmap-then-exit sequence ignores it: a split
+        // refused at the record limit leaves the pages charged, and teardown returns them. The
+        // kernel touches no user memory after this, and the thread never re-enters ring 3.
+        Syscall::ExitUnmap { addr, len, code } => {
+            if let Some(p) = t.process() {
+                let _ = p.munmap(addr, len);
+            }
+            Outcome::Exit(code)
+        }
         Syscall::ArchPrctl(FsOp::GetFs(p)) => {
             let bytes = (t.fs_base() as u64).to_le_bytes();
             ret(UserSlice::new(p.addr(), bytes.len())
@@ -1161,7 +1184,7 @@ mod test {
         // Each decode and copy error path once, with its exact errno.
         let z = [0usize; 6];
         let anon = abi::MAP_PRIVATE | MAP_ANONYMOUS;
-        let targeted: [(usize, [usize; 6], isize); 36] = [
+        let targeted: [(usize, [usize; 6], isize); 39] = [
             (0xFFFF, z, errno::ENOSYS),
             (SYS_FUTEX, [mapped, 99, 0, 0, 0, 0], errno::ENOSYS),
             // The timeout pointer is address 1, which is unmapped.
@@ -1261,6 +1284,13 @@ mod test {
                 errno::EFAULT,
             ),
             (SYS_ARCH_PRCTL, [0x1001, 0, 0, 0, 0, 0], errno::EINVAL),
+            (SYS_EXIT_UNMAP, [0x1001, 4096, 0, 0, 0, 0], errno::EINVAL),
+            (SYS_EXIT_UNMAP, [0x1000, 0, 0, 0, 0, 0], errno::EINVAL),
+            (
+                SYS_EXIT_UNMAP,
+                [USER_TOP - 4096, 8192, 0, 0, 0, 0],
+                errno::EINVAL,
+            ),
             (SYS_MPROTECT, [0x1000, 4096, 8, 0, 0, 0], errno::EINVAL),
             // Valid, but this thread has no process to map into.
             (SYS_MMAP, [0, 4096, 3, anon, usize::MAX, 0], errno::ENOMEM),
@@ -1313,6 +1343,7 @@ mod test {
             SYS_MUNMAP,
             SYS_BRK,
             SYS_ARCH_PRCTL,
+            SYS_EXIT_UNMAP,
         ];
         let (mut enosys, mut efault, mut einval, mut ebadf, mut eintr) = (0, 0, 0, 0, 0);
         for i in 0..ITERATIONS {
