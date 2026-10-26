@@ -1,6 +1,7 @@
 #!/bin/sh
 # Static gate for the version pins that must move together: the OSTD requirement and lock entry,
-# the build image tag, the cargo-osdk install, and both toolchain files.
+# the two OSDK allocator crates the ktest probe reads, the build image tag, the cargo-osdk install,
+# and both toolchain files.
 # Usage: sh tools/pin_check.sh [ROOT]      check ROOT (default: the repo root)
 #        sh tools/pin_check.sh --self-test break one pin at a time in a scratch copy
 # Needs no Docker and no KVM.
@@ -10,6 +11,9 @@ ostd_req='version = "=0.19.0"'
 image_from='FROM asterinas/osdk-dev:0.19.0-'
 osdk_install='cargo-osdk --version 0.19.0'
 toolchain='channel = "nightly-2026-07-21"'
+# The probe crates (kernel/src/probe.rs) ride the OSTD release: one exact pin for all three.
+probe_crates='osdk-frame-allocator osdk-heap-allocator'
+probe_req='"=0.19.0"'
 
 check() {
   root=$1
@@ -22,6 +26,11 @@ check() {
   # The lock entry is the version line right after the exact package name.
   lock_ver=$(awk '/^name = "ostd"$/ { getline; print; exit }' "$root/kernel/Cargo.lock")
   [ "$lock_ver" = 'version = "0.19.0"' ] || fail kernel/Cargo.lock 'ostd version = "0.19.0"'
+  for crate in $probe_crates; do
+    grep -Fqx "$crate = $probe_req" "$root/kernel/Cargo.toml" || fail kernel/Cargo.toml "$crate = $probe_req"
+    probe_ver=$(awk -v want="name = \"$crate\"" '$0 == want { getline; print; exit }' "$root/kernel/Cargo.lock")
+    [ "$probe_ver" = 'version = "0.19.0"' ] || fail kernel/Cargo.lock "$crate version = \"0.19.0\""
+  done
   grep -Fq "$image_from" "$root/kernel/Dockerfile" || fail kernel/Dockerfile "$image_from"
   grep -Fq "$osdk_install" "$root/kernel/Dockerfile" || fail kernel/Dockerfile "$osdk_install"
   grep -Fq "$toolchain" "$root/kernel/rust-toolchain.toml" || fail kernel/rust-toolchain.toml "$toolchain"
@@ -53,6 +62,10 @@ self_test() {
   }
   round kernel/Cargo.toml 's/"=0\.19\.0"/"0.19.0"/'
   round kernel/Cargo.lock '/^name = "ostd"$/{n;s/0\.19\.0/0.19.1/;}'
+  for crate in $probe_crates; do
+    round kernel/Cargo.toml "s/^$crate = \"=0\.19\.0\"/$crate = \"0.19.0\"/"
+    round kernel/Cargo.lock "/^name = \"$crate\"\$/{n;s/0\.19\.0/0.19.1/;}"
+  done
   round kernel/Dockerfile 's#osdk-dev:0\.19\.0-#osdk-dev:0.19.1-#'
   round kernel/Dockerfile 's#--version 0\.19\.0#--version 0.19.1#'
   round kernel/rust-toolchain.toml 's/nightly-2026-07-21/nightly-2026-07-22/'

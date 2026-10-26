@@ -11,6 +11,8 @@ pub mod agent;
 pub mod cap;
 pub mod futex;
 pub mod ipc;
+#[cfg(ktest)]
+pub mod probe;
 pub mod sched;
 pub mod space;
 pub mod syscall;
