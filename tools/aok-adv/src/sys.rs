@@ -522,7 +522,7 @@ pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> io::Result<()> {
     if pid <= 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "kill: refusing pid <= 0 (never kill(0)/kill(-1))",
+            "kill: refusing pid <= 0 (never signals pid 0 or pid -1)",
         ));
     }
     // SAFETY: `pid > 0` is enforced above, so this can only signal one
@@ -861,5 +861,23 @@ pub fn clone3_fork_into_cgroup(cgroup_fd: RawFd) -> io::Result<ForkResult> {
             child_pid: rc as libc::pid_t,
             child_pidfd,
         })
+    }
+}
+
+/// Reap a `clone3_fork_into_cgroup` child by pid, so route (iv)'s parent
+/// side never leaves a zombie behind (`std::process::Child` has no `From`
+/// for a raw clone3 pid, so this is the one `waitpid` call the crate needs
+/// outside the `std::process` path).
+#[allow(dead_code)] // used by Task 2's routes.rs (impersonation route iv)
+pub fn waitpid_reap(pid: libc::pid_t) -> io::Result<()> {
+    // SAFETY: `pid` is the child pid this process just received back from
+    // `clone3_fork_into_cgroup`'s own return value, so it is this process's
+    // own child; `status` is a live local on this stack frame, written only
+    // within its own size; `0` flags request a blocking, default wait.
+    let rc = unsafe { libc::waitpid(pid, ptr::null_mut::<libc::c_int>(), 0) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }

@@ -4,6 +4,7 @@
 //! Subcommands: `stub`, `run`, `list-routes`, `report` (run/list-routes/
 //! report are fleshed out across Tasks 1-3 of this plan).
 
+mod routes;
 mod stub;
 #[allow(unsafe_code)]
 mod sys;
@@ -41,9 +42,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn list_routes_cli(_args: &[String]) -> std::io::Result<()> {
-    // Task 2 (routes.rs) replaces this body with the D-16 route table.
-    Ok(())
+fn list_routes_cli(args: &[String]) -> std::io::Result<()> {
+    routes::list_routes_cli(args)
 }
 
 fn run_cli(_args: &[String]) -> std::io::Result<()> {
