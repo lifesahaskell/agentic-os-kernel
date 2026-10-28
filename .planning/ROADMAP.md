@@ -244,7 +244,22 @@ Plans:
     - An ADV-03 count above 0 is a trigger (c) candidate, and its try-first step is the broker under its own uid.
 **Research:** The `bpftool` `lsm_cgroup` attach and the return-1-to-allow convention (both ASSUMED, linux-baseline.md section 9). Which unix-socket send hook is attachable (the gap analysis lists `socket_sendmsg` and `unix_stream_connect`; the disabled set is in `kernel/bpf/bpf_lsm.c`). The WSL2 `kernelCommandLine` route matters only if the reference host is WSL2 (ASSUMED).
 **Decisions due:** ENV-01, the source of the privileged environment. ENV-02, the reference kernel and host; trigger (b) reads "the reference kernel" and no document defines it. DEC-01, S1 to S9 and the POSX-02 row. DEC-02, the S3 openat bound. DEC-03, the floor, rule and distros.
-**Plans:** TBD
+**Plans:** 6 plans
+
+Plans:
+**Wave 1**
+- [ ] 08-01-PLAN.md — r1.py and transfer.py self-tests, floor.c, run.sh write_env extension (ENV-02, HARN-01, HARN-02)
+- [ ] 08-02-PLAN.md — aok-adv crate: pidfd/SO_PEERPIDFD stub, S5 route table, S1 class suite and report (ADV-01, ADV-02, ADV-03)
+- [ ] 08-03-PLAN.md — BPF-LSM sources (global, per-cgroup, adversarial) and the root wrapper, dry-run reviewable (ENV-01, HARN-02, HARN-03, ADV-03)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [ ] 08-04-PLAN.md — 08-GATE.md template, the OQ1/OQ2/OQ7 decisions, and the dual-boot reference-host install + probe (ENV-01, ENV-02, DEC-01, DEC-02, DEC-03)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 08-05-PLAN.md — the reference-host measurement runs: HARN-01 transfer, HARN-02/03 variants, ADV baseline and agent (HARN-01, HARN-02, HARN-03, ADV-01, ADV-02, ADV-03)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+- [ ] 08-06-PLAN.md — the cited run report, the user marking 08-GATE.md, and the transcription into scoping-linux.md and ADR 0004 (DEC-01, DEC-02, DEC-03, HARN-01, HARN-02)
 
 ### Phase 9: Agent launcher and containment
 
