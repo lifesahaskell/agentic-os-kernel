@@ -59,7 +59,6 @@ pub enum Reach {
 }
 
 impl Reach {
-    #[allow(dead_code)] // used by Task 3's report.rs wiring (the reach field)
     pub fn as_str(&self) -> &'static str {
         match self {
             Reach::Reachable => "reachable",
@@ -73,13 +72,11 @@ impl Reach {
 /// cgroup (`--no-cgroup`). Skipped is never `invalid` and never a failure
 /// (D-16, ADV-02 empty case 29).
 #[derive(Debug)]
-#[allow(dead_code)] // used by Task 3's run_cli wiring (per-row run result)
 pub enum RunOutcome {
     Ran(Reach),
     Skipped(&'static str),
 }
 
-#[allow(dead_code)] // used by Task 3's run_cli wiring (the --no-cgroup skip rule)
 pub const SKIPPED_NEEDS_CGROUP: &str = "skipped: needs delegated cgroup";
 
 /// Route names for the four kill-family rows that run in the sibling
@@ -118,13 +115,11 @@ pub const IMPERSONATION_ROUTES: &[&str] = &[
 /// The cgroup subtree every cgroup-bearing route is scoped to (T-08-05):
 /// `cgroup.kill`, `cgroup.procs` and the route (iv) clone3 target must all
 /// resolve under this prefix.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (the cgroup.kill guard)
 pub const CGROUP_ADV_PREFIX: &str = "/sys/fs/cgroup/aok-phase8/adv/";
 
 /// True for the three routes whose non-agent baseline needs a delegated
 /// cgroup subtree (D-16; 08-03's `--adv` wrapper creates it). Every other
 /// route runs with no cgroup dependency.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (the --no-cgroup skip rule)
 pub fn needs_cgroup(route: &str) -> bool {
     matches!(
         route,
@@ -209,7 +204,6 @@ pub fn list_routes_cli(_args: &[String]) -> io::Result<()> {
 
 /// Reads `/proc/sys/kernel/yama/ptrace_scope` once. Missing file (no Yama
 /// LSM compiled in) is recorded as `"absent"`, never treated as an error.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (ptrace_scope stamping)
 pub fn read_ptrace_scope() -> String {
     match std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope") {
         Ok(s) => s.trim().to_string(),
@@ -227,7 +221,6 @@ pub fn read_ptrace_scope() -> String {
 /// otherwise run `attempt` and map its result onto `Reach`. `attempt` is
 /// injected so routes.rs's own tests can assert the skip and void-baseline
 /// rules without performing a real syscall.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (baseline-to-reach mapping)
 pub fn evaluate_row<F>(row: &RouteRow, no_cgroup: bool, attempt: F) -> RunOutcome
 where
     F: FnOnce() -> io::Result<()>,
@@ -244,7 +237,6 @@ where
 /// Reject a `cgroup.kill` (or any cgroup-write) target outside the suite's
 /// own throwaway subtree (T-08-05): the write never reaches the session
 /// cgroup or any cgroup this suite did not create.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (the cgroup.kill guard)
 pub fn assert_cgroup_kill_path(path: &str) -> io::Result<()> {
     if !path.starts_with(CGROUP_ADV_PREFIX) {
         return Err(io::Error::new(
@@ -262,14 +254,12 @@ pub fn assert_cgroup_kill_path(path: &str) -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Spawn a throwaway `sleep` child this attempt owns for its own duration.
-#[allow(dead_code)] // used by the attempt_* helpers below, via Task 3's run_cli
 fn spawn_target() -> io::Result<std::process::Child> {
     Command::new("/bin/sh").arg("-c").arg("sleep 5").spawn()
 }
 
 /// `kill` route: `kill(pid, SIGKILL)` against a suite-spawned child,
 /// verified by waiting for the child to exit.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (kill route)
 pub fn attempt_kill() -> io::Result<()> {
     let mut child = spawn_target()?;
     let pid = child.id() as libc::pid_t;
@@ -280,7 +270,6 @@ pub fn attempt_kill() -> io::Result<()> {
 
 /// `tgkill` route: signal the suite-spawned child's own tgid/tid pair
 /// (single-threaded, so tgid == tid == pid).
-#[allow(dead_code)] // used by Task 3's run_cli wiring (tgkill route)
 pub fn attempt_tgkill() -> io::Result<()> {
     let mut child = spawn_target()?;
     let pid = child.id() as libc::pid_t;
@@ -291,7 +280,6 @@ pub fn attempt_tgkill() -> io::Result<()> {
 
 /// `rt_sigqueueinfo` route: queue `SIGKILL` at the suite-spawned child's
 /// tgid.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (rt_sigqueueinfo route)
 pub fn attempt_rt_sigqueueinfo() -> io::Result<()> {
     let mut child = spawn_target()?;
     let pid = child.id() as libc::pid_t;
@@ -302,7 +290,6 @@ pub fn attempt_rt_sigqueueinfo() -> io::Result<()> {
 
 /// `pidfd_send_signal` route: open a pidfd on the suite-spawned child and
 /// signal through it, verified by polling the pidfd for exit (ADV-02).
-#[allow(dead_code)] // used by Task 3's run_cli wiring (pidfd_send_signal route)
 pub fn attempt_pidfd_send_signal() -> io::Result<()> {
     let mut child = spawn_target()?;
     let pid = child.id() as libc::pid_t;
@@ -323,7 +310,6 @@ pub fn attempt_pidfd_send_signal() -> io::Result<()> {
 /// `cgroup.kill` route: write `1` to `<leaf>/cgroup.kill`, guarded by
 /// `assert_cgroup_kill_path` so the write can only ever land under this
 /// suite's own subtree.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (cgroup.kill route)
 pub fn attempt_cgroup_kill(leaf_dir: &str) -> io::Result<()> {
     let target = format!("{leaf_dir}/cgroup.kill");
     assert_cgroup_kill_path(&target)?;
@@ -335,7 +321,6 @@ pub fn attempt_cgroup_kill(leaf_dir: &str) -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// `PTRACE_ATTACH` then detach, against a suite-spawned child.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (PTRACE_ATTACH route)
 pub fn attempt_ptrace_attach() -> io::Result<()> {
     let mut child = spawn_target()?;
     let pid = child.id() as libc::pid_t;
@@ -347,7 +332,6 @@ pub fn attempt_ptrace_attach() -> io::Result<()> {
 }
 
 /// `PTRACE_SEIZE` then detach, against a suite-spawned child.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (PTRACE_SEIZE route)
 pub fn attempt_ptrace_seize() -> io::Result<()> {
     let mut child = spawn_target()?;
     let pid = child.id() as libc::pid_t;
@@ -362,7 +346,6 @@ pub fn attempt_ptrace_seize() -> io::Result<()> {
 /// Without a ptrace relationship this is expected to fail same-uid under
 /// Yama scope >= 1 (RESEARCH A5); failure here is a baseline void, not a
 /// bug.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (process_vm_readv route)
 pub fn attempt_process_vm_readv() -> io::Result<()> {
     let mut child = spawn_target()?;
     let pid = child.id() as libc::pid_t;
@@ -375,7 +358,6 @@ pub fn attempt_process_vm_readv() -> io::Result<()> {
 
 /// `process_vm_writev`: write one byte back into a suite-spawned child's
 /// address space.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (process_vm_writev route)
 pub fn attempt_process_vm_writev() -> io::Result<()> {
     let mut child = spawn_target()?;
     let pid = child.id() as libc::pid_t;
@@ -387,7 +369,6 @@ pub fn attempt_process_vm_writev() -> io::Result<()> {
 }
 
 /// `/proc/<pid>/mem`: open and read one byte from a suite-spawned child.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (/proc/pid/mem route)
 pub fn attempt_proc_pid_mem() -> io::Result<()> {
     use std::io::Read;
     let mut child = spawn_target()?;
@@ -404,7 +385,6 @@ pub fn attempt_proc_pid_mem() -> io::Result<()> {
 }
 
 /// `pidfd_getfd`: obtain the suite-spawned child's fd 0 through its pidfd.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (pidfd_getfd route)
 pub fn attempt_pidfd_getfd() -> io::Result<()> {
     let mut child = spawn_target()?;
     let pid = child.id() as libc::pid_t;
@@ -424,7 +404,6 @@ pub fn attempt_pidfd_getfd() -> io::Result<()> {
 /// `pathname` route: `unlink` then `bind` the broker's pathname socket while
 /// nothing else holds it, oracle being that a fresh client reaches this
 /// listener instead of the broker.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (bind pathname route)
 pub fn attempt_bind_pathname(socket_path: &str) -> io::Result<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
@@ -434,7 +413,6 @@ pub fn attempt_bind_pathname(socket_path: &str) -> io::Result<()> {
 
 /// `abstract` route: bind the broker's abstract-namespace name during the
 /// restart gap between stub instances.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (bind abstract route)
 pub fn attempt_bind_abstract(name: &str) -> io::Result<()> {
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::SocketAddr;
@@ -451,7 +429,6 @@ pub fn attempt_bind_abstract(name: &str) -> io::Result<()> {
 /// Route (i): move this process's own pid into another agent's cgroup via
 /// `cgroup.procs`, guarded by `assert_cgroup_kill_path`'s prefix rule (the
 /// same subtree boundary applies to every cgroup write this suite makes).
-#[allow(dead_code)] // used by Task 3's run_cli wiring (cgroup.procs route)
 pub fn attempt_cgroup_procs_move(target_cgroup_dir: &str) -> io::Result<()> {
     let target = format!("{target_cgroup_dir}/cgroup.procs");
     assert_cgroup_kill_path(&target)?;
@@ -461,7 +438,6 @@ pub fn attempt_cgroup_procs_move(target_cgroup_dir: &str) -> io::Result<()> {
 /// Route (ii): receive a connected fd over `SCM_RIGHTS` from a peer and use
 /// it, simulated here with a suite-owned socket pair standing in for
 /// agent-a and agent-b.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (scm_rights route)
 pub fn attempt_scm_rights() -> io::Result<()> {
     let (a, b) = UnixStream::pair()?;
     let send_fd: std::os::fd::RawFd = std::os::fd::AsRawFd::as_raw_fd(&a);
@@ -475,7 +451,6 @@ pub fn attempt_scm_rights() -> io::Result<()> {
 /// control that must be ignored, so success here means the stub's reply
 /// still carries this process's own kernel-stamped identity, not the
 /// claimed one.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (payload_claim route)
 pub fn attempt_payload_claim(socket_path: &str, claimed_id: &str) -> io::Result<String> {
     use std::io::{Read, Write};
     let mut stream = UnixStream::connect(socket_path)?;
@@ -494,7 +469,6 @@ pub fn attempt_payload_claim(socket_path: &str, claimed_id: &str) -> io::Result<
 /// Route (iv): `clone3` with `CLONE_INTO_CGROUP`, placing a new child
 /// directly into another agent's cgroup, gated only by
 /// `cgroup_may_write` on the reference host.
-#[allow(dead_code)] // used by Task 3's run_cli wiring (clone3_CLONE_INTO_CGROUP route)
 pub fn attempt_clone3_into_cgroup(target_cgroup_fd: std::os::fd::RawFd) -> io::Result<()> {
     match sys::clone3_fork_into_cgroup(target_cgroup_fd)? {
         sys::ForkResult::Parent {
