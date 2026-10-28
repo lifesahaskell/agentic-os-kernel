@@ -64,7 +64,7 @@ if [ -n "$TAG" ]; then
 	esac
 fi
 
-for b in micro broker deadline cgbench; do
+for b in micro broker deadline cgbench floor; do
 	[ -x "$BIN/$b" ] || { echo "run.sh: $BIN/$b missing; run make -C $TOOLS" >&2; exit 1; }
 done
 
@@ -143,6 +143,8 @@ write_env() {
 	top=$(ps -eo comm= --sort=-pcpu 2>/dev/null | head -n 5 | paste -sd';' || true)
 	kv top_cpu_before "$top"
 	"$BIN/micro" --env >>"$RUNDIR/env.txt"
+	# ENV-02: 12 floor_ rows, each with a floormethod_ key, plus the unprivileged host keys.
+	"$BIN/floor" >>"$RUNDIR/env.txt" || kv floor_probe unreadable
 }
 
 if [ ! -s "$RUNDIR/env.txt" ]; then
