@@ -15,6 +15,8 @@ echo "== pin_check self-test"
 sh tools/pin_check.sh --self-test
 echo "== pin_check"
 sh tools/pin_check.sh
+echo "== r1 self-test"
+python3 -I tools/linux-baseline/r1.py --self-test
 
 cd kernel
 echo "== userland build, fmt, clippy; kernel fmt, clippy"
