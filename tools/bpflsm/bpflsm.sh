@@ -184,11 +184,14 @@ agent only: bpftool prog loadall tools/bpflsm/bpfadv.bpf.o /sys/fs/bpf/aok/adv p
             agent_cg: agent-a -> 1, agent-b -> 2; subtree: agent-a -> 1, agent-b -> 2
 for each row of: tools/aok-adv/target/release/aok-adv list-routes   (family route topology; 23 rows)
   agent: sum every per-hook counter (before)
-  ( echo BASHPID > .../adv/CG/cgroup.procs && exec setpriv --reuid UID --regid GID --init-groups \
-    tools/aok-adv/target/release/aok-adv run --routes ROUTE --topology TOPOLOGY --mode MODE \
-    --cgroup-root /sys/fs/cgroup/aok-phase8/adv --out tools/aok-adv/results/ID/MODE.jsonl )
+  ( echo BASHPID > /sys/fs/cgroup/aok-phase8/adv/cgroup.procs && exec setpriv --reuid UID --regid GID \
+    --init-groups tools/aok-adv/target/release/aok-adv run --socket TMP/adv/stub.sock \
+    --cgroup-root /sys/fs/cgroup/aok-phase8/adv --routes ROUTE --topology TOPOLOGY --mode MODE \
+    --out TMP/adv/row.jsonl )   then the row is appended to tools/aok-adv/results/ID/MODE.jsonl
   agent: sum every per-hook counter (after); append to tools/aok-adv/results/ID/deny-counters.txt:
-    route=R topology=T hook=H before=N after=N
+    route=R topology=T hook=H before=N after=N   (hooks: task_kill ptrace_access_check
+    socket_sendmsg socket_bind file_open)
+exit 1 if no rows ran or any row failed; the governor and the stats sysctl are not touched
 Note A11 (assumed): the cgroup.kill deny counter is a file_open counter, not a task_kill counter.
 EOF
 }
@@ -337,6 +340,7 @@ map_sum() {
 }
 
 # san TEXT: one line, without the characters that would break a key=value line or the sed rewrite.
+# shellcheck disable=SC1003 # the \\ inside the single quotes is a literal backslash for tr
 san() { printf '%s' "$1" | tr '\n|&\\' '    '; }
 
 # Little-endian 8 byte hex string for a cgroup id, for `key hex ...`.
@@ -700,8 +704,128 @@ mode_harn03() {
 }
 
 # ---- --adv ------------------------------------------------------------------------------------
+# u64_put MAP_PIN CGID VALUE: write a u64 -> u32 entry (VALUE below 256) into a pinned HASH map.
+u64_put() {
+	# shellcheck disable=SC2046 # see pol_set
+	bpftool map update pinned "$1" key hex $(le64 "$2") value hex "$(printf '%02x' "$3")" 00 00 00
+}
+
+# adv_read: read the five adv_count slots (summed over CPUs) into ADV_NOW[0..4].
+adv_read() {
+	local i
+	for i in 0 1 2 3 4; do
+		ADV_NOW[i]=$(map_sum "$PIN/adv-maps/adv_count" "$i")
+	done
+}
+
+# One route row at a time: baseline runs every row with the non-agent cgroup and no BPF program, agent
+# runs every row from the agent cgroups with bpfadv loaded. Both read the route list from the same
+# aok-adv binary, which must already be built by the unprivileged user (cargo is never run as root).
+#
+# A11 (assumed): the cgroup.kill deny counter is a file_open counter, not a task_kill counter, because
+# __cgroup_kill goes through send_sig and likely skips security_task_kill. The report carries that note.
+#
+# ptrace_scope is read and recorded as yama_ptrace_scope and never written: the user sets it to the OQ1
+# Answer before the run (08-05 Task 3) and restores it afterwards.
 mode_adv() {
-	die "--adv is not implemented in this revision"
+	local m=$ADV_MODE bin="$ADV/target/release/aok-adv" outdir="$ADV/results/$RUN_ID" scope prev
+	local family rest route topo i h failed=0 rows=0 maps="$PIN/adv-maps" a_id b_id
+	local -a before=() ADV_NOW=()
+	local -a ADV_HOOKS=(task_kill ptrace_access_check socket_sendmsg socket_bind file_open)
+	RUNDIR=$outdir
+	prepare
+	user_ids
+	[ -x "$bin" ] || die "$bin is missing; as the unprivileged user run: cargo build --release --manifest-path $ADV/Cargo.toml"
+	if [ -e "$outdir/$m.jsonl" ]; then
+		die "$outdir/$m.jsonl exists: use a fresh run id"
+	fi
+	if [ "$m" = agent ]; then
+		need_bpf_lsm
+		[ -f "$BPF/bpfadv.bpf.o" ] || die "$BPF/bpfadv.bpf.o is missing; run make -C $BPF on the host first"
+	fi
+
+	mkdir -p "$outdir"
+	if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
+		scope=$(cat /proc/sys/kernel/yama/ptrace_scope)
+	else
+		scope=absent
+	fi
+	if [ -f "$outdir/env.txt" ]; then
+		prev=$(sed -n 's/^yama_ptrace_scope=//p' "$outdir/env.txt" | sed -n 1p)
+		if [ "$prev" = "$scope" ]; then
+			:
+		else
+			die "yama_ptrace_scope was $prev in the first run of $RUN_ID and is $scope now: baseline and agent must run under the same value"
+		fi
+	else
+		kv yama_ptrace_scope "$scope"
+		kv adv_cgroup_root "$CGROOT/adv"
+	fi
+
+	mkdir "$CGROOT"
+	CG_MADE=1
+	chown "$UID_GID" "$CGROOT"
+	mkcg "$CGROOT/adv" "$CGROOT/adv/broker" "$CGROOT/adv/agent-a" "$CGROOT/adv/agent-b" "$CGROOT/adv/nonagent"
+	# The runner is started inside adv, which the user owns, so aok-adv may move its own children into
+	# the leaves below it (a cgroup.procs move needs write access to the common ancestor). The stub
+	# socket and the row file live in a user-owned directory under the root-made temp dir.
+	chmod 755 "$TMPD"
+	mkdir "$TMPD/adv"
+	chown "$UID_GID" "$TMPD/adv"
+
+	if [ "$m" = agent ]; then
+		bpftool prog loadall "$BPF/bpfadv.bpf.o" "$PIN/adv" pinmaps "$maps" autoattach
+		a_id=$(stat -c %i "$CGROOT/adv/agent-a")
+		b_id=$(stat -c %i "$CGROOT/adv/agent-b")
+		u64_put "$maps/agent_cg" "$a_id" 1
+		u64_put "$maps/agent_cg" "$b_id" 2
+		u64_put "$maps/subtree" "$a_id" 1
+		u64_put "$maps/subtree" "$b_id" 2
+		: >"$outdir/deny-counters.txt"
+	fi
+
+	run_as_uid "$CGROOT/adv" "$bin" list-routes >"$TMPD/routes"
+	: >"$outdir/$m.jsonl"
+	# Not a timing run: the governor and the stats sysctl are left alone.
+	while read -r family rest; do
+		if [ -z "$family" ]; then
+			continue
+		fi
+		# A row is "family route topology"; a route may be more than one word, the topology is last.
+		topo=${rest##* }
+		route=${rest% *}
+		rows=$((rows + 1))
+		if [ "$m" = agent ]; then
+			adv_read
+			before=("${ADV_NOW[@]}")
+		fi
+		rm -f "$TMPD/adv/row.jsonl"
+		if run_as_uid "$CGROOT/adv" "$bin" run --socket "$TMPD/adv/stub.sock" \
+			--cgroup-root "$CGROOT/adv" --routes "$route" --topology "$topo" --mode "$m" \
+			--out "$TMPD/adv/row.jsonl"; then
+			:
+		else
+			failed=$((failed + 1))
+			echo "bpflsm.sh: aok-adv run failed for $family $route $topo" >&2
+		fi
+		if [ -f "$TMPD/adv/row.jsonl" ]; then
+			cat "$TMPD/adv/row.jsonl" >>"$outdir/$m.jsonl"
+		fi
+		if [ "$m" = agent ]; then
+			adv_read
+			for i in 0 1 2 3 4; do
+				h=${ADV_HOOKS[$i]}
+				printf 'route=%s topology=%s hook=%s before=%s after=%s\n' \
+					"$route" "$topo" "$h" "${before[$i]}" "${ADV_NOW[$i]}" >>"$outdir/deny-counters.txt"
+			done
+		fi
+	done <"$TMPD/routes"
+
+	chown -R "$UID_GID" "$outdir"
+	echo "bpflsm.sh: --adv $m: $rows rows, $failed failed; wrote $outdir/$m.jsonl" >&2
+	if [ "$rows" -eq 0 ] || [ "$failed" -gt 0 ]; then
+		exit 1
+	fi
 }
 
 case "$MODE" in
