@@ -270,6 +270,36 @@ pub fn assert_cgroup_kill_path(path: &str) -> io::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Harness failures versus attempt failures. Only the attacker's own attempt
+// may yield a void row; anything that stops the suite from setting the
+// attempt up (stub spawn, stub readiness, placement, helper spawn) is a
+// `HarnessError` and makes `run` exit non-zero with no row written.
+// ---------------------------------------------------------------------------
+
+/// Marker payload carried inside an `io::Error` for a harness failure.
+#[derive(Debug)]
+pub struct HarnessError(pub String);
+
+impl std::fmt::Display for HarnessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HarnessError {}
+
+/// Build an `io::Error` that `is_harness_error` recognises.
+pub fn harness_error(msg: impl Into<String>) -> io::Error {
+    io::Error::other(HarnessError(msg.into()))
+}
+
+/// True when `e` came from `harness_error` (not from the attempt itself).
+pub fn is_harness_error(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<HarnessError>().is_some())
+}
+
 /// Move `pid` into `leaf_dir`'s `cgroup.procs` (D4 agent-mode placement:
 /// attacker into agent-a, stub into broker, helper into agent-b). Guarded
 /// by `assert_cgroup_kill_path` like every other cgroup write this suite
@@ -476,11 +506,12 @@ pub fn attempt_bind_pathname(target: &Target) -> io::Result<()> {
     let listener = UnixListener::bind(&target.socket_path)?;
     let accept_thread = serve_one_marker(listener);
     let path = target.socket_path.clone();
-    let result = confirm_marker_reached(move || UnixStream::connect(&path));
-    let _ = accept_thread
+    // The accept thread is still blocked in accept() on a confirm failure;
+    // joining it would hang the attacker. It dies with this process instead.
+    confirm_marker_reached(move || UnixStream::connect(&path))?;
+    accept_thread
         .join()
-        .map_err(|_| io::Error::other("accept thread panicked"))?;
-    result
+        .map_err(|_| io::Error::other("accept thread panicked"))?
 }
 
 /// `abstract` route: bind the broker's abstract-namespace name during the
@@ -499,14 +530,13 @@ pub fn attempt_bind_abstract(target: &Target) -> io::Result<()> {
     let listener = UnixListener::bind_addr(&addr)?;
     let accept_thread = serve_one_marker(listener);
     let name = name.to_string();
-    let result = confirm_marker_reached(move || {
+    confirm_marker_reached(move || {
         let connect_addr = SocketAddr::from_abstract_name(name.as_bytes())?;
         UnixStream::connect_addr(&connect_addr)
-    });
-    let _ = accept_thread
+    })?;
+    accept_thread
         .join()
-        .map_err(|_| io::Error::other("accept thread panicked"))?;
-    result
+        .map_err(|_| io::Error::other("accept thread panicked"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +611,40 @@ pub fn attempt_cgroup_procs_move(agent_b_dir: &str, socket_path: &str) -> io::Re
     }
 }
 
+/// Wait (bounded) for the scm-rights helper to connect to the handoff
+/// listener, failing early if the helper dies first (for example because its
+/// own connect to the stub was refused: an attempt failure, not a harness
+/// one) instead of blocking in `accept` forever.
+fn accept_handoff(
+    listener: &UnixListener,
+    helper: &mut std::process::Child,
+) -> io::Result<UnixStream> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                return Ok(stream);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(status) = helper.try_wait()? {
+                    return Err(io::Error::other(format!(
+                        "scm_rights helper exited ({status}) before handing off a connected fd"
+                    )));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "scm_rights helper never handed off a connected fd",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Route (ii): a real helper process connects to the stub at `socket_path`
 /// and hands its now-connected fd to this process over a side-channel
 /// `SCM_RIGHTS` handoff (D5). This process then speaks to the stub through
@@ -590,37 +654,57 @@ pub fn attempt_cgroup_procs_move(agent_b_dir: &str, socket_path: &str) -> io::Re
 /// `cgroupid` is checked against it; otherwise success just means a real
 /// borrowed, connected fd was obtained and used.
 pub fn attempt_scm_rights(socket_path: &str, agent_b_dir: Option<&str>) -> io::Result<()> {
+    use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+
+    let setup = |what: &str, e: io::Error| harness_error(format!("scm_rights: {what}: {e}"));
 
     let handoff_dir = std::env::temp_dir().join(format!("aok-adv-scm-{}", std::process::id()));
-    std::fs::create_dir_all(&handoff_dir)?;
+    std::fs::create_dir_all(&handoff_dir).map_err(|e| setup("creating handoff dir", e))?;
     let handoff_path = handoff_dir.join("handoff.sock");
     let _ = std::fs::remove_file(&handoff_path);
-    let listener = UnixListener::bind(&handoff_path)?;
+    let listener =
+        UnixListener::bind(&handoff_path).map_err(|e| setup("binding handoff socket", e))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| setup("handoff socket nonblocking", e))?;
 
-    let exe = std::env::current_exe()?;
+    let exe = std::env::current_exe().map_err(|e| setup("locating own executable", e))?;
     let mut cmd = Command::new(exe);
     cmd.arg("scm-helper")
         .arg("--socket")
         .arg(socket_path)
         .arg("--handoff")
-        .arg(&handoff_path);
-    let mut child = cmd.spawn()?;
+        .arg(&handoff_path)
+        .stdin(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| setup("spawning helper", e))?;
 
-    if let Some(dir) = agent_b_dir {
-        let _ = place_in_cgroup(child.id() as libc::pid_t, dir);
+    // The helper is placed before it is told to connect, so the identity the
+    // stub reads for it is the placed one, never a race against placement.
+    if let Some(dir) = agent_b_dir
+        && let Err(e) = place_in_cgroup(child.id() as libc::pid_t, dir)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&handoff_dir);
+        return Err(setup(&format!("placing helper in {dir}"), e));
+    }
+    let mut helper_stdin = child.stdin.take();
+    if let Some(stdin) = helper_stdin.as_mut() {
+        let _ = stdin.write_all(b"go\n");
     }
 
     let result = (|| -> io::Result<u64> {
-        let (handoff_stream, _) = listener.accept()?;
+        let handoff_stream = accept_handoff(&listener, &mut child)?;
         let borrowed_fd = sys::recv_fd(handoff_stream.as_raw_fd())?;
         let mut borrowed = UnixStream::from(sys::owned_fd(borrowed_fd));
         let reply = send_hello(&mut borrowed, "via-scm-rights")?;
         parse_cgroupid(&reply)
     })();
 
+    drop(helper_stdin);
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&handoff_dir);
@@ -705,6 +789,17 @@ pub fn attempt_clone3_into_cgroup(
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn harness_errors_are_distinguishable_from_attempt_errors() {
+        let h = harness_error("cannot spawn the stub");
+        assert!(is_harness_error(&h));
+        assert!(h.to_string().contains("cannot spawn the stub"));
+        assert!(!is_harness_error(&io::Error::other("attempt failed")));
+        assert!(!is_harness_error(&io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+    }
 
     #[test]
     fn all_rows_has_23_entries_17_sibling_6_ancestor() {

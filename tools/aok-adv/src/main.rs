@@ -188,7 +188,13 @@ fn parse_run_args(args: &[String]) -> io::Result<RunArgs> {
 /// is meaningless otherwise); `cgroup.procs`/`clone3_CLONE_INTO_CGROUP`
 /// target agent-b, the "other agent" this suite's impersonation routes
 /// attack, independent of what mode the attacker itself is running under.
-fn dispatch_attempt(route: &str, target: &routes::Target, cgroup_root: &str) -> io::Result<()> {
+fn dispatch_attempt(
+    route: &str,
+    target: &routes::Target,
+    cgroup_root: &str,
+    mode: &str,
+    no_cgroup: bool,
+) -> io::Result<()> {
     let broker_dir = format!("{cgroup_root}/broker");
     let agent_b_dir = format!("{cgroup_root}/agent-b");
 
@@ -207,17 +213,27 @@ fn dispatch_attempt(route: &str, target: &routes::Target, cgroup_root: &str) -> 
         "pathname" => routes::attempt_bind_pathname(target),
         "abstract" => routes::attempt_bind_abstract(target),
         "cgroup.procs" => routes::attempt_cgroup_procs_move(&agent_b_dir, &target.socket_path),
-        "scm_rights" => routes::attempt_scm_rights(&target.socket_path, None),
+        "scm_rights" => routes::attempt_scm_rights(
+            &target.socket_path,
+            scm_agent_b_dir(cgroup_root, mode, no_cgroup).as_deref(),
+        ),
         "payload_claim" => routes::attempt_payload_claim(&target.socket_path, "impersonated-id"),
         "clone3_CLONE_INTO_CGROUP" => {
-            let dir = std::fs::File::open(&agent_b_dir)?;
+            let dir = std::fs::File::open(&agent_b_dir).map_err(|e| {
+                routes::harness_error(format!("opening the target cgroup {agent_b_dir}: {e}"))
+            })?;
             routes::attempt_clone3_into_cgroup(dir.as_raw_fd(), &agent_b_dir)
         }
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("run: unknown route {other}"),
-        )),
+        other => Err(routes::harness_error(format!("run: unknown route {other}"))),
     }
+}
+
+/// The cgroup the `scm_rights` helper is placed in, and whose id the stub's
+/// reply is checked against: `<cgroup-root>/agent-b` in agent mode (not
+/// `--no-cgroup`), none otherwise, where success just means a real borrowed
+/// connected fd was obtained and used.
+fn scm_agent_b_dir(cgroup_root: &str, mode: &str, no_cgroup: bool) -> Option<String> {
+    (mode == "agent" && !no_cgroup).then(|| format!("{cgroup_root}/agent-b"))
 }
 
 /// Spawn the stub broker as a fresh child of the calling process, re-exec'd
@@ -251,14 +267,22 @@ fn spawn_stub(socket_path: &str, abstract_mode: bool) -> io::Result<std::process
 }
 
 /// Block (bounded) until the stub is accepting connections, by polling a
-/// real connect attempt rather than sleeping a fixed guess (D3).
+/// real connect attempt rather than sleeping a fixed guess (D3). A stub that
+/// exits before it accepts (bind failure, bad path) is reported at once,
+/// naming its exit status, instead of burning the whole timeout.
 fn wait_for_stub_ready(
+    stub: &mut std::process::Child,
     socket_path: &str,
     abstract_mode: bool,
     timeout: Duration,
 ) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
+        if let Some(status) = stub.try_wait()? {
+            return Err(io::Error::other(format!(
+                "stub exited ({status}) before accepting connections on {socket_path}"
+            )));
+        }
         let connected = if abstract_mode {
             use std::os::linux::net::SocketAddrExt;
             use std::os::unix::net::{SocketAddr, UnixStream};
@@ -289,25 +313,33 @@ fn kill_and_reap(mut child: std::process::Child) {
 /// Run one route row end to end: spawn a fresh stub and a separate attacker
 /// process in the topology the row names (D2), hand the attacker a `go`
 /// signal only once the stub (sibling topology) is ready, and parse the
-/// attacker's reported outcome. Returns the same `io::Result<()>` shape
-/// `routes::evaluate_row_with_errno` expects from its injected closure.
+/// attacker's reported outcome.
+///
+/// The return type separates the two kinds of failure: the outer `Err` is a
+/// harness failure (stub could not be spawned or never became ready,
+/// placement failed, the attacker produced no verdict), which `run_cli`
+/// turns into a non-zero exit with no row; the inner `io::Result` is the
+/// attacker's own attempt, the only thing allowed to yield a void row.
 fn run_one_row(
     row: &routes::RouteRow,
     socket: &str,
     cgroup_root: &str,
     mode: &str,
     no_cgroup: bool,
-) -> io::Result<()> {
+) -> io::Result<io::Result<()>> {
     let abstract_mode = row.route == "abstract";
     let place_attacker_in_agent_a = mode == "agent" && !no_cgroup;
 
     match row.topology {
         routes::Topology::Sibling => {
-            let stub_child = spawn_stub(socket, abstract_mode)?;
+            let mut stub_child = spawn_stub(socket, abstract_mode)
+                .map_err(|e| routes::harness_error(format!("spawning the stub: {e}")))?;
             let stub_pid = stub_child.id() as libc::pid_t;
-            if let Err(e) = wait_for_stub_ready(socket, abstract_mode, STUB_ACCEPT_TIMEOUT) {
+            if let Err(e) =
+                wait_for_stub_ready(&mut stub_child, socket, abstract_mode, STUB_ACCEPT_TIMEOUT)
+            {
                 kill_and_reap(stub_child);
-                return Err(e);
+                return Err(routes::harness_error(format!("stub not ready: {e}")));
             }
             // Diagnostic (also acceptance (c)'s observable: a fresh stub pid
             // per row, since every row re-enters `run_one_row` and spawns a
@@ -323,7 +355,13 @@ fn run_one_row(
             // suite is running in agent mode (placement is otherwise a
             // no-op in nonagent mode).
             if !no_cgroup && (routes::needs_cgroup(row.route) || mode == "agent") {
-                let _ = routes::place_in_cgroup(stub_pid, &format!("{cgroup_root}/broker"));
+                let broker = format!("{cgroup_root}/broker");
+                if let Err(e) = routes::place_in_cgroup(stub_pid, &broker) {
+                    kill_and_reap(stub_child);
+                    return Err(routes::harness_error(format!(
+                        "placing the stub in {broker}: {e}"
+                    )));
+                }
             }
 
             // D5: the `abstract` route's gap-bind oracle needs the stub
@@ -336,7 +374,11 @@ fn run_one_row(
                 kill_and_reap(stub_child);
                 let result = run_attacker_subprocess(
                     row.route,
-                    AttackerStubMode::Sibling { pid: 0 },
+                    AttackerStubMode::Sibling {
+                        pid: 0,
+                        mode: mode.to_string(),
+                        no_cgroup,
+                    },
                     socket,
                     cgroup_root,
                     place_attacker_in_agent_a,
@@ -346,7 +388,11 @@ fn run_one_row(
 
             let result = run_attacker_subprocess(
                 row.route,
-                AttackerStubMode::Sibling { pid: stub_pid },
+                AttackerStubMode::Sibling {
+                    pid: stub_pid,
+                    mode: mode.to_string(),
+                    no_cgroup,
+                },
                 socket,
                 cgroup_root,
                 place_attacker_in_agent_a,
@@ -370,7 +416,11 @@ fn run_one_row(
 enum AttackerStubMode {
     /// Sibling topology: the runner already spawned the stub; this is its
     /// pid. The attacker only attacks it, never spawns it.
-    Sibling { pid: libc::pid_t },
+    Sibling {
+        pid: libc::pid_t,
+        mode: String,
+        no_cgroup: bool,
+    },
     /// Ancestor topology: the attacker itself spawns and owns the stub as
     /// its own child (D2), then attacks that child.
     AncestorSpawn { mode: String, no_cgroup: bool },
@@ -379,15 +429,17 @@ enum AttackerStubMode {
 /// Spawn the attacker as a separate process from the runner (D2), hand it a
 /// `go` signal over a pipe once any runner-side setup (stub readiness,
 /// agent-a placement) is done, and parse its stdout for the attempt's
-/// outcome.
+/// outcome. The outer `Err` is a harness failure, the inner result is the
+/// attempt's own (see `run_one_row`).
 fn run_attacker_subprocess(
     route: &str,
     stub_mode: AttackerStubMode,
     socket: &str,
     cgroup_root: &str,
     place_attacker_in_agent_a: bool,
-) -> io::Result<()> {
-    let exe = std::env::current_exe()?;
+) -> io::Result<io::Result<()>> {
+    let exe = std::env::current_exe()
+        .map_err(|e| routes::harness_error(format!("locating own executable: {e}")))?;
     let mut cmd = Command::new(exe);
     cmd.arg("attempt")
         .arg("--route")
@@ -398,11 +450,20 @@ fn run_attacker_subprocess(
         .arg(cgroup_root);
 
     match &stub_mode {
-        AttackerStubMode::Sibling { pid } => {
+        AttackerStubMode::Sibling {
+            pid,
+            mode,
+            no_cgroup,
+        } => {
             cmd.arg("--topology")
                 .arg("sibling")
                 .arg("--pid")
-                .arg(pid.to_string());
+                .arg(pid.to_string())
+                .arg("--mode")
+                .arg(mode);
+            if *no_cgroup {
+                cmd.arg("--no-cgroup");
+            }
         }
         AttackerStubMode::AncestorSpawn { mode, no_cgroup } => {
             cmd.arg("--topology")
@@ -418,11 +479,18 @@ fn run_attacker_subprocess(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| routes::harness_error(format!("spawning the attacker: {e}")))?;
 
     if place_attacker_in_agent_a {
-        let _ =
-            routes::place_in_cgroup(child.id() as libc::pid_t, &format!("{cgroup_root}/agent-a"));
+        let agent_a = format!("{cgroup_root}/agent-a");
+        if let Err(e) = routes::place_in_cgroup(child.id() as libc::pid_t, &agent_a) {
+            kill_and_reap(child);
+            return Err(routes::harness_error(format!(
+                "placing the attacker in {agent_a}: {e}"
+            )));
+        }
     }
 
     // Pipe handshake (D2): the attacker blocks on stdin until it reads
@@ -445,11 +513,18 @@ fn run_attacker_subprocess(
 }
 
 /// Parse the attacker subprocess's one-line stdout verdict back into the
-/// `io::Result<()>` shape the row loop expects: `REACHABLE` succeeds;
-/// `VOID errno=<n|none> msg=<...>` fails with that errno attached (D5).
-fn parse_attempt_outcome(stdout: &str, stderr: &str) -> io::Result<()> {
+/// two-level shape the row loop expects: `REACHABLE` is `Ok(Ok(()))`;
+/// `VOID errno=<n|none> msg=<...>` is `Ok(Err(..))` with that errno attached
+/// (D5); `HARNESS msg=<...>` and an unparseable or missing verdict are an
+/// outer `Err`, a harness failure that produces no row.
+fn parse_attempt_outcome(stdout: &str, stderr: &str) -> io::Result<io::Result<()>> {
     if stdout == "REACHABLE" {
-        return Ok(());
+        return Ok(Ok(()));
+    }
+    if let Some(rest) = stdout.strip_prefix("HARNESS ") {
+        return Err(routes::harness_error(
+            rest.trim_start_matches("msg=").to_string(),
+        ));
     }
     if let Some(rest) = stdout.strip_prefix("VOID ") {
         let mut errno = None;
@@ -459,16 +534,16 @@ fn parse_attempt_outcome(stdout: &str, stderr: &str) -> io::Result<()> {
             errno = errno_str.parse::<i32>().ok();
             msg = remainder.trim_start_matches("msg=").to_string();
         }
-        return Err(match errno {
+        return Ok(Err(match errno {
             Some(e) => io::Error::from_raw_os_error(e),
             None => io::Error::other(if msg.is_empty() {
                 format!("attacker reported void with no errno; stderr: {stderr}")
             } else {
                 msg
             }),
-        });
+        }));
     }
-    Err(io::Error::other(format!(
+    Err(routes::harness_error(format!(
         "attacker subprocess produced no parseable verdict; stdout: {stdout:?} stderr: {stderr:?}"
     )))
 }
@@ -490,11 +565,57 @@ fn run_cli(args: &[String]) -> io::Result<()> {
         ));
     }
 
+    if let Some(socket) = &parsed.socket {
+        check_socket_path(socket)?;
+    }
+
     let ptrace_scope = routes::read_ptrace_scope();
     let runid = std::process::id().to_string();
     let work_dir = std::env::temp_dir().join(format!("aok-adv-run-{runid}"));
     std::fs::create_dir_all(&work_dir)?;
 
+    // The rows are collected in memory and written only after every row has
+    // run, so a harness failure in any row leaves no output file at all.
+    let result = collect_records(&parsed, &work_dir, &runid, &ptrace_scope)
+        .and_then(|records| report::write_jsonl(&records, Path::new(&parsed.out)));
+    let _ = std::fs::remove_dir_all(&work_dir);
+    result
+}
+
+/// An AF_UNIX `sun_path` holds 108 bytes including the trailing NUL (and, for
+/// an abstract name, the leading NUL), so a longer `--socket` can never be
+/// bound. That is a harness problem: say so up front instead of letting the
+/// stub fail to bind and the row read as a failed baseline.
+const SUN_PATH_MAX: usize = 107;
+
+fn check_socket_path(socket: &str) -> io::Result<()> {
+    if socket.len() > SUN_PATH_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "--socket is {} bytes; an AF_UNIX socket path holds at most {SUN_PATH_MAX} bytes",
+                socket.len()
+            ),
+        ));
+    }
+    if socket.is_empty() || socket.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--socket must be a non-empty path without NUL bytes",
+        ));
+    }
+    Ok(())
+}
+
+/// Run the S1 cases and the selected route rows. Only the attacker's own
+/// attempt may produce a void row; any harness failure aborts the whole
+/// invocation with an error naming the row and the cause.
+fn collect_records(
+    parsed: &RunArgs,
+    work_dir: &Path,
+    runid: &str,
+    ptrace_scope: &str,
+) -> io::Result<Vec<report::Record>> {
     let mut records = Vec::new();
 
     // D1/deviation: when `--routes` selects specific route rows, the S1
@@ -502,19 +623,30 @@ fn run_cli(args: &[String]) -> io::Result<()> {
     // route-focused wrapper invocation does not also re-run and re-report
     // all 8 cases on every row's own invocation. `--cases` without
     // `--routes` still runs cases only, exactly as before.
+    //
+    // The cases ignore cgroup confinement, so in agent mode they would run
+    // as an unconfined process and their success would be noise: no case
+    // rows are emitted and `agent_result` stays null (untested).
     if parsed.routes.is_none() {
-        for outcome in cases::run_all_cases(&work_dir, &runid) {
-            if let Some(filter) = &parsed.cases
-                && !filter.iter().any(|c| c.as_str() == outcome.spec.class)
-            {
-                continue;
+        if parsed.mode == "agent" {
+            eprintln!(
+                "aok-adv: agent-mode S1 needs enforcement hooks that arrive with ADV-04 and \
+                 Phases 11-13; no S1 case rows emitted (agent_result stays untested)"
+            );
+        } else {
+            for outcome in cases::run_all_cases(work_dir, runid) {
+                if let Some(filter) = &parsed.cases
+                    && !filter.iter().any(|c| c.as_str() == outcome.spec.class)
+                {
+                    continue;
+                }
+                records.push(report::Record::from_case(
+                    outcome.spec,
+                    outcome.baseline_ok,
+                    &parsed.mode,
+                    ptrace_scope,
+                ));
             }
-            records.push(report::Record::from_case(
-                outcome.spec,
-                outcome.baseline_ok,
-                &parsed.mode,
-                &ptrace_scope,
-            ));
         }
     }
 
@@ -530,28 +662,42 @@ fn run_cli(args: &[String]) -> io::Result<()> {
             {
                 continue;
             }
+            let mut harness_failure: Option<io::Error> = None;
             let (outcome, errno) = routes::evaluate_row_with_errno(&row, parsed.no_cgroup, || {
-                run_one_row(
+                match run_one_row(
                     &row,
                     socket,
                     &parsed.cgroup_root,
                     &parsed.mode,
                     parsed.no_cgroup,
-                )
+                ) {
+                    Ok(attempt) => attempt,
+                    Err(e) => {
+                        harness_failure = Some(e);
+                        Ok(())
+                    }
+                }
             });
+            if let Some(e) = harness_failure {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "harness failure on route {} topology {}: {e}",
+                        row.route,
+                        row.topology.as_str()
+                    ),
+                ));
+            }
             records.push(report::Record::from_route(
                 &row,
                 &outcome,
                 &parsed.mode,
-                &ptrace_scope,
+                ptrace_scope,
                 errno,
             ));
         }
     }
-
-    report::write_jsonl(&records, Path::new(&parsed.out))?;
-    let _ = std::fs::remove_dir_all(&work_dir);
-    Ok(())
+    Ok(records)
 }
 
 // ---------------------------------------------------------------------------
@@ -650,31 +796,37 @@ fn attempt_cli(args: &[String]) -> io::Result<()> {
     let mut line = String::new();
     let _ = io::stdin().lock().read_line(&mut line);
 
+    let mode = parsed.mode.as_deref().unwrap_or("nonagent");
     let outcome: io::Result<()> = (|| {
         let abstract_mode = parsed.route == "abstract";
         let (pid, stub_child) = match parsed.topology.as_str() {
             "sibling" => {
-                let pid = parsed.pid.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "sibling topology requires --pid",
-                    )
-                })?;
+                let pid = parsed
+                    .pid
+                    .ok_or_else(|| routes::harness_error("sibling topology requires --pid"))?;
                 (pid as libc::pid_t, None)
             }
             "ancestor" => {
-                let mut stub_child = spawn_stub(&parsed.socket, abstract_mode)?;
+                let mut stub_child = spawn_stub(&parsed.socket, abstract_mode)
+                    .map_err(|e| routes::harness_error(format!("spawning the stub: {e}")))?;
                 let stub_pid = stub_child.id() as libc::pid_t;
-                wait_for_stub_ready(&parsed.socket, abstract_mode, STUB_ACCEPT_TIMEOUT)
-                    .inspect_err(|_e| {
-                        kill_and_reap(stub_child_take(&mut stub_child));
-                    })?;
-                let mode = parsed.mode.as_deref().unwrap_or("nonagent");
+                if let Err(e) = wait_for_stub_ready(
+                    &mut stub_child,
+                    &parsed.socket,
+                    abstract_mode,
+                    STUB_ACCEPT_TIMEOUT,
+                ) {
+                    kill_and_reap(stub_child);
+                    return Err(routes::harness_error(format!("stub not ready: {e}")));
+                }
                 if !parsed.no_cgroup && (routes::needs_cgroup(&parsed.route) || mode == "agent") {
-                    let _ = routes::place_in_cgroup(
-                        stub_pid,
-                        &format!("{}/broker", parsed.cgroup_root),
-                    );
+                    let broker = format!("{}/broker", parsed.cgroup_root);
+                    if let Err(e) = routes::place_in_cgroup(stub_pid, &broker) {
+                        kill_and_reap(stub_child);
+                        return Err(routes::harness_error(format!(
+                            "placing the stub in {broker}: {e}"
+                        )));
+                    }
                 }
                 // Diagnostic (also acceptance (b)'s observable: in ancestor
                 // topology this process, the attacker, is the stub's own
@@ -692,10 +844,9 @@ fn attempt_cli(args: &[String]) -> io::Result<()> {
                 (stub_pid, Some(stub_child))
             }
             other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("attempt: unknown topology {other}"),
-                ));
+                return Err(routes::harness_error(format!(
+                    "attempt: unknown topology {other}"
+                )));
             }
         };
 
@@ -708,7 +859,13 @@ fn attempt_cli(args: &[String]) -> io::Result<()> {
                 None
             },
         };
-        let result = dispatch_attempt(&parsed.route, &target, &parsed.cgroup_root);
+        let result = dispatch_attempt(
+            &parsed.route,
+            &target,
+            &parsed.cgroup_root,
+            mode,
+            parsed.no_cgroup,
+        );
         if let Some(stub_child) = stub_child {
             kill_and_reap(stub_child);
         }
@@ -718,6 +875,13 @@ fn attempt_cli(args: &[String]) -> io::Result<()> {
     match outcome {
         Ok(()) => {
             println!("REACHABLE");
+            Ok(())
+        }
+        Err(e) if routes::is_harness_error(&e) => {
+            // Not the attempt's verdict: the runner turns this into a
+            // non-zero exit with no row.
+            println!("HARNESS msg={}", e.to_string().replace('\n', " "));
+            eprintln!("aok-adv attempt: harness failure: {e}");
             Ok(())
         }
         Err(e) => {
@@ -734,27 +898,6 @@ fn attempt_cli(args: &[String]) -> io::Result<()> {
             Ok(())
         }
     }
-}
-
-/// Helper so the `map_err` closure above can hand its child back for
-/// cleanup without fighting the borrow checker over a moved `Child`.
-fn stub_child_take(child: &mut std::process::Child) -> std::process::Child {
-    std::mem::replace(
-        child,
-        Command::new("true")
-            .spawn()
-            .unwrap_or_else(|_| child_placeholder()),
-    )
-}
-
-/// Fallback placeholder if even `true` cannot be spawned (should not
-/// happen on any POSIX host); `kill_and_reap` on it is a harmless no-op.
-fn child_placeholder() -> std::process::Child {
-    Command::new("/bin/sh")
-        .arg("-c")
-        .arg("exit 0")
-        .spawn()
-        .expect("spawn a trivial placeholder child")
 }
 
 // ---------------------------------------------------------------------------
@@ -795,9 +938,18 @@ fn scm_helper_cli(args: &[String]) -> io::Result<()> {
         io::Error::new(io::ErrorKind::InvalidInput, "scm-helper requires --handoff")
     })?;
 
+    // Wait for the attacker's "go" (it places this helper in its cgroup
+    // first, so the identity the stub reads is the placed one), and stay
+    // alive after the handoff until the attacker closes our stdin, so the
+    // stub can still read this process's identity when it answers.
+    let mut line = String::new();
+    let _ = io::stdin().lock().read_line(&mut line);
+
     let stub_conn = std::os::unix::net::UnixStream::connect(&socket)?;
     let handoff_conn = std::os::unix::net::UnixStream::connect(&handoff)?;
     sys::send_fd(handoff_conn.as_raw_fd(), stub_conn.as_raw_fd())?;
+    let mut rest = Vec::new();
+    let _ = io::stdin().lock().read_to_end(&mut rest);
     Ok(())
 }
 
@@ -907,5 +1059,95 @@ mod tests {
             err.to_string().contains("ADV-05"),
             "unexpected error message: {err}"
         );
+    }
+
+    /// B: in agent mode (not `--no-cgroup`) the scm_rights route is handed
+    /// `<cgroup-root>/agent-b`, so success means the stub's reply names
+    /// agent-b's cgroup id. Fails when `None` is passed unconditionally (the
+    /// pre-fix dispatch). The tempdir stands in for the cgroup root.
+    #[test]
+    fn scm_agent_b_dir_is_wired_only_in_agent_mode() {
+        let root = std::env::temp_dir().join(format!("aok-adv-agentb-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("agent-b")).expect("create stand-in agent-b");
+        let root_s = root.to_str().expect("utf-8 temp path");
+
+        assert_eq!(
+            super::scm_agent_b_dir(root_s, "agent", false),
+            Some(format!("{root_s}/agent-b"))
+        );
+        assert_eq!(super::scm_agent_b_dir(root_s, "nonagent", false), None);
+        assert_eq!(super::scm_agent_b_dir(root_s, "baseline", false), None);
+        assert_eq!(super::scm_agent_b_dir(root_s, "agent", true), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stub that dies at once is reported as such, naming the exit, and
+    /// well inside the timeout.
+    #[test]
+    fn wait_for_stub_ready_reports_an_immediate_exit() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 3")
+            .spawn()
+            .expect("spawn short-lived child");
+        let started = std::time::Instant::now();
+        let err = super::wait_for_stub_ready(
+            &mut child,
+            "/nonexistent-aok-dir/s.sock",
+            false,
+            Duration::from_secs(5),
+        )
+        .expect_err("an exited stub is never ready");
+        assert!(
+            err.to_string().contains("exited"),
+            "error must name the exit: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "must fail fast, not burn the timeout"
+        );
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn check_socket_path_enforces_the_sun_path_limit() {
+        let ok = format!("/{}", "a".repeat(super::SUN_PATH_MAX - 1));
+        assert_eq!(ok.len(), super::SUN_PATH_MAX);
+        assert!(super::check_socket_path(&ok).is_ok());
+        let long = format!("/{}", "a".repeat(super::SUN_PATH_MAX));
+        let err = super::check_socket_path(&long).expect_err("108 bytes cannot be bound");
+        assert!(err.to_string().contains("108"), "{err}");
+        assert!(super::check_socket_path("").is_err());
+        assert!(super::check_socket_path("/tmp/a\0b").is_err());
+    }
+
+    /// Only the attacker's own attempt is a void row; `HARNESS` and garbage
+    /// are hard errors, and a void row carries the attempt's errno when one
+    /// exists.
+    #[test]
+    fn parse_attempt_outcome_separates_attempt_from_harness() {
+        assert!(matches!(
+            super::parse_attempt_outcome("REACHABLE", ""),
+            Ok(Ok(()))
+        ));
+
+        let void = super::parse_attempt_outcome("VOID errno=1 msg=Operation not permitted", "")
+            .expect("VOID is an attempt result, not a harness failure")
+            .expect_err("VOID is a failed attempt");
+        assert_eq!(void.raw_os_error(), Some(1));
+
+        let no_errno = super::parse_attempt_outcome("VOID errno=none msg=identity mismatch", "")
+            .expect("VOID is an attempt result")
+            .expect_err("VOID is a failed attempt");
+        assert_eq!(no_errno.raw_os_error(), None);
+
+        let harness = super::parse_attempt_outcome("HARNESS msg=cannot place helper", "")
+            .expect_err("HARNESS is a harness failure");
+        assert!(crate::routes::is_harness_error(&harness));
+        assert!(harness.to_string().contains("cannot place helper"));
+
+        let garbage =
+            super::parse_attempt_outcome("", "boom").expect_err("no verdict is a harness failure");
+        assert!(crate::routes::is_harness_error(&garbage));
     }
 }
