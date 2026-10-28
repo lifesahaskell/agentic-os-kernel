@@ -12,7 +12,7 @@
 
 use std::ffi::CStr;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, RawFd};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -373,7 +373,37 @@ pub struct PeerIdentity {
     pub pid: i32,
 }
 
-/// Read the identity of whoever is connected to `sock_fd` right now.
+/// `PIDFD_GET_INFO(cgroupid|pid)` on an already-open pidfd the caller owns.
+/// Does not close `pidfd`: ownership stays with the caller, so this can be
+/// called on a pidfd obtained from `clone3`'s `CLONE_PIDFD` (route iv's
+/// placement check) as well as one opened fresh via `SO_PEERPIDFD`.
+pub fn pidfd_identity(pidfd: RawFd) -> io::Result<PeerIdentity> {
+    // SAFETY: `info` is zero-initialized, valid for libc's #[non_exhaustive]
+    // `pidfd_info` because every field is an integer (the all-zero bit
+    // pattern is a valid value); `mask` is then set to request exactly the
+    // fields read below before the ioctl call. `pidfd` is a caller-owned fd,
+    // valid for the duration of this call; this function never closes it.
+    unsafe {
+        let mut info: libc::pidfd_info = core::mem::zeroed();
+        info.mask = (libc::PIDFD_INFO_CGROUPID | libc::PIDFD_INFO_PID) as u64;
+        let rc = libc::ioctl(
+            pidfd,
+            libc::PIDFD_GET_INFO,
+            &mut info as *mut libc::pidfd_info,
+        );
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(PeerIdentity {
+            cgroupid: info.cgroupid,
+            pid: info.pid as i32,
+        })
+    }
+}
+
+/// Read the identity of whoever is connected to `sock_fd` right now, via
+/// `SO_PEERPIDFD` then `pidfd_identity`. The pidfd this opens is private to
+/// this call and always closed before returning.
 pub fn peer_identity(sock_fd: RawFd) -> io::Result<PeerIdentity> {
     // SAFETY: `sock_fd` is a valid, open socket fd owned by the caller for
     // the duration of this call. `pidfd` and `len` are live locals on this
@@ -395,30 +425,13 @@ pub fn peer_identity(sock_fd: RawFd) -> io::Result<PeerIdentity> {
         pidfd
     };
 
-    // SAFETY: `info` is zero-initialized, valid for libc's #[non_exhaustive]
-    // `pidfd_info` because every field is an integer (the all-zero bit
-    // pattern is a valid value); `mask` is then set to request exactly the
-    // fields read below before the ioctl call. `pidfd` is the fd opened
-    // above, valid for the duration of this call and closed before every
-    // return path below.
+    let result = pidfd_identity(pidfd);
+    // SAFETY: `pidfd` was opened by this function alone, just above; nothing
+    // else holds or uses it, so closing it here is sound on every path.
     unsafe {
-        let mut info: libc::pidfd_info = core::mem::zeroed();
-        info.mask = (libc::PIDFD_INFO_CGROUPID | libc::PIDFD_INFO_PID) as u64;
-        let rc = libc::ioctl(
-            pidfd,
-            libc::PIDFD_GET_INFO,
-            &mut info as *mut libc::pidfd_info,
-        );
-        let saved_err = io::Error::last_os_error();
         libc::close(pidfd);
-        if rc != 0 {
-            return Err(saved_err);
-        }
-        Ok(PeerIdentity {
-            cgroupid: info.cgroupid,
-            pid: info.pid as i32,
-        })
     }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +490,20 @@ pub fn pidfd_getfd(pidfd: RawFd, targetfd: RawFd) -> io::Result<RawFd> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// Wrap a raw fd this process owns into an `OwnedFd`, so a caller outside
+/// this module (`routes.rs`'s `scm_rights` route, which receives a fd from
+/// `recv_fd` below) can turn it into a `UnixStream` via std's safe
+/// `From<OwnedFd>` without needing its own unsafe block (D-13: `FromRawFd`
+/// is an unsafe trait; this is the one place that unsafety is paid).
+#[allow(dead_code)] // used by routes.rs's scm_rights route
+pub fn owned_fd(fd: RawFd) -> std::os::fd::OwnedFd {
+    // SAFETY: the caller asserts ownership of `fd` (here, a fd just
+    // received via `recv_fd`'s `SCM_RIGHTS` path, which this process now
+    // uniquely owns) and will only use it again through the returned
+    // `OwnedFd`.
+    unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
 }
 
 /// Close a raw fd this process owns. A thin wrapper so every raw syscall
