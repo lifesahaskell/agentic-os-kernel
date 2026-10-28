@@ -1,0 +1,106 @@
+C0 round=1 pid=657930 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=0 landlock=none neg_seccomp=na neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=0 errors=0 result=ok
+C1a round=1 pid=660251 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=na neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=1 errors=0 result=ok
+C1b round=1 pid=662566 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=pass neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=64 errors=0 result=ok
+C1c round=1 pid=664889 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=pass neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=65 errors=0 result=ok
+C2a round=1 pid=667185 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=1 landlock=fs neg_seccomp=na neg_fs=pass neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=0 errors=0 result=ok
+C2b round=1 pid=669497 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=1 landlock=net_scope neg_seccomp=na neg_fs=na neg_net=pass neg_scope_unix=pass neg_scope_signal=pass filter_insns=0 errors=0 result=ok
+C3 round=1 pid=671800 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=fs_net_scope neg_seccomp=pass neg_fs=pass neg_net=pass neg_scope_unix=pass neg_scope_signal=pass filter_insns=64 errors=0 result=ok
+C0 round=2 pid=674109 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=0 landlock=none neg_seccomp=na neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=0 errors=0 result=ok
+C1a round=2 pid=676432 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=na neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=1 errors=0 result=ok
+C1b round=2 pid=678727 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=pass neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=64 errors=0 result=ok
+C1c round=2 pid=681049 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=pass neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=65 errors=0 result=ok
+C2a round=2 pid=683356 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=1 landlock=fs neg_seccomp=na neg_fs=pass neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=0 errors=0 result=ok
+C2b round=2 pid=685681 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=1 landlock=net_scope neg_seccomp=na neg_fs=na neg_net=pass neg_scope_unix=pass neg_scope_signal=pass filter_insns=0 errors=0 result=ok
+C3 round=2 pid=688003 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=fs_net_scope neg_seccomp=pass neg_fs=pass neg_net=pass neg_scope_unix=pass neg_scope_signal=pass filter_insns=64 errors=0 result=ok
+C0 round=3 pid=690324 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=0 landlock=none neg_seccomp=na neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=0 errors=0 result=ok
+C1a round=3 pid=692618 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=na neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=1 errors=0 result=ok
+C1b round=3 pid=694925 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=pass neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=64 errors=0 result=ok
+C1c round=3 pid=697245 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=pass neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=65 errors=0 result=ok
+C2a round=3 pid=699549 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=1 landlock=fs neg_seccomp=na neg_fs=pass neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=0 errors=0 result=ok
+C2b round=3 pid=701871 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=1 landlock=net_scope neg_seccomp=na neg_fs=na neg_net=pass neg_scope_unix=pass neg_scope_signal=pass filter_insns=0 errors=0 result=ok
+C3 round=3 pid=704201 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=fs_net_scope neg_seccomp=pass neg_fs=pass neg_net=pass neg_scope_unix=pass neg_scope_signal=pass filter_insns=64 errors=0 result=ok
+C0 round=4 pid=706499 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=0 landlock=none neg_seccomp=na neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=0 errors=0 result=ok
+C1a round=4 pid=708820 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=na neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=1 errors=0 result=ok
+C1b round=4 pid=711125 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=pass neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=64 errors=0 result=ok
+C1c round=4 pid=713446 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=pass neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=65 errors=0 result=ok
+C2a round=4 pid=715773 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=1 landlock=fs neg_seccomp=na neg_fs=pass neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=0 errors=0 result=ok
+C2b round=4 pid=718062 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=1 landlock=net_scope neg_seccomp=na neg_fs=na neg_net=pass neg_scope_unix=pass neg_scope_signal=pass filter_insns=0 errors=0 result=ok
+C3 round=4 pid=720369 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=fs_net_scope neg_seccomp=pass neg_fs=pass neg_net=pass neg_scope_unix=pass neg_scope_signal=pass filter_insns=64 errors=0 result=ok
+C0 round=5 pid=722694 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=0 landlock=none neg_seccomp=na neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=0 errors=0 result=ok
+C1a round=5 pid=725005 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=na neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=1 errors=0 result=ok
+C1b round=5 pid=727319 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=pass neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=64 errors=0 result=ok
+C1c round=5 pid=729624 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=none neg_seccomp=pass neg_fs=na neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=65 errors=0 result=ok
+C2a round=5 pid=731936 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=1 landlock=fs neg_seccomp=na neg_fs=pass neg_net=na neg_scope_unix=na neg_scope_signal=na filter_insns=0 errors=0 result=ok
+C2b round=5 pid=734265 Seccomp=0 Seccomp_filters=0 base_filters=0 NoNewPrivs=1 landlock=net_scope neg_seccomp=na neg_fs=na neg_net=pass neg_scope_unix=pass neg_scope_signal=pass filter_insns=0 errors=0 result=ok
+C3 round=5 pid=736576 Seccomp=2 Seccomp_filters=1 base_filters=0 NoNewPrivs=1 landlock=fs_net_scope neg_seccomp=pass neg_fs=pass neg_net=pass neg_scope_unix=pass neg_scope_signal=pass filter_insns=64 errors=0 result=ok
+direct round=1 errors=0 result=ok
+broker_noid round=1 errors=0 result=ok
+broker_id round=1 so_peercred=ok so_peerpidfd=ok pidfd_get_info=ok pid_match=yes cgroupid_match=yes errors=0 result=ok
+egress_direct round=1 errors=0 result=ok
+egress_broker round=1 errors=0 result=ok
+direct round=2 errors=0 result=ok
+broker_noid round=2 errors=0 result=ok
+broker_id round=2 so_peercred=ok so_peerpidfd=ok pidfd_get_info=ok pid_match=yes cgroupid_match=yes errors=0 result=ok
+egress_direct round=2 errors=0 result=ok
+egress_broker round=2 errors=0 result=ok
+direct round=3 errors=0 result=ok
+broker_noid round=3 errors=0 result=ok
+broker_id round=3 so_peercred=ok so_peerpidfd=ok pidfd_get_info=ok pid_match=yes cgroupid_match=yes errors=0 result=ok
+egress_direct round=3 errors=0 result=ok
+egress_broker round=3 errors=0 result=ok
+direct round=4 errors=0 result=ok
+broker_noid round=4 errors=0 result=ok
+broker_id round=4 so_peercred=ok so_peerpidfd=ok pidfd_get_info=ok pid_match=yes cgroupid_match=yes errors=0 result=ok
+egress_direct round=4 errors=0 result=ok
+egress_broker round=4 errors=0 result=ok
+direct round=5 errors=0 result=ok
+broker_noid round=5 errors=0 result=ok
+broker_id round=5 so_peercred=ok so_peerpidfd=ok pidfd_get_info=ok pid_match=yes cgroupid_match=yes errors=0 result=ok
+egress_direct round=5 errors=0 result=ok
+egress_broker round=5 errors=0 result=ok
+pidfd_L0 round=1 errors=0 result=ok
+pidfd_L1 round=1 errors=0 result=ok
+pidfd_L4 round=1 errors=0 result=ok
+cgkill_L0 round=1 errors=0 result=ok
+cgkill_L1 round=1 errors=0 result=ok
+cgkill_L4 round=1 errors=0 result=ok
+pidfd_L0 round=2 errors=0 result=ok
+pidfd_L1 round=2 errors=0 result=ok
+pidfd_L4 round=2 errors=0 result=ok
+cgkill_L0 round=2 errors=0 result=ok
+cgkill_L1 round=2 errors=0 result=ok
+cgkill_L4 round=2 errors=0 result=ok
+pidfd_L0 round=3 errors=0 result=ok
+pidfd_L1 round=3 errors=0 result=ok
+pidfd_L4 round=3 errors=0 result=ok
+cgkill_L0 round=3 errors=0 result=ok
+cgkill_L1 round=3 errors=0 result=ok
+cgkill_L4 round=3 errors=0 result=ok
+pidfd_L0 round=4 errors=0 result=ok
+pidfd_L1 round=4 errors=0 result=ok
+pidfd_L4 round=4 errors=0 result=ok
+cgkill_L0 round=4 errors=0 result=ok
+cgkill_L1 round=4 errors=0 result=ok
+cgkill_L4 round=4 errors=0 result=ok
+pidfd_L0 round=5 errors=0 result=ok
+pidfd_L1 round=5 errors=0 result=ok
+pidfd_L4 round=5 errors=0 result=ok
+cgkill_L0 round=5 errors=0 result=ok
+cgkill_L1 round=5 errors=0 result=ok
+cgkill_L4 round=5 errors=0 result=ok
+spawn_fork round=1 errors=0 result=ok
+spawn_clone3_into round=1 errors=0 result=ok
+spawn_fork_move round=1 errors=0 result=ok
+behaviour round=1 errors=0 result=ok
+spawn_fork round=2 errors=0 result=ok
+spawn_clone3_into round=2 errors=0 result=ok
+spawn_fork_move round=2 errors=0 result=ok
+spawn_fork round=3 errors=0 result=ok
+spawn_clone3_into round=3 errors=0 result=ok
+spawn_fork_move round=3 errors=0 result=ok
+spawn_fork round=4 errors=0 result=ok
+spawn_clone3_into round=4 errors=0 result=ok
+spawn_fork_move round=4 errors=0 result=ok
+spawn_fork round=5 errors=0 result=ok
+spawn_clone3_into round=5 errors=0 result=ok
+spawn_fork_move round=5 errors=0 result=ok
