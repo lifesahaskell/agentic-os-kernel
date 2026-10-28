@@ -20,7 +20,18 @@ import sys
 
 SUITES = ("micro", "broker", "deadline", "cgroup")
 
-MICRO_BENCHES = ("timer_pair", "getppid", "getppid_x1000")
+MICRO_BENCHES = (
+    "timer_pair",
+    "getppid",
+    "getppid_x1000",
+    "openat_tmpfs",
+    "openat_rootfs",
+    "unix_connect",
+    "tcp_connect",
+    "fork_exec_wait",
+    "posix_spawn",
+    "unix_dgram_pingpong",
+)
 
 MICRO_CONFIGS = ("C0", "C1a", "C1b", "C1c", "C2a", "C2b", "C3")
 BROKER_CONFIGS = (
@@ -487,17 +498,35 @@ def check(run_dir):
                     problems.append("delegation=yes but %s not requested" % c)
     if not asked:
         problems.append("env.txt lists no requested_* suites")
-    if "cgroup" in env.get("requested_cgroup_configs", []) or probe:
+    wants_probe = any(
+        env.get("requested_%s_configs" % s) for s in ("deadline", "cgroup")
+    )
+    if wants_probe and not probe:
+        problems.append(
+            "deadline or cgroup suite requested but cgroup-probe.txt missing"
+        )
+    if probe:
+        if delegation not in ("yes", "no"):
+            problems.append("cgroup-probe.txt has no delegation=yes|no line")
         if delegation == "no" and not any(
             ln.startswith("NOT MEASURED") for ln in probe_lines
         ):
             problems.append(
                 "delegation=no but no NOT MEASURED lines in cgroup-probe.txt"
             )
-        if delegation == "yes" and not (
-            set(CGROUP_CONFIGS) <= {r["config"] for r in rows if r["suite"] == "cgroup"}
-        ):
-            problems.append("delegation=yes but cgroup spawn rows are missing")
+        if delegation == "yes" and env.get("requested_cgroup_configs"):
+            got = {r["config"] for r in rows if r["suite"] == "cgroup"}
+            if not set(CGROUP_CONFIGS) <= got:
+                problems.append("delegation=yes but cgroup spawn rows are missing")
+            beh = "\n".join(read_lines(os.path.join(run_dir, "cgroup-behaviour.txt")))
+            for key in (
+                "clone3_into_cgroup_functional=",
+                "oom_trial=",
+                "pids_trial=",
+                "psi_trigger_register=",
+            ):
+                if key not in beh:
+                    problems.append("cgroup-behaviour.txt lacks " + key)
     return problems
 
 
