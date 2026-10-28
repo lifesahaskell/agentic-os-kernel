@@ -1,0 +1,8 @@
+clone3_into_cgroup_functional=yes
+oom_trial=1 signal=9 exit=-1 chunks_mib=63 oom=1 oom_kill=1 peak_bytes=67108864
+oom_trial=2 signal=9 exit=-1 chunks_mib=63 oom=1 oom_kill=1 peak_bytes=67108864
+oom_trial=3 signal=9 exit=-1 chunks_mib=63 oom=1 oom_kill=1 peak_bytes=67108864
+pids_trial=1 forks_ok=7 errno=EAGAIN pids_events_max=1
+pids_trial=2 forks_ok=7 errno=EAGAIN pids_events_max=1
+pids_trial=3 forks_ok=7 errno=EAGAIN pids_events_max=1
+psi_trigger_register=ok

@@ -1,0 +1,12 @@
+own_cgroup=/init.scope
+own_cgroup_writable=no
+user_owned_dirs=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service;/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/session.slice;/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/session.slice/dbus.service;/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice;/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/dbus.socket;/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/gpg-agent-ssh.socket;/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/init.scope
+direct_move=_: line 1: echo: write error: Permission denied
+systemd_run_scope=ok:0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-rbda6693d086643cd976be68c644b700c.scope
+systemd_run_service=ok
+service_cgroup=/user.slice/user-1000.slice/user@1000.service/app.slice/run-u27.service
+service_owner=1000
+service_controllers=cpu memory pids
+service_writable=yes
+unshare_cgroupns=/ not-writable
+delegation=yes
