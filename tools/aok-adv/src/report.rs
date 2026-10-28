@@ -56,11 +56,18 @@ impl Record {
     /// Build a route row from one `RouteRow` and its `RunOutcome`
     /// (routes.rs): a `Skipped` row still carries its skip reason in
     /// `reach`, never marked invalid or failed (ADV-02 empty case 29).
+    /// `errno` is the failing attempt's raw OS error, when the row ran and
+    /// failed (D5: "failures are recorded with errno"); `None` for a
+    /// reachable or skipped row. `payload_claim` is D-15's control route
+    /// (iii): it is marked `oracle="control"` here so `report_text`'s S5
+    /// tally (and any later phase's) excludes it by construction rather
+    /// than by a name check scattered at each call site.
     pub fn from_route(
         row: &RouteRow,
         outcome: &RunOutcome,
         mode: &str,
         ptrace_scope: &str,
+        errno: Option<i64>,
     ) -> Record {
         let reach = match outcome {
             RunOutcome::Ran(r) => r.as_str().to_string(),
@@ -71,6 +78,8 @@ impl Record {
             topology: Some(row.topology.as_str().to_string()),
             family: Some(row.family.as_str().to_string()),
             reach: Some(reach),
+            errno,
+            oracle: is_control_route(row.route).then(|| "control".to_string()),
             closable_by: Some(String::new()),
             mode: mode.to_string(),
             ptrace_scope: ptrace_scope.to_string(),
@@ -136,6 +145,13 @@ impl Record {
         }
         r
     }
+}
+
+/// D-15 route (iii) is a control: it must be reachable only when the stub's
+/// reply ignored the claimed id (`attempt_payload_claim`'s own check), and
+/// it never counts toward the S5 reachable-route tally (D5).
+fn is_control_route(route: &str) -> bool {
+    route == "payload_claim"
 }
 
 fn field_str(key: &str, v: &Option<String>) -> String {
@@ -446,6 +462,36 @@ pub fn report_text(records: &[Record]) -> String {
         }
     }
 
+    let s5_total = records
+        .iter()
+        .filter(|r| r.route.is_some() && r.oracle.as_deref() != Some("control"))
+        .count();
+    let s5_reachable = records
+        .iter()
+        .filter(|r| {
+            r.route.is_some()
+                && r.oracle.as_deref() != Some("control")
+                && r.reach.as_deref() == Some("reachable")
+        })
+        .count();
+    lines.push(format!(
+        "S5 routes: {s5_reachable} of {s5_total} reachable (payload_claim excluded: \
+         control route, D-15/D5, never counted toward S5)"
+    ));
+
+    for r in records {
+        if let Some(class) = &r.class {
+            lines.push(format!(
+                "class={class} case={} valid={} agent_result={}",
+                r.case.as_deref().unwrap_or("-"),
+                r.valid
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                r.agent_result.as_deref().unwrap_or("untested"),
+            ));
+        }
+    }
+
     let case_count = records.iter().filter(|r| r.case.is_some()).count();
     let valid_count = records
         .iter()
@@ -455,6 +501,16 @@ pub fn report_text(records: &[Record]) -> String {
         "S1 skeleton: {valid_count} of {case_count} cases valid; 0 of about 8 is not evidence \
          of completeness (D-17): a case with no valid instance proves nothing about whether \
          that class is reachable."
+    ));
+
+    let case_untested = records
+        .iter()
+        .filter(|r| r.case.is_some() && r.agent_result.is_none())
+        .count();
+    lines.push(format!(
+        "S1 agent column: {case_untested} of {case_count} cases untested (agent-mode S1 needs \
+         enforcement hooks that arrive with ADV-04 and Phases 11-13; untested is not a failure \
+         and is never fabricated as a denial or a success)."
     ));
     lines.push(
         "Read-then-act race: PIDFD_GET_INFO reads the peer's cgroup id at the moment of the \
@@ -492,7 +548,7 @@ mod tests {
             },
             topology,
         };
-        Record::from_route(&row, &RunOutcome::Ran(Reach::Reachable), mode, "1")
+        Record::from_route(&row, &RunOutcome::Ran(Reach::Reachable), mode, "1", None)
     }
 
     #[test]
@@ -564,5 +620,68 @@ mod tests {
         let text = report_text(&[sample_route_record("kill", Topology::Sibling, "nonagent")]);
         assert!(text.contains("not evidence of completeness"));
         assert!(text.contains("Read-then-act race"));
+    }
+
+    /// C.3: when the agent file carries route rows only (no case rows), the
+    /// nonagent file's 8 S1 cases merge with `agent_result: None` ("untested"
+    /// in `report_text`), never a fabricated denial or success, and never
+    /// reported as a failure.
+    #[test]
+    fn merge_leaves_cases_untested_when_agent_file_has_no_case_rows() {
+        let case_row = Record {
+            class: Some("kill-impersonation".to_string()),
+            case: Some("case-1".to_string()),
+            oracle: Some("pidfd".to_string()),
+            baseline_ok: Some(true),
+            valid: Some(true),
+            mode: "nonagent".to_string(),
+            ptrace_scope: "1".to_string(),
+            ..Default::default()
+        };
+        let nonagent = vec![case_row];
+        let agent = vec![sample_route_record("kill", Topology::Sibling, "agent")];
+
+        let merged = merge(&nonagent, &agent, &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].agent_result, None,
+            "a case with no agent-file counterpart must stay untested, not denied/succeeded"
+        );
+
+        let text = report_text(&merged);
+        assert!(
+            text.contains("agent_result=untested"),
+            "report_text must render the untested case column: {text}"
+        );
+        assert!(
+            text.contains("S1 agent column: 1 of 1 cases untested"),
+            "report_text must summarize the untested count: {text}"
+        );
+    }
+
+    /// D5: `payload_claim` is a control and must never count toward the S5
+    /// reachable-route tally, even when it itself is reachable.
+    #[test]
+    fn payload_claim_is_excluded_from_the_s5_tally() {
+        let row = RouteRow {
+            family: Family::Impersonation,
+            route: "payload_claim",
+            topology: Topology::Sibling,
+        };
+        let claim_record = Record::from_route(
+            &row,
+            &RunOutcome::Ran(Reach::Reachable),
+            "nonagent",
+            "1",
+            None,
+        );
+        assert_eq!(claim_record.oracle, Some("control".to_string()));
+
+        let kill_record = sample_route_record("kill", Topology::Sibling, "nonagent");
+        let text = report_text(&[claim_record, kill_record]);
+        assert!(
+            text.contains("S5 routes: 1 of 1 reachable"),
+            "expected payload_claim excluded from the S5 tally, got: {text}"
+        );
     }
 }

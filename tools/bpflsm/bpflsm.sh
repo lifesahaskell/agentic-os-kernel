@@ -191,6 +191,11 @@ for each row of: tools/aok-adv/target/release/aok-adv list-routes   (family rout
   agent: sum every per-hook counter (after); append to tools/aok-adv/results/ID/deny-counters.txt:
     route=R topology=T hook=H before=N after=N   (hooks: task_kill ptrace_access_check
     socket_sendmsg socket_bind file_open)
+baseline|nonagent only: one more call, no --socket/--routes, runs the 8 S1 cases:
+  tools/aok-adv/target/release/aok-adv run --mode MODE --out TMP/adv/cases.jsonl
+  appended to tools/aok-adv/results/ID/MODE.jsonl; a failure counts toward failed same as a row.
+  agent mode runs none of this (agent-mode S1 needs enforcement hooks that arrive with ADV-04
+  and Phases 11-13); aok-adv itself emits no case rows and agent_result stays untested.
 exit 1 if no rows ran or any row failed; the governor and the stats sysctl are not touched
 Note A11 (assumed): the cgroup.kill deny counter is a file_open counter, not a task_kill counter.
 EOF
@@ -820,6 +825,19 @@ mode_adv() {
 			done
 		fi
 	done <"$TMPD/routes"
+
+	if [ "$m" != agent ]; then
+		rm -f "$TMPD/adv/cases.jsonl"
+		if run_as_uid "$CGROOT/adv" "$bin" run --mode "$m" --out "$TMPD/adv/cases.jsonl"; then
+			:
+		else
+			failed=$((failed + 1))
+			echo "bpflsm.sh: aok-adv run failed for the S1 cases" >&2
+		fi
+		if [ -f "$TMPD/adv/cases.jsonl" ]; then
+			cat "$TMPD/adv/cases.jsonl" >>"$outdir/$m.jsonl"
+		fi
+	fi
 
 	chown -R "$UID_GID" "$outdir"
 	echo "bpflsm.sh: --adv $m: $rows rows, $failed failed; wrote $outdir/$m.jsonl" >&2

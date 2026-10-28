@@ -222,3 +222,482 @@ trust boundary row. No new surface outside the registered threat model was intro
   (`fb1ab825610c8afb1505a5aedec319e8f97c84fd`) via `git merge-base --is-ancestor`.
 - `git rev-list --count cf8766e5ccc6a82660c210827a18b825cf0abd87..HEAD` = 3, matching `commits: 3`
   in the frontmatter.
+
+## Gap closure
+
+The merged crate failed several `must_haves.truths` because the route functions attacked a
+throwaway self-spawned child instead of the stub broker, topology was a label, nothing started
+or restarted the stub, `--mode agent` did not place anything in a cgroup, and the D5 oracles
+did not check their own postconditions. This section fixes those five defects, documents a
+sixth found during end-to-end verification, and re-checks every `must_haves.truths` entry
+against the fixed code.
+
+### D1: routes attacked a throwaway child, not the given target
+
+**Root cause:** every `attempt_*` function in `routes.rs` spawned its own `/bin/sh -c "sleep 5"`
+child and attacked that, ignoring whatever broker or stub the plan actually describes.
+
+**Fix (`tools/aok-adv/src/routes.rs`):** every `attempt_*` function now takes a `Target { pid,
+socket_path, abstract_name }` parameter and performs its syscall against exactly that target;
+none of them spawns anything. `main.rs` owns every process this suite ever signals, ptraces, or
+connects to.
+
+**Commit:** `b42f8cd`
+
+### D2: topology was a label, ancestry was never real
+
+**Root cause:** nothing in the pre-fix code forked the stub as the attacker's own child; both
+"sibling" and "ancestor" rows ran the identical self-spawned-child attack (the original
+SUMMARY's own Known Stub #1 names this directly).
+
+**Fix (`tools/aok-adv/src/main.rs`):** sibling topology spawns the stub and the attacker as the
+runner's own two children (`run_one_row`'s `Sibling` branch). Ancestor topology re-execs into a
+hidden `attempt` subcommand that spawns the stub itself as its own child, waits for it to
+accept, and (in agent mode) places it in the broker cgroup before the attacker would enter its
+own agent cgroup, so the stub's parent is the attacker, not the runner. Verified directly:
+`tests/topology_and_lifecycle.rs`'s `sibling_topology_shares_the_runner_as_parent_for_stub_and_attacker`
+and `ancestor_topology_makes_the_attacker_the_stubs_parent` read `/proc/<pid>/stat`'s ppid field
+for both processes in both topologies.
+
+**Commit:** `ac7bb69`, `9a7562d` (tests)
+
+### D3: nothing started or restarted the stub
+
+**Root cause:** `run_cli` never spawned a stub broker at all; the plan assumed an external,
+already-running broker that nothing in the pre-fix binary could start, restart, or tear down.
+
+**Fix (`tools/aok-adv/src/main.rs`):** `run` now owns the stub lifecycle end to end per row:
+`spawn_stub` re-execs `current_exe()` into the hidden `stub` subcommand, `wait_for_stub_ready`
+polls a real connect attempt (bounded by `STUB_ACCEPT_TIMEOUT` = 5s) instead of sleeping a fixed
+guess, and `kill_and_reap` tears it down after the row. Every row gets a fresh stub child, never
+a reused one. `--broker-pid` is rejected outright with an `io::ErrorKind::Unsupported` error
+naming "ADV-05 (Phase 10)"; this suite never signals or ptraces a pid it did not spawn itself.
+Verified: `tests/topology_and_lifecycle.rs`'s `consecutive_rows_get_a_fresh_stub_pid` parses two
+consecutive rows' `stub_pid=` diagnostics from a real `run` invocation and asserts they differ;
+`tests/broker_pid_rejected.rs` and `main.rs`'s own
+`broker_pid_flag_is_rejected_with_adv05_message` cover the rejection at both the CLI and
+in-process boundary.
+
+**Commit:** `ac7bb69`, `9a7562d` (tests)
+
+### D4: `--mode agent` was a label, nothing was placed in a cgroup
+
+**Root cause:** `--mode` was parsed and stamped onto the JSON `mode` field but never consulted
+for process placement.
+
+**Fix (`tools/aok-adv/src/main.rs`, `tools/aok-adv/src/routes.rs`):** in agent mode (and
+`!no_cgroup`), the attacker is placed in `<cgroup-root>/agent-a` before it is signaled "go", the
+stub is placed in `<cgroup-root>/broker`, and the impersonation helper (`scm_rights`'s
+`scm-helper` subprocess) is placed in `<cgroup-root>/agent-b`, each via a `cgroup.procs` write
+through `routes::place_in_cgroup`, itself guarded by the existing `assert_cgroup_kill_path`
+prefix check. `--no-cgroup` skips both the cgroup-bearing route rows (unchanged `D-16` skip rule)
+and all placement, even when `--mode agent` is given. Verified against an injectable tempdir
+standing in for a delegated cgroup v2 mount (no real `/sys/fs/cgroup` access needed):
+`routes.rs`'s `agent_mode_placement_writes_each_pid_to_its_own_leafs_cgroup_procs` (acceptance 4).
+
+**Commit:** `b42f8cd`, `ac7bb69`
+
+### D5: the oracles never checked their own postconditions
+
+**Root cause:** every impersonation/bind route returned `Ok` on a bare round trip without ever
+checking that the thing the route claims to prove actually happened.
+
+**Fix (`tools/aok-adv/src/routes.rs`):**
+- `cgroup.procs` (`attempt_cgroup_procs_move`): moves this process into `agent_b_dir`'s
+  `cgroup.procs`, then asks the stub for the kernel-stamped identity on this connection and
+  checks it equals `agent_b_dir`'s own inode.
+- `scm_rights` (`attempt_scm_rights`): a real `scm-helper` subprocess connects to the stub and
+  hands its connected fd to this process over a side-channel `SCM_RIGHTS` socket
+  (`main.rs`'s `scm_helper_cli`); this process speaks to the stub through the borrowed fd, and
+  when an `agent_b_dir` is given, checks the reply's identity against it.
+- `payload_claim` (`attempt_payload_claim`): now fails when the reply's `cgroupid` does **not**
+  equal this process's own kernel-stamped id (`own_cgroup_id`) — i.e. it is a control that
+  passes only when the claimed id was correctly ignored. The pre-fix code returned `Ok` on any
+  reply at all, including one that honored the claim. Verified directly:
+  `payload_claim_fails_when_reply_carries_the_claimed_id` stands up a malicious stand-in stub
+  that echoes the claimed id back and asserts the route rejects it (acceptance (d)).
+- `clone3_CLONE_INTO_CGROUP` (`attempt_clone3_into_cgroup`): verifies the clone3 child actually
+  landed in `target_cgroup_dir` (via `PIDFD_GET_INFO` on the pidfd `clone3` returns) before
+  killing and reaping it, rather than assuming the flag worked.
+- `pathname`/`abstract` binds (`attempt_bind_pathname`, `attempt_bind_abstract`): unlink/rebind
+  the broker's socket name, then prove a **fresh** connect reaches the attacker's own listener
+  (a thread-served fixed marker) rather than merely checking that `bind` itself returned `Ok`.
+  `main.rs`'s `abstract` branch of `run_one_row` creates the kill-stub-then-bind-then-restart gap
+  this route needs by killing the stub before dispatching and letting the next row's own fresh
+  spawn start a new one afterward.
+- `payload_claim` is excluded from the S5 tally and tagged `oracle: "control"` in `report.rs`
+  (`is_control_route`), per D-15.
+
+**Commit:** `b42f8cd`
+
+### D6 (found during end-to-end verification, not one of the original five): `spawn_stub`'s abstract-mode flag set
+
+**Root cause:** `stub::run_cli` unconditionally requires `--socket PATH` (the CLI contract is
+`stub --socket PATH [--abstract NAME]`, never `--abstract` alone). `spawn_stub` originally
+passed only one of `--socket`/`--abstract` depending on `abstract_mode`, so every `abstract`-route
+stub child exited immediately with `"stub: --socket PATH is required"`. Because `spawn_stub`
+sets the child's `stderr` to `Stdio::null()` (so a stub log line can never corrupt the
+`stub_pid=`/verdict diagnostics the runner and `attempt` parse off their own stderr/stdout —
+itself one of this gap closure's intentional fixes), that error message was silently swallowed.
+The runner then spent a full 5 seconds in `wait_for_stub_ready` polling a socket nothing was
+listening on, before failing with an `io::ErrorKind::TimedOut` that carries no `raw_os_error` —
+surfacing as `"void (baseline failed)"` with `errno: null` and **no** `stub_pid=` diagnostic
+line, which is how this was caught (the diagnostic was conspicuously missing from the `abstract`
+row's stderr during the acceptance-3 end-to-end run, below).
+
+**Fix (`tools/aok-adv/src/main.rs`):** `spawn_stub` now always passes `--socket socket_path`, and
+additionally passes `--abstract socket_path` when `abstract_mode` is true. `stub::serve` already
+binds the abstract name instead whenever one is given and never touches the socket-path argument
+in that case, so this does not change the stub's own bind behavior, only satisfies `run_cli`'s
+required-flag check.
+
+**Commit:** `ac7bb69`
+
+### Measured end-to-end table (acceptance 3)
+
+Built release (`cargo build --release`), then ran `target/release/aok-adv run --socket
+<fresh-dir>/s.sock --cgroup-root <fresh-dir>/c --routes <ROUTE> --topology <TOPO> --mode
+nonagent --no-cgroup --out <fresh-dir>/o.jsonl` once per `list-routes` row, each under its own
+temp directory with a fresh socket. Measured on this host: uid 1000, `ptrace_scope` = `1`
+(confirmed, matches `ptrace_scope` field on every row below), no delegated cgroup under
+`/sys/fs/cgroup/aok-phase8/adv/`.
+
+| # | family | route | topology | reach | errno |
+|---|--------|-------|----------|-------|-------|
+| 1 | kill | kill | sibling | reachable | - |
+| 2 | kill | tgkill | sibling | reachable | - |
+| 3 | kill | rt_sigqueueinfo | sibling | reachable | - |
+| 4 | kill | pidfd_send_signal | sibling | reachable | - |
+| 5 | kill | cgroup.kill | sibling | skipped: needs delegated cgroup | - |
+| 6 | ptrace | PTRACE_ATTACH | sibling | void (baseline failed) | 1 (EPERM) |
+| 7 | ptrace | PTRACE_SEIZE | sibling | void (baseline failed) | 1 (EPERM) |
+| 8 | ptrace | process_vm_readv | sibling | void (baseline failed) | 1 (EPERM) |
+| 9 | ptrace | process_vm_writev | sibling | void (baseline failed) | 1 (EPERM) |
+| 10 | ptrace | /proc/pid/mem | sibling | void (baseline failed) | 13 (EACCES) |
+| 11 | ptrace | pidfd_getfd | sibling | void (baseline failed) | 1 (EPERM) |
+| 12 | ptrace | PTRACE_ATTACH | ancestor | reachable | - |
+| 13 | ptrace | PTRACE_SEIZE | ancestor | reachable | - |
+| 14 | ptrace | process_vm_readv | ancestor | reachable | - |
+| 15 | ptrace | process_vm_writev | ancestor | reachable | - |
+| 16 | ptrace | /proc/pid/mem | ancestor | reachable | - |
+| 17 | ptrace | pidfd_getfd | ancestor | reachable | - |
+| 18 | bind | pathname | sibling | reachable | - |
+| 19 | bind | abstract | sibling | reachable | - |
+| 20 | impersonation | cgroup.procs | sibling | skipped: needs delegated cgroup | - |
+| 21 | impersonation | scm_rights | sibling | reachable | - |
+| 22 | impersonation | payload_claim | sibling | reachable (oracle: control, excluded from S5) | - |
+| 23 | impersonation | clone3_CLONE_INTO_CGROUP | sibling | skipped: needs delegated cgroup | - |
+
+This matches the acceptance-3 expectation exactly: all 6 sibling ptrace rows void with an
+EPERM-class errno (5 literal `EPERM`, 1 `EACCES` — `/proc/<pid>/mem` is a VFS `open()` gated by
+the same Yama `ptrace_access_check` under the hood, but the kernel surfaces the denial as
+`EACCES` on that path rather than `EPERM`, which is still permission-denied class, not a
+different failure mode), all 6 ancestor ptrace rows reachable, and all 3 cgroup-bearing rows
+skipped under `--no-cgroup`. The kill family, both bind routes, and `scm_rights`/`payload_claim`
+all reach their non-agent baseline on this host (same-uid, no LSM loaded), which is the expected
+starting point before any agent-cgroup/BPF-LSM run (deferred to 08-05).
+
+### Truth-by-truth re-check (`must_haves.truths`, `08-02-PLAN.md` lines 28-42)
+
+1. **`cargo test`/`fmt --check`/`clippy -D warnings` clean on 1.99.1 (ADV-01).** MET. 34 tests
+   pass (30 unit + `broker_pid_rejected` + 3 in `topology_and_lifecycle`), `fmt --check` and
+   `clippy --all-targets -- -D warnings` both clean, confirmed after every commit in this gap
+   closure.
+2. **`#![deny(unsafe_code)]` crate-wide, exactly one `#[allow(unsafe_code)]` module
+   (`src/sys.rs`), every unsafe block carries `// SAFETY:` (D-13).** MET. `main.rs` line 1 is
+   `#![deny(unsafe_code)]`, line 13 is the single `#[allow(unsafe_code)] mod sys;`. `sys.rs` has
+   33 bare `unsafe` occurrences and 33 `// SAFETY:` comments (the 3-occurrence gap between that
+   and the raw `grep -c unsafe` count of 36 is three doc-comment mentions of the word, not code);
+   the two functions added for this gap closure (`pidfd_identity`, `owned_fd`) each carry their
+   own `// SAFETY:` comment.
+3. **libc `=0.2.191` pin; `sys.rs` takes `SO_PEERPIDFD`/`PIDFD_GET_INFO`/`PIDFD_INFO_CGROUPID`/
+   `pidfd_info` from libc with the 64-byte/offset-8 compile-time probe (RESEARCH A6).** MET,
+   unchanged by this gap closure — `sys.rs`'s pre-existing `pidfd_identity`-adjacent code and the
+   probe were not touched beyond adding `pidfd_identity` itself (which reuses the existing
+   `PeerIdentity`/`PIDFD_GET_INFO` plumbing) and `owned_fd`.
+4. **`sys.rs` hand-defines only `CLONE_INTO_CGROUP`, Landlock, `SYS_lsm_list_modules`, io_uring
+   structs; everything else from libc (D-13).** MET, unchanged — no new hand-defined constant was
+   added in this gap closure.
+5. **Stub HELLO/OK protocol, claimed id ignored, 4-byte LE framing, 4096 cap, unknown verbs
+   rejected (ADV-02).** MET, unchanged — `stub.rs` was not modified in this gap closure.
+6. **`list-routes` enumerates exactly the D-16 routes plus route (iv) (ADV-03, D-16).** MET.
+   `all_rows_has_23_entries_17_sibling_6_ancestor` and
+   `exactly_the_six_ptrace_routes_carry_an_ancestor_row` (both pre-existing, re-verified) and the
+   `list-routes` output captured for the measured table above both confirm 23 rows, 17 sibling +
+   6 ancestor, the six ancestor rows exactly the six ptrace routes.
+7. **Reach rule: `void (baseline failed)` when the non-agent baseline fails, `reachable` when it
+   succeeds; S5 counts only reachable rows from an agent cgroup (ADV-02, ADV-03).** MET for the
+   non-agent half, now backed by a baseline that actually exercises the real target instead of a
+   throwaway child (D1) — see the measured table. The agent-cgroup half of the S5 count is
+   BACKSTOP, deferred to 08-05 per the plan's own line 302 note; `payload_claim`'s exclusion from
+   that count (D-15) is implemented and unit-tested
+   (`payload_claim_is_excluded_from_the_s5_tally` in `report.rs`, pre-existing).
+8. **Yama `ptrace_scope` table; measured, not predicted, reach per row (ADV-02, RESEARCH A5).**
+   MET, now with a real measurement instead of the original SUMMARY's acknowledged duplicate:
+   the measured table above shows exactly the scope-1 row documented in the plan (6 sibling void,
+   6 ancestor reachable), and the real ancestor-topology fork (D2) is what makes this
+   measurement meaningful rather than a relabeled sibling run.
+9. **JSON fields and `report --merge-counters` join (ADV-03).** MET. Every row in the measured
+   table carries exactly `class, case, oracle, baseline_ok, valid, reach, errno, closable_by,
+   route, topology, family, mode, agent_result, deny_counter_delta, ptrace_scope` (confirmed by
+   inspecting the raw JSONL); the `errno` field is now populated with a real value on failure
+   (D5) rather than always `null`.
+10. **S1 skeleton, ~8 cases, one per class, "0 of about 8 is not evidence of completeness"
+    (ADV-01, D-17).** MET, unchanged — `cases.rs` was not modified in this gap closure (out of
+    scope per the dispatch instructions); its pre-existing behavior and tests are untouched. See
+    "Additional defects found, not fixed" below for two `cases.rs`-adjacent issues this gap
+    closure surfaced but did not fix.
+11. **`--topology sibling|ancestor` full D2 semantics, stub restart before every row,
+    `ptrace_scope` read once, `--no-cgroup` skip rule (ADV-02).** MET. This is the core of D2/D3;
+    see those sections above and `tests/topology_and_lifecycle.rs`.
+12. **Every target spawned and pidfd-tracked by the suite; never `kill(0)`/`kill(-1)`;
+    `cgroup.kill` asserted under `/sys/fs/cgroup/aok-phase8/adv/` (ADV-02 safety).** MET with one
+    caveat: every target's pid now genuinely originates from a `Command::spawn()` this suite
+    issued (D1), and `sys::kill`/`tgkill`/`rt_sigqueueinfo` never take a hardcoded `0`/`-1`.
+    "pidfd-tracked" applies literally to the routes whose own definition is pidfd-based
+    (`pidfd_send_signal`, `pidfd_getfd`, and the clone3 route's returned pidfd); the plain
+    `kill`/`tgkill`/`rt_sigqueueinfo` routes signal `target.pid` directly, which is correct for
+    testing those specific syscalls rather than a gap. `assert_cgroup_kill_path`'s prefix guard
+    is unchanged and still covers every cgroup write, including the two new placement call sites
+    added for D4.
+13. **(backstop) Non-agent baseline of every ADV-01 case and ADV-02 route succeeds on the
+    reference host, proving a real path; a non-succeeding case is marked invalid and excluded.**
+    BACKSTOP, formally deferred to 08-05. Informally exercised during this gap closure on this
+    dev host (not the project's designated reference host) — see the measured table. Read
+    literally against that table, the 6 sibling ptrace rows do *not* succeed; that is the
+    expected, documented Yama behavior from truth 8, not an "invalid" case needing exclusion —
+    the two truths use "baseline" in compatible but not identical senses (D-16's reach rule vs.
+    this truth's path-reachability claim), which this gap closure did not need to reconcile
+    since both are consistent with what actually measured.
+14. **(backstop) Agent-cgroup BPF-LSM `deny_counter_delta` per route, reference host.**
+    BACKSTOP, deferred to 08-05 as before. Not exercised in this gap closure (no BPF-LSM hooks
+    loaded on this host).
+15. **(backstop) The `PIDFD_GET_INFO` read-then-act race is named in the report, not hidden.**
+    BACKSTOP/unchanged — `report.rs`'s report text (not touched in this gap closure) already
+    carries the "Read-then-act race" line per the original Task 3 implementation.
+
+### Deviations chosen (gap closure)
+
+- The stub is placed in the broker leaf for `cgroup.kill` even in non-agent mode, whenever that
+  row actually needs a cgroup; placement is otherwise a no-op outside agent mode.
+- Placement uses `cgroup.procs` writes (`routes::place_in_cgroup`) for the attacker/stub/helper,
+  not `clone3 CLONE_INTO_CGROUP` — that flag is reserved for route (iv)'s own test subject, a
+  fresh clone3 child, not for placing the suite's own already-running processes.
+- `--no-cgroup` with `--mode agent` degrades to no placement at all (consistent with D-16's
+  existing `--no-cgroup` skip rule for cgroup-bearing routes).
+- The `--socket` string doubles as the abstract-namespace name for the `abstract` route and for
+  `payload_claim`'s stand-in socket; `run`'s flag set has no separate `--abstract-name` (restated
+  from the original SUMMARY's Decisions section, unchanged).
+- The S1 case suite is suppressed whenever `--routes` is given to `run`, so a route-focused
+  invocation (which `bpflsm.sh`'s `mode_adv` always is — see below) never also re-runs and
+  re-appends all 8 cases to the output file on every row.
+- `dispatch_attempt` passes `None` for `scm_rights`'s `agent_b_dir` argument (the identity check
+  against a specific cgroup is only exercised when a caller passes `Some`, which `dispatch_attempt`
+  itself never does); see "Additional defects found, not fixed" below.
+- `AOK_ADV_TEST_PAUSE_MS` is a test-only environment-variable hook in the hidden `attempt`
+  subcommand, read only when set, used by `tests/topology_and_lifecycle.rs` to observe the
+  ancestor stub's parentage before the route attempt can affect it.
+
+### Additional defects found, not fixed (outside this plan's five, per dispatch instructions)
+
+1. **`cases.rs`'s S1 suite ignores `--mode` entirely.** `run_all_cases` takes no mode parameter;
+   the 8 S1 cases run identically whether `--mode` is `baseline`, `agent`, or `nonagent`. Agent
+   mode is a pure label for the case suite, exactly as the original SUMMARY's Known Stub #1
+   described for topology before this gap closure fixed that for the *route* table. Not fixed:
+   `cases.rs` is outside this gap closure's scope.
+2. **`bpflsm.sh`'s `mode_adv` never passes `--cases` or omits `--routes`.** Reading
+   `tools/bpflsm/bpflsm.sh`'s `mode_adv` (lines ~787-822, read-only, not modified): it calls `run
+   --routes "$route" --topology "$topo" --mode "$m" ...` once per `list-routes` row and never
+   once without `--routes`. Combined with this gap closure's "suppress cases when `--routes` is
+   given" deviation (chosen specifically to stop 184 duplicate case rows — 8 cases x 23
+   wrapper-invoked rows — from being appended to `$m.jsonl`, which is what the pre-fix,
+   non-suppressing code would have done), the wrapper's `--adv` mode never produces any S1 case
+   rows in its output at all. Whether the S1 case suite is meant to be wired into `mode_adv`
+   through a separate invocation, a different wrapper mode, or not at all, is not resolved by
+   this gap closure and is not a `tools/bpflsm/bpflsm.sh` change I am authorized to make under
+   this dispatch's constraints; flagging for the plan/phase that owns that wiring.
+
+### Verified (command and result)
+
+- `cd tools/aok-adv && cargo test`: 34 tests pass (30 unit across `main.rs`/`routes.rs`/
+  `stub.rs`/`cases.rs`, 1 in `tests/broker_pid_rejected.rs`, 3 in `tests/topology_and_lifecycle.rs`).
+- `cargo fmt --check`: clean.
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo build --release`: succeeds.
+- `target/release/aok-adv list-routes`: 23 rows, confirmed by direct count and by the pre-existing
+  `all_rows_has_23_entries_17_sibling_6_ancestor` test.
+- All 23 `list-routes` rows run individually via the release binary with `--mode nonagent
+  --no-cgroup`, fresh socket and cgroup-root paths per row: measured table above. `ptrace_scope`
+  read as `"1"` on every row.
+- Acceptance tests (a)-(e), all added or adapted in this gap closure, pass against the fixed
+  code: (a) `kill_route_acts_on_given_pid_and_spawns_no_extra_child`, (b)
+  `sibling_topology_shares_the_runner_as_parent_for_stub_and_attacker` +
+  `ancestor_topology_makes_the_attacker_the_stubs_parent`, (c)
+  `consecutive_rows_get_a_fresh_stub_pid`, (d)
+  `payload_claim_fails_when_reply_carries_the_claimed_id`, (e)
+  `broker_pid_flag_is_rejected_with_adv05_message` +
+  `broker_pid_is_rejected_at_the_cli_with_the_adv05_message`. All five fail on the pre-fix code
+  by construction: the pre-fix binary had no `attempt` subcommand, no stub spawn from `run` at
+  all, a zero-argument `attempt_kill` that always spawned its own `sleep 5` child regardless of
+  what was passed, and a `payload_claim` that returned `Ok` on any reply without checking it —
+  none of the pre-fix code paths these tests exercise existed in a form that could pass them.
+
+### Not verified
+
+- Agent-mode placement against a real delegated cgroup v2 mount (this host has none under
+  `/sys/fs/cgroup/aok-phase8/adv/`); covered only by the injectable-tempdir unit test
+  (acceptance 4).
+- BPF-LSM denial / `deny_counter_delta` (no BPF-LSM hooks loaded on this host; backstop, 08-05).
+- The three cgroup-bearing route rows (`cgroup.kill`, `cgroup.procs`, `clone3_CLONE_INTO_CGROUP`)
+  end to end against a real cgroup: all three measured `skipped: needs delegated cgroup` on this
+  host, same as before this gap closure.
+- `scm_rights`'s agent-mode identity check (`attempt_scm_rights`'s `agent_b_dir: Some(...)` path):
+  reachable only through `dispatch_attempt` passing `Some`, which it never does (see "Additional
+  defects found" above); the `None` path (a real borrowed, connected fd obtained and used,
+  without an identity check against a specific cgroup) is what the measured table's `scm_rights`
+  row exercised.
+- Whether this dev host is the project's formally designated "reference host" for the backstop
+  truths (13-15); the measurements in this gap closure are offered as evidence gathered while
+  fixing the five defects, not as a substitute for the 08-05 reference-host run itself.
+
+### Follow-up (A/B/C)
+
+Orchestrator-dispatched follow-up on top of the four commits above (`b42f8cd`, `ac7bb69`,
+`9a7562d`, `d41103c`), independently re-verified by the orchestrator before dispatch. New
+commits: `99eec47` (fix, A+B+C's `main.rs`/`routes.rs` half), `b3faa62` (test, new
+`tests/harness_failures.rs`), `6083914` (fix, C's `report.rs` + `tools/bpflsm/bpflsm.sh` half).
+A later commit makes `kill_route_acts_on_given_pid_and_spawns_no_extra_child` race-free under
+plain `cargo test` (per-thread child count); see the Gates bullet "Correction" below.
+
+**A. A harness failure must be a hard error, not a void row. MET.**
+
+- Added `routes::harness_error`/`is_harness_error` (a marker type wrapped in `io::Error`) so a
+  harness failure is distinguishable from the attacker's own attempt result throughout the call
+  chain. `main.rs`'s `wait_for_stub_ready`, `run_one_row`, `run_attacker_subprocess`, and
+  `parse_attempt_outcome` all now return the two-level `io::Result<io::Result<()>>` shape (outer
+  = harness failure, inner = attempt outcome: `Ok`/`VOID`). `collect_records` propagates any
+  harness failure as a hard `Err` naming the row and cause, and `run_cli` only writes the output
+  file after every row has run cleanly, so a harness failure leaves no file at all (verified:
+  `over_long_socket_path_exits_nonzero_and_writes_no_row`,
+  `stub_that_exits_immediately_is_a_hard_error_not_void`,
+  `agent_mode_placement_failure_is_a_hard_error` — all three assert `!out_file.exists()` plus a
+  non-zero exit, and the first two were confirmed to fail against the pre-fix void/errno-null
+  behavior by re-reading that code path before the fix).
+  - The over-long-path repro from the dispatch (`129`-byte-class path) now fails fast:
+    `check_socket_path` rejects anything over 107 bytes before a stub is even spawned.
+  - A stub that exits immediately is caught by `wait_for_stub_ready`'s `try_wait()` check and
+    reported in well under the 5s timeout (measured: the test asserts `< 4s`).
+  - The attacker subprocess protocol gained a third stdout verdict line, `HARNESS msg=<text>`,
+    alongside the existing `REACHABLE` and `VOID errno=<n|none> msg=<text>`; `parse_attempt_outcome`
+    maps `HARNESS` and any unparseable output to the outer `Err`, never to a void row.
+- **Which void rows carry `errno: null`.** In the re-run 23-row measured table below, **zero**
+  rows are void with `errno: null`: the 6 sibling-ptrace void rows all carry a real OS errno (5 x
+  `1`/EPERM, 1 x `13`/EACCES on `/proc/pid/mem`, same as the original gap-closure table). An
+  `errno: null` void row is only possible now when the attacker's own attempt fails without an OS
+  errno to report (identity/oracle mismatches on `cgroup.procs`, `scm_rights`, `clone3_*`, or
+  `payload_claim`'s control check; a bind-marker-not-reached read; an EOF on the handoff
+  connection) — none of those conditions occurred in this run, so the measured table has none.
+
+**B. Wire `agent_b_dir` for the scm_rights route. MET.**
+
+- `scm_agent_b_dir(cgroup_root, mode, no_cgroup)` returns `Some("<cgroup_root>/agent-b")` only
+  when `mode == "agent"` and `!no_cgroup`, `None` otherwise (unit-tested:
+  `scm_agent_b_dir_is_wired_only_in_agent_mode`, all four combinations). `dispatch_attempt` passes
+  that value through to `routes::attempt_scm_rights`, which now places the scm-helper child in
+  `agent_b_dir` *before* telling it to proceed (the helper blocks on one stdin line sent only
+  after placement succeeds, and stays alive — blocked on stdin EOF — until the attempt finishes,
+  so the stub can still read the helper's placed identity when it answers).
+- Verified end to end with a real stub and a tempdir stand-in for the cgroup root (no real
+  cgroupfs needed to exercise the wiring, since the placement guard's prefix check rejects a
+  tempdir root deterministically): `scm_rights_in_agent_mode_places_the_helper_in_agent_b` sends
+  `--mode agent` and asserts the verdict is `HARNESS ... placing helper ...` — i.e. agent mode
+  *attempts* the placement and fails on the guard, rather than skipping placement and reporting
+  `REACHABLE` as the pre-fix dispatch did (confirmed by reading the pre-fix `dispatch_attempt`,
+  which passed `None` unconditionally). `scm_rights_in_nonagent_mode_is_unchanged` asserts
+  nonagent still reports plain `REACHABLE`, matching the original gap-closure table's row 21.
+- Not verified against a real delegated cgroup (none on this host, same caveat as the original
+  gap closure's "Not verified" section): the actual success path — placement succeeds, the
+  stub's reply identifies agent-b's cgroup id — is exercised only through the guard-rejection
+  branch above, not the full happy path.
+
+**C. S1 case wiring. MET.**
+
+1. `collect_records` (`main.rs`): when `--routes` is absent and `--mode agent`, no case rows run;
+   one stderr line explains agent-mode S1 needs the enforcement hooks arriving with ADV-04 and
+   Phases 11-13, and `agent_result` stays null (untested), never fabricated as a denial or a
+   success (verified: `agent_mode_s1_emits_no_case_rows_and_names_the_reason`, asserting exit 0,
+   the stderr text, and zero lines in the output file). Nonagent/baseline with no `--routes` is
+   unchanged and still runs all 8 cases (verified:
+   `nonagent_s1_still_emits_the_eight_case_rows`).
+2. `tools/bpflsm/bpflsm.sh`'s `mode_adv`: after the per-route loop, when `$m` is baseline or
+   nonagent (not `agent`), one additional call — `run_as_uid "$CGROOT/adv" "$bin" run --mode "$m"
+   --out "$TMPD/adv/cases.jsonl"` (no `--socket`, no `--routes`) — appends its output to
+   `$outdir/$m.jsonl`; a failure counts toward `failed` the same as a route row. Agent mode runs
+   none of this, matching `aok-adv`'s own skip from item 1. `dry_adv`'s heredoc documents the new
+   call and the agent-mode skip. No other function, argument parsing, or mode was touched.
+3. Verified:
+   - `bash -n tools/bpflsm/bpflsm.sh` exits 0 (syntax clean).
+   - `bash tools/bpflsm/bpflsm.sh --dry-run --adv baseline` exits 0 and prints the updated
+     `dry_adv` text, including the new "baseline|nonagent only: one more call..." block, with
+     nothing privileged touched.
+   - `aok-adv report --in nonagent.jsonl --in agent.jsonl --out r.json` (where `nonagent.jsonl` =
+     the 8 case rows + all 23 route rows from the re-run measured table below, and `agent.jsonl` =
+     the 23 route rows only, no case rows, standing in for a real agent-mode run that emits no
+     case rows per item 1) **succeeds, exit 0**. `report_text` now renders one line per case
+     (`class=... case=... valid=true agent_result=untested`) and a summary line `S1 agent column:
+     8 of 8 cases untested (agent-mode S1 needs enforcement hooks that arrive with ADV-04 and
+     Phases 11-13; untested is not a failure and is never fabricated as a denial or a success)`.
+     All 8 S1 classes show `valid=true` from the baseline and `agent_result=untested` from the
+     agent column — neither dropped nor reported as failures. This required a `report.rs` fix
+     (`report_text` previously had no per-case lines and no agent-column summary at all, only the
+     "S1 skeleton: X of Y valid" count); added and covered by a new test,
+     `merge_leaves_cases_untested_when_agent_file_has_no_case_rows`.
+
+**Gates (re-run after all three fixes, `tools/aok-adv`):**
+- `cargo test` (plain, default parallelism): 47 tests pass (36 unit in
+  `main.rs`/`routes.rs`/`stub.rs`/`cases.rs`/`report.rs`, 1 in `tests/broker_pid_rejected.rs`,
+  7 in the new `tests/harness_failures.rs`, 3 in `tests/topology_and_lifecycle.rs`), 20 of 20
+  consecutive runs green with all four test binaries reporting `ok`.
+- **Correction (earlier wording of this bullet was wrong).** It called
+  `kill_route_acts_on_given_pid_and_spawns_no_extra_child` a "pre-existing, unrelated flake" and
+  recommended `--test-threads=1`. That was an argument, not a measurement, and it was wrong: the
+  test was a defect of this plan's own acceptance (a) evidence. It counted every child of the
+  test process via `/proc/*/stat`, while the other unit tests spawn and reap children
+  concurrently in the same process, so the count raced (the orchestrator measured 7 of 8 plain
+  runs failing). Fixed in `routes.rs`: the count is now per calling thread, read from
+  `/proc/thread-self/children` (a child's Linux parent is the thread that forked it, and each
+  test runs on its own thread), and the test also asserts the thread owns exactly the target it
+  spawned. No `--test-threads=1`, no `#[ignore]`, no shared lock. Mutation check: with
+  `attempt_kill` temporarily spawning its own `sleep 5`, the test fails deterministically
+  (`left: [1513461]`, `right: [1513461, 1513463]`, "attempt_kill spawned an extra child"); the
+  mutation was reverted and `git diff` showed only the test change. Dependency: the kernel needs
+  `CONFIG_PROC_CHILDREN`; if the file is missing the test panics rather than passing vacuously.
+- `cargo fmt --check`: clean.
+- `cargo clippy --all-targets -- -D warnings`: clean (two `clippy::question_mark` findings in
+  `routes.rs`'s `attempt_bind_pathname`/`attempt_bind_abstract`, introduced by this follow-up's
+  early-return fix for A, resolved by rewriting both with `?` instead of `if result.is_err() {
+  return result; }`).
+
+**Measured 23-row end-to-end table, re-run after A/B/C (release build, `--mode nonagent
+--no-cgroup`, short socket paths under `/tmp/aok-adv-e2e2/rN/s.sock`, all under 100 bytes):**
+identical to the original gap-closure table above in every `reach`/`errno` value — this
+follow-up changed harness-failure and agent-mode behavior, not the non-agent baseline path, so no
+regression is expected or observed. Full per-row detail is in the original table; the `errno`
+column was re-confirmed row by row (see "Which void rows carry `errno: null`" above).
+
+**8-case baseline output (new artifact, `aok-adv run --mode nonagent --out cases.jsonl`, no
+`--socket`/`--routes`):** all 8 classes (`files`, `network`, `tools`, `other agents`, `model`,
+`io_uring`, `API key`, `shell-out`) ran with `baseline_ok: true`, `valid: true`. Exit 0.
+
+**Not verified (follow-up-specific, in addition to the original gap closure's list):**
+- `scm_rights`'s agent-mode *success* path (placement succeeds, stub's reply matches agent-b's
+  cgroup id): only the guard-rejection branch was exercised, since this host has no delegated
+  cgroup for a real placement to succeed against.
+- `aok-adv report`'s agent-mode route-column behavior against a real agent-mode run's own output
+  (the `agent.jsonl` used above is the nonagent route rows relabeled, standing in for "route rows
+  only, no case rows" per the dispatch's wording — it demonstrates the join-key and
+  case/untested-column behavior the dispatch asked for, not a real BPF-LSM agent run's
+  `agent_result` values, which remain BACKSTOP/08-05 as before).
+- `bpflsm.sh --adv baseline` end to end as root with real cgroups (needs uid 0 and a host with
+  BPF LSM; this follow-up only ran `--dry-run` and `bash -n`, per the same no-root constraint as
+  the rest of this gap closure).
