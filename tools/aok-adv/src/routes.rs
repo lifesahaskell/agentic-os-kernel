@@ -1000,6 +1000,11 @@ mod tests {
     /// D5/acceptance (a): the kill route acts on the given pid and only
     /// that pid. Fails on the pre-fix code, which spawned its own `sleep 5`
     /// child inside `attempt_kill` regardless of what was passed in.
+    ///
+    /// The count is per calling thread (`/proc/thread-self/children`), not per
+    /// process: the Linux parent of a spawned child is the thread that forked
+    /// it, and every test runs on its own thread, so children that other
+    /// unit tests spawn and reap concurrently never appear in this count.
     #[test]
     fn kill_route_acts_on_given_pid_and_spawns_no_extra_child() {
         let mut child = Command::new("/bin/sh")
@@ -1009,14 +1014,19 @@ mod tests {
             .expect("spawn a target this test owns");
         let pid = child.id() as libc::pid_t;
 
-        let children_before = count_children_of(std::process::id() as libc::pid_t);
+        let children_before = children_of_this_thread();
+        assert_eq!(
+            children_before,
+            vec![pid],
+            "this thread should own exactly the target it just spawned"
+        );
         let target = Target {
             pid,
             socket_path: String::new(),
             abstract_name: None,
         };
         attempt_kill(&target).expect("kill route against the given target");
-        let children_after = count_children_of(std::process::id() as libc::pid_t);
+        let children_after = children_of_this_thread();
 
         assert_eq!(
             children_before, children_after,
@@ -1030,39 +1040,18 @@ mod tests {
         );
     }
 
-    /// Count this test process's own live children by reading `/proc/*/stat`
-    /// field 4 (ppid), so the no-extra-spawn assertion above does not depend
-    /// on a shell helper.
-    fn count_children_of(parent_pid: libc::pid_t) -> usize {
-        let mut count = 0;
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return 0;
-        };
-        for entry in entries.flatten() {
-            let Some(pid_str) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if pid_str.parse::<i32>().is_err() {
-                continue;
-            }
-            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-                continue;
-            };
-            // Field 4 is ppid; field 2 (comm) may itself contain spaces
-            // inside parens, so split after the closing paren.
-            let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
-                continue;
-            };
-            let fields: Vec<&str> = after_comm.split_whitespace().collect();
-            // fields[0] is state, fields[1] is ppid (field 4 overall).
-            if let Some(ppid_str) = fields.get(1)
-                && let Ok(ppid) = ppid_str.parse::<libc::pid_t>()
-                && ppid == parent_pid
-            {
-                count += 1;
-            }
-        }
-        count
+    /// Pids of the live children that the calling thread itself forked, from
+    /// `/proc/thread-self/children` (needs `CONFIG_PROC_CHILDREN`; a missing
+    /// file is a hard failure, not an empty list).
+    fn children_of_this_thread() -> Vec<libc::pid_t> {
+        let text = std::fs::read_to_string("/proc/thread-self/children")
+            .expect("/proc/thread-self/children (kernel needs CONFIG_PROC_CHILDREN)");
+        let mut pids: Vec<libc::pid_t> = text
+            .split_whitespace()
+            .map(|p| p.parse().expect("child pid"))
+            .collect();
+        pids.sort_unstable();
+        pids
     }
 
     #[test]

@@ -566,6 +566,8 @@ Orchestrator-dispatched follow-up on top of the four commits above (`b42f8cd`, `
 `9a7562d`, `d41103c`), independently re-verified by the orchestrator before dispatch. New
 commits: `99eec47` (fix, A+B+C's `main.rs`/`routes.rs` half), `b3faa62` (test, new
 `tests/harness_failures.rs`), `6083914` (fix, C's `report.rs` + `tools/bpflsm/bpflsm.sh` half).
+A later commit makes `kill_route_acts_on_given_pid_and_spawns_no_extra_child` race-free under
+plain `cargo test` (per-thread child count); see the Gates bullet "Correction" below.
 
 **A. A harness failure must be a hard error, not a void row. MET.**
 
@@ -652,13 +654,24 @@ commits: `99eec47` (fix, A+B+C's `main.rs`/`routes.rs` half), `b3faa62` (test, n
      `merge_leaves_cases_untested_when_agent_file_has_no_case_rows`.
 
 **Gates (re-run after all three fixes, `tools/aok-adv`):**
-- `cargo test`: 47 tests pass (36 unit in `main.rs`/`routes.rs`/`stub.rs`/`cases.rs`/`report.rs`,
-  1 in `tests/broker_pid_rejected.rs`, 7 in the new `tests/harness_failures.rs`, 3 in
-  `tests/topology_and_lifecycle.rs`) — run single-threaded (`-- --test-threads=1`) to avoid a
-  pre-existing, unrelated flake in `kill_route_acts_on_given_pid_and_spawns_no_extra_child`
-  (a process-child-count race against other tests' own spawned children when run in parallel;
-  confirmed pre-existing by reverting to `HEAD~3` conceptually — it reproduces identically before
-  any follow-up edit, and passes reliably alone or under `--test-threads=1`; not touched by A/B/C).
+- `cargo test` (plain, default parallelism): 47 tests pass (36 unit in
+  `main.rs`/`routes.rs`/`stub.rs`/`cases.rs`/`report.rs`, 1 in `tests/broker_pid_rejected.rs`,
+  7 in the new `tests/harness_failures.rs`, 3 in `tests/topology_and_lifecycle.rs`), 20 of 20
+  consecutive runs green with all four test binaries reporting `ok`.
+- **Correction (earlier wording of this bullet was wrong).** It called
+  `kill_route_acts_on_given_pid_and_spawns_no_extra_child` a "pre-existing, unrelated flake" and
+  recommended `--test-threads=1`. That was an argument, not a measurement, and it was wrong: the
+  test was a defect of this plan's own acceptance (a) evidence. It counted every child of the
+  test process via `/proc/*/stat`, while the other unit tests spawn and reap children
+  concurrently in the same process, so the count raced (the orchestrator measured 7 of 8 plain
+  runs failing). Fixed in `routes.rs`: the count is now per calling thread, read from
+  `/proc/thread-self/children` (a child's Linux parent is the thread that forked it, and each
+  test runs on its own thread), and the test also asserts the thread owns exactly the target it
+  spawned. No `--test-threads=1`, no `#[ignore]`, no shared lock. Mutation check: with
+  `attempt_kill` temporarily spawning its own `sleep 5`, the test fails deterministically
+  (`left: [1513461]`, `right: [1513461, 1513463]`, "attempt_kill spawned an extra child"); the
+  mutation was reverted and `git diff` showed only the test change. Dependency: the kernel needs
+  `CONFIG_PROC_CHILDREN`; if the file is missing the test panics rather than passing vacuously.
 - `cargo fmt --check`: clean.
 - `cargo clippy --all-targets -- -D warnings`: clean (two `clippy::question_mark` findings in
   `routes.rs`'s `attempt_bind_pathname`/`attempt_bind_abstract`, introduced by this follow-up's
