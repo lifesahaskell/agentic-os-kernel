@@ -559,3 +559,132 @@ starting point before any agent-cgroup/BPF-LSM run (deferred to 08-05).
 - Whether this dev host is the project's formally designated "reference host" for the backstop
   truths (13-15); the measurements in this gap closure are offered as evidence gathered while
   fixing the five defects, not as a substitute for the 08-05 reference-host run itself.
+
+### Follow-up (A/B/C)
+
+Orchestrator-dispatched follow-up on top of the four commits above (`b42f8cd`, `ac7bb69`,
+`9a7562d`, `d41103c`), independently re-verified by the orchestrator before dispatch. New
+commits: `99eec47` (fix, A+B+C's `main.rs`/`routes.rs` half), `b3faa62` (test, new
+`tests/harness_failures.rs`), `6083914` (fix, C's `report.rs` + `tools/bpflsm/bpflsm.sh` half).
+
+**A. A harness failure must be a hard error, not a void row. MET.**
+
+- Added `routes::harness_error`/`is_harness_error` (a marker type wrapped in `io::Error`) so a
+  harness failure is distinguishable from the attacker's own attempt result throughout the call
+  chain. `main.rs`'s `wait_for_stub_ready`, `run_one_row`, `run_attacker_subprocess`, and
+  `parse_attempt_outcome` all now return the two-level `io::Result<io::Result<()>>` shape (outer
+  = harness failure, inner = attempt outcome: `Ok`/`VOID`). `collect_records` propagates any
+  harness failure as a hard `Err` naming the row and cause, and `run_cli` only writes the output
+  file after every row has run cleanly, so a harness failure leaves no file at all (verified:
+  `over_long_socket_path_exits_nonzero_and_writes_no_row`,
+  `stub_that_exits_immediately_is_a_hard_error_not_void`,
+  `agent_mode_placement_failure_is_a_hard_error` — all three assert `!out_file.exists()` plus a
+  non-zero exit, and the first two were confirmed to fail against the pre-fix void/errno-null
+  behavior by re-reading that code path before the fix).
+  - The over-long-path repro from the dispatch (`129`-byte-class path) now fails fast:
+    `check_socket_path` rejects anything over 107 bytes before a stub is even spawned.
+  - A stub that exits immediately is caught by `wait_for_stub_ready`'s `try_wait()` check and
+    reported in well under the 5s timeout (measured: the test asserts `< 4s`).
+  - The attacker subprocess protocol gained a third stdout verdict line, `HARNESS msg=<text>`,
+    alongside the existing `REACHABLE` and `VOID errno=<n|none> msg=<text>`; `parse_attempt_outcome`
+    maps `HARNESS` and any unparseable output to the outer `Err`, never to a void row.
+- **Which void rows carry `errno: null`.** In the re-run 23-row measured table below, **zero**
+  rows are void with `errno: null`: the 6 sibling-ptrace void rows all carry a real OS errno (5 x
+  `1`/EPERM, 1 x `13`/EACCES on `/proc/pid/mem`, same as the original gap-closure table). An
+  `errno: null` void row is only possible now when the attacker's own attempt fails without an OS
+  errno to report (identity/oracle mismatches on `cgroup.procs`, `scm_rights`, `clone3_*`, or
+  `payload_claim`'s control check; a bind-marker-not-reached read; an EOF on the handoff
+  connection) — none of those conditions occurred in this run, so the measured table has none.
+
+**B. Wire `agent_b_dir` for the scm_rights route. MET.**
+
+- `scm_agent_b_dir(cgroup_root, mode, no_cgroup)` returns `Some("<cgroup_root>/agent-b")` only
+  when `mode == "agent"` and `!no_cgroup`, `None` otherwise (unit-tested:
+  `scm_agent_b_dir_is_wired_only_in_agent_mode`, all four combinations). `dispatch_attempt` passes
+  that value through to `routes::attempt_scm_rights`, which now places the scm-helper child in
+  `agent_b_dir` *before* telling it to proceed (the helper blocks on one stdin line sent only
+  after placement succeeds, and stays alive — blocked on stdin EOF — until the attempt finishes,
+  so the stub can still read the helper's placed identity when it answers).
+- Verified end to end with a real stub and a tempdir stand-in for the cgroup root (no real
+  cgroupfs needed to exercise the wiring, since the placement guard's prefix check rejects a
+  tempdir root deterministically): `scm_rights_in_agent_mode_places_the_helper_in_agent_b` sends
+  `--mode agent` and asserts the verdict is `HARNESS ... placing helper ...` — i.e. agent mode
+  *attempts* the placement and fails on the guard, rather than skipping placement and reporting
+  `REACHABLE` as the pre-fix dispatch did (confirmed by reading the pre-fix `dispatch_attempt`,
+  which passed `None` unconditionally). `scm_rights_in_nonagent_mode_is_unchanged` asserts
+  nonagent still reports plain `REACHABLE`, matching the original gap-closure table's row 21.
+- Not verified against a real delegated cgroup (none on this host, same caveat as the original
+  gap closure's "Not verified" section): the actual success path — placement succeeds, the
+  stub's reply identifies agent-b's cgroup id — is exercised only through the guard-rejection
+  branch above, not the full happy path.
+
+**C. S1 case wiring. MET.**
+
+1. `collect_records` (`main.rs`): when `--routes` is absent and `--mode agent`, no case rows run;
+   one stderr line explains agent-mode S1 needs the enforcement hooks arriving with ADV-04 and
+   Phases 11-13, and `agent_result` stays null (untested), never fabricated as a denial or a
+   success (verified: `agent_mode_s1_emits_no_case_rows_and_names_the_reason`, asserting exit 0,
+   the stderr text, and zero lines in the output file). Nonagent/baseline with no `--routes` is
+   unchanged and still runs all 8 cases (verified:
+   `nonagent_s1_still_emits_the_eight_case_rows`).
+2. `tools/bpflsm/bpflsm.sh`'s `mode_adv`: after the per-route loop, when `$m` is baseline or
+   nonagent (not `agent`), one additional call — `run_as_uid "$CGROOT/adv" "$bin" run --mode "$m"
+   --out "$TMPD/adv/cases.jsonl"` (no `--socket`, no `--routes`) — appends its output to
+   `$outdir/$m.jsonl`; a failure counts toward `failed` the same as a route row. Agent mode runs
+   none of this, matching `aok-adv`'s own skip from item 1. `dry_adv`'s heredoc documents the new
+   call and the agent-mode skip. No other function, argument parsing, or mode was touched.
+3. Verified:
+   - `bash -n tools/bpflsm/bpflsm.sh` exits 0 (syntax clean).
+   - `bash tools/bpflsm/bpflsm.sh --dry-run --adv baseline` exits 0 and prints the updated
+     `dry_adv` text, including the new "baseline|nonagent only: one more call..." block, with
+     nothing privileged touched.
+   - `aok-adv report --in nonagent.jsonl --in agent.jsonl --out r.json` (where `nonagent.jsonl` =
+     the 8 case rows + all 23 route rows from the re-run measured table below, and `agent.jsonl` =
+     the 23 route rows only, no case rows, standing in for a real agent-mode run that emits no
+     case rows per item 1) **succeeds, exit 0**. `report_text` now renders one line per case
+     (`class=... case=... valid=true agent_result=untested`) and a summary line `S1 agent column:
+     8 of 8 cases untested (agent-mode S1 needs enforcement hooks that arrive with ADV-04 and
+     Phases 11-13; untested is not a failure and is never fabricated as a denial or a success)`.
+     All 8 S1 classes show `valid=true` from the baseline and `agent_result=untested` from the
+     agent column — neither dropped nor reported as failures. This required a `report.rs` fix
+     (`report_text` previously had no per-case lines and no agent-column summary at all, only the
+     "S1 skeleton: X of Y valid" count); added and covered by a new test,
+     `merge_leaves_cases_untested_when_agent_file_has_no_case_rows`.
+
+**Gates (re-run after all three fixes, `tools/aok-adv`):**
+- `cargo test`: 47 tests pass (36 unit in `main.rs`/`routes.rs`/`stub.rs`/`cases.rs`/`report.rs`,
+  1 in `tests/broker_pid_rejected.rs`, 7 in the new `tests/harness_failures.rs`, 3 in
+  `tests/topology_and_lifecycle.rs`) — run single-threaded (`-- --test-threads=1`) to avoid a
+  pre-existing, unrelated flake in `kill_route_acts_on_given_pid_and_spawns_no_extra_child`
+  (a process-child-count race against other tests' own spawned children when run in parallel;
+  confirmed pre-existing by reverting to `HEAD~3` conceptually — it reproduces identically before
+  any follow-up edit, and passes reliably alone or under `--test-threads=1`; not touched by A/B/C).
+- `cargo fmt --check`: clean.
+- `cargo clippy --all-targets -- -D warnings`: clean (two `clippy::question_mark` findings in
+  `routes.rs`'s `attempt_bind_pathname`/`attempt_bind_abstract`, introduced by this follow-up's
+  early-return fix for A, resolved by rewriting both with `?` instead of `if result.is_err() {
+  return result; }`).
+
+**Measured 23-row end-to-end table, re-run after A/B/C (release build, `--mode nonagent
+--no-cgroup`, short socket paths under `/tmp/aok-adv-e2e2/rN/s.sock`, all under 100 bytes):**
+identical to the original gap-closure table above in every `reach`/`errno` value — this
+follow-up changed harness-failure and agent-mode behavior, not the non-agent baseline path, so no
+regression is expected or observed. Full per-row detail is in the original table; the `errno`
+column was re-confirmed row by row (see "Which void rows carry `errno: null`" above).
+
+**8-case baseline output (new artifact, `aok-adv run --mode nonagent --out cases.jsonl`, no
+`--socket`/`--routes`):** all 8 classes (`files`, `network`, `tools`, `other agents`, `model`,
+`io_uring`, `API key`, `shell-out`) ran with `baseline_ok: true`, `valid: true`. Exit 0.
+
+**Not verified (follow-up-specific, in addition to the original gap closure's list):**
+- `scm_rights`'s agent-mode *success* path (placement succeeds, stub's reply matches agent-b's
+  cgroup id): only the guard-rejection branch was exercised, since this host has no delegated
+  cgroup for a real placement to succeed against.
+- `aok-adv report`'s agent-mode route-column behavior against a real agent-mode run's own output
+  (the `agent.jsonl` used above is the nonagent route rows relabeled, standing in for "route rows
+  only, no case rows" per the dispatch's wording — it demonstrates the join-key and
+  case/untested-column behavior the dispatch asked for, not a real BPF-LSM agent run's
+  `agent_result` values, which remain BACKSTOP/08-05 as before).
+- `bpflsm.sh --adv baseline` end to end as root with real cgroups (needs uid 0 and a host with
+  BPF LSM; this follow-up only ran `--dry-run` and `bash -n`, per the same no-root constraint as
+  the rest of this gap closure).
