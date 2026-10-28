@@ -223,7 +223,8 @@ milestone does not build. A fork candidate enters scope only through FORK-02.
 - **Privileged environment source** (ENV-01) and **reference kernel** (ENV-02).
 - **S2 task suite** (MED-06): no document defines it.
 - **os-test commit** for POSX-01 and POSX-02. A pin exists in the B3 stack notes; scoping-linux.md names no commit.
-- **Phase 7 anchor.** Its 2026-10-25 "post-MVP" decision was tied to the dropped Phase 6.
+- **Phase 15 spikes** (Phase 7 retired 2026-10-27). Whether S4 runs before Phase 14 so that DEC-04
+  can use it, and whether K1 to K4 are restated against Linux or dropped.
 - **PROJECT.md rewrite.** Its core value, constraints and key decisions describe the archived design.
 - **Phase 2 UAT.** Tests 4 and 5 are pending on a superseded phase: close them as superseded, or finish them on the archived tree.
 

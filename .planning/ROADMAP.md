@@ -8,8 +8,9 @@
   `archive/ostd-b2-spike`, commit `1f1333e`.
 - **Linux prototype** (Phases 8-14): current. ADR 0004 (status Proposed) and
   [scoping-linux.md](../docs/architecture/scoping-linux.md).
-- **Recursion and cheap-inference spikes** (Phase 7): a separate track, on neither milestone's
-  critical path. Unscheduled until the user re-anchors it (see Phase 7).
+- **Recursion and cheap-inference spikes** (Phase 15): follows the Linux prototype, on no critical
+  path. Phase 7 held the same spikes and was retired 2026-10-27, because its anchor (the dropped
+  B3 Phase 6) no longer exists.
 
 ## Overview
 
@@ -99,8 +100,10 @@ departure is *(interpretation)*.
      path Phase 14 charges inference against.
    - The hard dependency of Phase 14 is Phase 10. Phase 14 can run beside Phases 11 to 13 if the
      user wants.
-7. **Phase 7 stays a separate track, with its dependencies restated in its entry.** Its goal and
-   source are unchanged and its directory is untouched.
+7. **The spikes follow the prototype as Phase 15; Phase 7 is retired, not renumbered away.**
+   *(interpretation)* Removing Phase 7 with renumbering would have turned Phases 8-14 into 7-13,
+   and REQUIREMENTS.md cites them by number 53 times. Phase 15 carries Phase 7's goal and source
+   with its dependencies restated against the Linux phases.
 
 **Mapping rule.** Each requirement maps to the phase that first builds or decides it. Thresholds
 are read against the S row as DEC-01 and DEC-02 record it. Until then, every number in a success
@@ -116,8 +119,8 @@ to 13 cannot complete without it.
 **Phase Numbering:**
 - Integer phases (1, 2, 3): planned milestone work
 - Decimal phases (8.1, 8.2): urgent insertions (marked with INSERTED)
-- Numbers are never reused. 1-6 belong to the archived milestone, 7 is the separate track, and the
-  Linux prototype starts at 8.
+- Numbers are never reused. 1-6 belong to the archived milestone, 7 was retired on 2026-10-27 (its
+  spikes continue as Phase 15), and the Linux prototype is 8-14.
 
 ### Linux prototype (current)
 
@@ -129,9 +132,10 @@ to 13 cannot complete without it.
 - [ ] **Phase 13: Fork decision gate** - triggers (a) to (d) scored from runs, try-first steps, candidate and LTS pin if a fork is indicated
 - [ ] **Phase 14: Inference scheduling and admission control** - local or remote backend, one accounted queue, S7, S8, shared-daemon memory attribution
 
-### Separate track
+### After the Linux prototype
 
-- [ ] **Phase 7: Recursion and cheap-inference spikes** - containment, first self-improvement loop, ignition and reward-hacking measurement, 16 GB inference baseline (unscheduled; re-anchor pending)
+- [ ] **Phase 15: Recursion and cheap-inference spikes on the Linux prototype** - containment, first self-improvement loop, ignition and reward-hacking measurement, 16 GB inference baseline (retired Phase 7, re-anchored)
+- ~~Phase 7: Recursion and cheap-inference spikes~~ - retired 2026-10-27, moved to Phase 15
 
 <details>
 <summary>Archived milestone B3 (microkernel), Phases 1-6: archived 2026-10-27, superseded by ADR 0004</summary>
@@ -193,24 +197,7 @@ and is "proposed, awaiting user acceptance" until DEC-01 or DEC-02 records other
 
 ### Phase 7: Recursion and cheap-inference spikes
 
-**Goal:** As the researcher, I want the recursion and cheap-GPU inference spikes run after the B3 MVP, so that I know whether a contained self-improvement loop works at this scale before building on it.
-**Note on the goal:** The goal is kept verbatim. "After the B3 MVP" is superseded: the B3 MVP will not happen. The restated Depends on line below governs.
-**Depends on:** Unanchored. The 2026-10-25 decision tied this phase to Phase 6 ("post-MVP: nothing here is scheduled before Phase 6 completes"), and Phase 6 is dropped. Re-anchoring is a user decision; until then nothing here is scheduled. Restated per spike, from the source document:
-  - S0 (containment) needs no roadmap phase: the source specifies a throwaway git worktree inside a container. *(interpretation)* The Phase 9 launcher could serve as that sandbox, with the grader and held-out tasks outside the agent's Landlock grant. That would make S0 depend on Phase 9.
-  - S1 to S3 need S0 to pass first (S2 and S3 also need S1).
-  - S4 and S7 need a 16 GB card: the source's hardware envelope names an RTX 5070 Ti or an RX 9070 XT. No document in this repo records either card on this host. *(interpretation)* S4's numbers would inform DEC-04, local GPU or remote API.
-  - S5 and S6 depend on S1, which the source's ordering sentence does not say. S5 replays agent turns recorded in S1, and S6 gates on the seed spread of the S1 task set. "S4 to S6 are independent of S0" therefore holds only for S4.
-  - K1 (compute-unit accounting) now lands in the broker: BRK-04, INF-02, and the context-unit decision in Phase 14 *(interpretation)*.
-  - K2 is written against the B2 endpoint, and K3 against OSTD ktests in QEMU. Both are archived substrates, so each needs restating against the Linux prototype or dropping. That is a user decision.
-  - K4 (KV cache as a managed resource) maps onto ADM-01 and ADM-03 *(interpretation)*.
-  - The source is internally inconsistent: its section 4 says K1 to K3 consume S4 numbers, and its section 5 says K1 to K4 run after S4 and S7.
-**Requirements:** TBD
-**Source:** [recursion-and-cheap-inference-spikes.md](../docs/architecture/research/recursion-and-cheap-inference-spikes.md). Thresholds there are *proposed*; each spike measures its baseline first and fixes the threshold before the experiment.
-**Order:** S0 (containment) gates S1 to S3. S4 to S6 are independent of S0. K1 to K3 are design-only and consume S4 numbers. (Kept as written; see the restated dependencies above for where this line is wrong.)
-**Plans:** 0 plans
-
-Plans:
-- [ ] TBD (run /gsd-plan-phase 7 to break down)
+**Status:** Retired 2026-10-27, never planned: 0 plans, no requirements. Its anchor, "after Phase 6" (decided 2026-10-25), went when B3 was archived. Goal, source and restated dependencies moved to Phase 15. The number is not reused, and Phases 8-14 keep theirs. Its directory held only `.gitkeep` and was deleted.
 
 ### Phase 8: Reference environment, early falsifiers and threshold gate
 
@@ -386,15 +373,41 @@ Plans:
 **Research:**
   - S8 needs a memory-pressure generator and an observer, which the baseline harness lacks (linux-baseline.md section 8).
   - Choose the backend per DEC-04.
-  - Use Phase 7 S4 numbers if that spike has run.
+  - Phase 15's S4 numbers follow this phase, so DEC-04 cannot use them unless S4 is run first (see Phase 15).
 **Decisions due:** DEC-04. DEC-05. The context-capacity unit, tokens or bytes (gap analysis 4a).
 **Plans:** TBD
+
+### Phase 15: Recursion and cheap-inference spikes on the Linux prototype
+
+**Goal:** As the researcher, I want the recursion and cheap-GPU inference spikes run on the Linux prototype, so that I know whether a contained self-improvement loop works at this scale before building on it.
+**Note on the goal:** Carried from retired Phase 7, whose goal read "after the B3 MVP". The B3 MVP will not happen, so "on the Linux prototype" replaces it.
+**Mode:** standard *(interpretation: each spike ends in a recorded measurement, not a vertical slice)*
+**Depends on:** Phase 14, the last phase of the Linux prototype. Restated per spike, from the source document:
+  - S0 (containment) needs no roadmap phase: the source specifies a throwaway git worktree inside a container. *(interpretation)* The Phase 9 launcher could serve as that sandbox, with the grader and held-out tasks outside the agent's Landlock grant, and Phase 11 would add BPF-LSM mediation. Either route makes S0 depend on those phases.
+  - S1 to S3 need S0 to pass first (S2 and S3 also need S1).
+  - S4 and S7 need a 16 GB card: the source's hardware envelope names an RTX 5070 Ti or an RX 9070 XT. No document in this repo records either card on this host. S7 also follows S4.
+  - S5 and S6 depend on S1, which the source's ordering sentence does not say. S5 replays agent turns recorded in S1, and S6 gates on the seed spread of the S1 task set. "S4 to S6 are independent of S0" therefore holds only for S4.
+  - **S4 now follows DEC-04.** Phase 7 expected S4's numbers to inform DEC-04 (local GPU or remote API). DEC-04 is decided in Phase 14, so S4 cannot inform it from here unless S4 runs before Phase 14. S4 needs only the card, so it can. Moving it is a user decision.
+  - K1 (compute-unit accounting) landed in the broker and Phase 14: BRK-04, INF-02 and the context-unit decision. K4 (KV cache as a managed resource) maps onto ADM-01 and ADM-03. *(interpretation)* Both are built or decided by Phase 14, so what remains is checking them against the S4 and S7 numbers, or dropping them. That is a user decision.
+  - K2 is written against the B2 endpoint, and K3 against OSTD ktests in QEMU. Both are archived substrates, so each needs restating against the Linux prototype or dropping. That is a user decision.
+  - The source is internally inconsistent: its section 4 says K1 to K3 consume S4 numbers, and its section 5 says K1 to K4 run after S4 and S7.
+**Requirements:** TBD
+**Source:** [recursion-and-cheap-inference-spikes.md](../docs/architecture/research/recursion-and-cheap-inference-spikes.md). Thresholds there are *proposed*; each spike measures its baseline first and fixes the threshold before the experiment. Success criteria are TBD until `/gsd-plan-phase 15`.
+**Order:** S0 gates S1, and S1 gates S2, S3, S5 and S6. S4 gates S7. The S0 chain and the S4 chain are independent of each other.
+**What would show this was the wrong thing to do** (from the source):
+  - **S0 hits its kill condition.** If the grader needs files the agent must also read, the split is redesigned before any loop runs, and S1 to S3 do not start.
+  - **S2 shows no ignition.** The record says the improver is not improving, and nothing is built on that assumption.
+  - **A loop runs before S0 passes.** The source's one stated objection (section 6): "fully autonomous" before S0 would give the loop write access to its own measurement.
+**Decisions due:** Whether S4 runs before Phase 14. Which 16 GB card, if any, is available. K2 and K3: restate against Linux or drop. K1 and K4: check or drop.
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 15 to break down)
 
 ## Traceability
 
 | Phase | Requirements | Count |
 |-------|--------------|-------|
-| 7 | TBD (separate track) | 0 |
 | 8 | ENV-01, ENV-02, HARN-01, HARN-02, HARN-03, ADV-01, ADV-02, ADV-03, DEC-01, DEC-02, DEC-03 | 11 |
 | 9 | LNCH-01, LNCH-02, LNCH-03, LNCH-04, LNCH-05, LNCH-06 | 6 |
 | 10 | BRK-01, BRK-02, BRK-03, BRK-04, BRK-05, BRK-06, BRK-07 | 7 |
@@ -402,6 +415,7 @@ Plans:
 | 12 | ENV-03, DIST-01, DIST-02, DIST-03, POSX-01, POSX-02 | 6 |
 | 13 | FORK-01, FORK-02 | 2 |
 | 14 | DEC-04, DEC-05, INF-01, INF-02, INF-03, ADM-01, ADM-02, ADM-03 | 8 |
+| 15 | TBD (spike track) | 0 |
 
 **Coverage:** 48 of 48 v1 requirements mapped, each to exactly one phase. Unmapped: 0.
 
@@ -425,14 +439,14 @@ Plans:
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 8 → 9 → 10 → 11 → 12 → 13 → 14. Phases 9 and 10 can run before
-Phase 8 completes if ENV-01 stalls, and Phase 14 can run once Phase 10 is done (see Structure
-rationale). Phase 7 is unscheduled until re-anchored. Phases 1-6 are archived (see the archived
-milestone block above).
+Phases execute in numeric order: 8 → 9 → 10 → 11 → 12 → 13 → 14 → 15. Phases 9 and 10 can run
+before Phase 8 completes if ENV-01 stalls, and Phase 14 can run once Phase 10 is done (see
+Structure rationale). Phase 15 follows Phase 14, except that its S4 can run earlier (see Phase 15).
+Phase 7 is retired. Phases 1-6 are archived (see the archived milestone block above).
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 7. Recursion and cheap-inference spikes | 0/0 | Not started (unanchored) | - |
+| 7. Recursion and cheap-inference spikes | 0/0 | Retired (moved to Phase 15) | - |
 | 8. Reference environment, early falsifiers and threshold gate | 3/6 | In Progress | - |
 | 9. Agent launcher and containment | 0/0 | Not started | - |
 | 10. Broker | 0/0 | Not started | - |
@@ -440,3 +454,4 @@ milestone block above).
 | 12. Distro floor and POSIX non-interference | 0/0 | Not started | - |
 | 13. Fork decision gate | 0/0 | Not started | - |
 | 14. Inference scheduling and admission control | 0/0 | Not started | - |
+| 15. Recursion and cheap-inference spikes on the Linux prototype | 0/0 | Not started | - |
