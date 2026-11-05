@@ -106,6 +106,36 @@ fn remove_tree(dir: &Path) {
     }
 }
 
+/// One `name ret=R errno=E` line a ctypes probe printed.
+#[derive(Debug)]
+pub struct Line {
+    pub ret: i64,
+    pub errno: i32,
+}
+
+/// Parse the `name ret=R errno=E` lines of a probe's stdout by name.
+pub fn parse_probe(out: &str) -> std::collections::BTreeMap<String, Line> {
+    out.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let name = it.next()?;
+            let ret = it.next()?.strip_prefix("ret=")?.parse().ok()?;
+            let errno = it.next()?.strip_prefix("errno=")?.parse().ok()?;
+            Some((name.to_string(), Line { ret, errno }))
+        })
+        .collect()
+}
+
+/// The named probe line; panics with the names it did print.
+pub fn probe_line<'a>(m: &'a std::collections::BTreeMap<String, Line>, k: &str) -> &'a Line {
+    m.get(k).unwrap_or_else(|| {
+        panic!(
+            "probe printed no {k} line: {:?}",
+            m.keys().collect::<Vec<_>>()
+        )
+    })
+}
+
 static SCRATCH: AtomicU32 = AtomicU32::new(0);
 
 /// A fresh directory under the system temp dir (`/tmp`), removed on drop.

@@ -9,7 +9,6 @@
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::process::Command;
 
@@ -50,32 +49,6 @@ show("getpid", sc(39))
 show("clone3", sc(435, 0, 0))
 "#;
 
-struct Line {
-    ret: i64,
-    errno: i32,
-}
-
-fn parse(out: &str) -> BTreeMap<String, Line> {
-    out.lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            let name = it.next()?;
-            let ret = it.next()?.strip_prefix("ret=")?.parse().ok()?;
-            let errno = it.next()?.strip_prefix("errno=")?.parse().ok()?;
-            Some((name.to_string(), Line { ret, errno }))
-        })
-        .collect()
-}
-
-fn get<'a>(m: &'a BTreeMap<String, Line>, k: &str) -> &'a Line {
-    m.get(k).unwrap_or_else(|| {
-        panic!(
-            "probe printed no {k} line: {:?}",
-            m.keys().collect::<Vec<_>>()
-        )
-    })
-}
-
 #[test]
 fn errno_contract() {
     let a = Agent::new("errno");
@@ -94,8 +67,8 @@ fn errno_contract() {
         .output()
         .expect("control probe");
     assert!(c.status.success());
-    let control = parse(&String::from_utf8_lossy(&c.stdout));
-    let up = get(&control, "uring_setup");
+    let control = parse_probe(&String::from_utf8_lossy(&c.stdout));
+    let up = probe_line(&control, "uring_setup");
     assert!(
         up.ret >= 0,
         "control io_uring_setup failed (errno {}); is io_uring_disabled non-zero on this host?",
@@ -104,7 +77,7 @@ fn errno_contract() {
     // Without the filter a bad ring fd is rejected by the ring code itself
     // (MEASURED: EINVAL here), never with EPERM.
     for k in ["uring_enter", "uring_register"] {
-        let l = get(&control, k);
+        let l = probe_line(&control, k);
         assert_eq!(l.ret, -1, "control {k}");
         assert_ne!(
             l.errno,
@@ -118,13 +91,13 @@ fn errno_contract() {
         "run", "--name", &a.name, "--grant", &grant, "--", "python3", "-I", "-B", script_s,
     ]);
     assert_eq!(o.code, 0, "stderr: {}", o.stderr);
-    let m = parse(&o.stdout);
+    let m = parse_probe(&o.stdout);
     let eperm = |k: &str| {
-        let l = get(&m, k);
+        let l = probe_line(&m, k);
         assert_eq!((l.ret, l.errno), (-1, libc::EPERM), "{k}: {}", o.stdout);
     };
     let enosys = |k: &str| {
-        let l = get(&m, k);
+        let l = probe_line(&m, k);
         assert_eq!((l.ret, l.errno), (-1, libc::ENOSYS), "{k}: {}", o.stdout);
     };
     // Known-denied: EPERM where the control saw success or EBADF.
@@ -141,8 +114,8 @@ fn errno_contract() {
     enosys("far_above");
     // Allowed numbers behave normally: getpid works and clone3 (D-02) got
     // past the filter to its own argument check (size 0 is EINVAL).
-    assert!(get(&m, "getpid").ret > 0, "{}", o.stdout);
-    let c3 = get(&m, "clone3");
+    assert!(probe_line(&m, "getpid").ret > 0, "{}", o.stdout);
+    let c3 = probe_line(&m, "clone3");
     assert_eq!((c3.ret, c3.errno), (-1, libc::EINVAL), "{}", o.stdout);
 }
 
@@ -269,15 +242,15 @@ fn subset_seccomp_stage() {
         .output()
         .expect("spawn the probe under both filters");
     assert!(o.status.success(), "probe died: {:?}", o.status);
-    let m = parse(&String::from_utf8_lossy(&o.stdout));
-    let up = get(&m, "uring_setup");
+    let m = parse_probe(&String::from_utf8_lossy(&o.stdout));
+    let up = probe_line(&m, "uring_setup");
     assert_eq!(
         (up.ret, up.errno),
         (-1, libc::EPERM),
         "the allow-all filter lifted a denial: {:?}",
         String::from_utf8_lossy(&o.stdout)
     );
-    let gap = get(&m, "gap");
+    let gap = probe_line(&m, "gap");
     assert_eq!((gap.ret, gap.errno), (-1, libc::ENOSYS));
     println!("subset_seccomp stage ok");
 }
