@@ -3,17 +3,17 @@ gsd_state_version: "1.0"
 current_phase: 9
 current_phase_name: Agent launcher and containment
 status: executing
-stopped_at: Phase 9 planned (6 plans, 6 serial waves); ready to execute
-last_updated: "2026-11-05T09:33:21.392Z"
+stopped_at: Phase 9 wave 1 complete (09-01 done); wave 2 (09-02) next
+last_updated: "2026-11-05T09:36:32.319Z"
 last_activity: 2026-11-05
-last_activity_desc: Resumed; B3 resume files archived, reference-host date moved to 2026-11-19
-state_head: 2d00053e6ccb4a9a284b5f4693b05f2ff90cc5ad
+last_activity_desc: Phase 09 execution started
+state_head: 5c2d7911fcb688156dcc5fd8295494160f4760a5
 progress:
   total_phases: 8
   completed_phases: 0
   total_plans: 12
-  completed_plans: 3
-  percent: 25
+  completed_plans: 4
+  percent: 33
 ---
 
 # Project State
@@ -23,21 +23,21 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-26)
 
 **Core value:** The protection boundary knows what an agent is: authority is exactly the set of capability handles an agent holds, and the kernel stamps its identity on every message, while unmodified POSIX programs still run.
-**Current focus:** Phase 8 — Reference environment, early falsifiers and threshold gate
+**Current focus:** Phase 09 — Agent launcher and containment
 
 ## Current Position
 
-Phase: 9 (Agent launcher and containment) — PLANNED, ready to execute. 6 plans in 6 serial waves (09-01 .. 09-06).
+Phase: 09 (Agent launcher and containment) — EXECUTING, wave 2 of 6 next (09-01 done)
 Phase 8 (Reference environment, early falsifiers and threshold gate) — parked on human checkpoints. Plan 08-04 (wave 2); plans 08-01, 08-02, 08-03 done; 08-05 and 08-06 blocked on 08-04.
 Phase 8 status: 08-04 Task 1 (gate template) committed in 91a1d50. Task 2 (user types the OQ1/OQ2/OQ7 Answers in 08-GATE.md) and Task 3 (dual-boot reference host and `bpflsm.sh --probe`) are open and human-only.
-Last activity: 2026-11-05 — resumed; D-03 host date moved from 2026-11-04 to 2026-11-19
+Last activity: 2026-11-05 — Phase 09 execution started
 
-Progress: [██░░░░░░░░] 25% of planned plans in the live milestone (3 of 12: Phase 8 has 3 of 6 done, Phase 9 has 0 of 6). Phase 9 planned 2026-11-05 with plan-check override: 09-03 is sized over budget (115k vs 100k, low confidence), one warning accepted. Live milestone: Phases 8-15; Phase 7 retired; Phases 1-6 archived under `.planning/milestones/b3-microkernel/`.
+Progress: [███░░░░░░░] 33% of planned plans in the live milestone (4 of 12: Phase 8 has 3 of 6 done, Phase 9 has 1 of 6). Phase 9 planned 2026-11-05 with plan-check override: 09-03 is sized over budget (115k vs 100k, low confidence), one warning accepted. Live milestone: Phases 8-15; Phase 7 retired; Phases 1-6 archived under `.planning/milestones/b3-microkernel/`.
 
 ## Performance Metrics
 
 **Velocity:**
-- Plans completed in the live milestone: 3 (all Phase 8)
+- Plans completed in the live milestone: 4 (3 in Phase 8, 1 in Phase 9)
 - Average duration: -
 - Total execution time: -
 
@@ -46,7 +46,7 @@ Progress: [██░░░░░░░░] 25% of planned plans in the live mile
 | Phase | Plans done | Total | Avg/Plan |
 |-------|-----------|-------|----------|
 | 08 | 3 | 6 | - |
-| 09 | 0 | 6 | - |
+| 09 | 1 | 6 | - |
 
 *B3 metrics (Phase 1: 8 plans) went to the archive with the milestone.*
 
@@ -93,5 +93,5 @@ Items acknowledged and deferred at milestone close, most recent first:
 ## Session Continuity
 
 Last session: 2026-11-05T09:33:21.392Z
-Stopped at: Phase 9 planned (6 plans, 6 serial waves); ready to execute
-Resume file: .planning/phases/09-agent-launcher-and-containment/09-01-PLAN.md
+Stopped at: Phase 9 wave 1 complete (09-01 done); wave 2 (09-02) next
+Resume file: .planning/phases/09-agent-launcher-and-containment/09-02-PLAN.md
