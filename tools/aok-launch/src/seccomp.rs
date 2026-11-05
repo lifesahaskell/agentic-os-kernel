@@ -272,7 +272,7 @@ fn ins(code: u16, jt: u8, jf: u8, k: u32) -> sock_filter {
 }
 
 fn off(n: usize) -> u8 {
-    u8::try_from(n).expect("BPF jump offset fits in 8 bits")
+    n.try_into().expect("BPF jump offset fits in 8 bits")
 }
 
 /// The assembled program. It loads only `arch` and `nr`:
