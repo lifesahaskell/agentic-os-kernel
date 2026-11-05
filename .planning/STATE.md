@@ -3,17 +3,17 @@ gsd_state_version: "1.0"
 current_phase: 8
 current_phase_name: Reference environment, early falsifiers and threshold gate
 status: executing
-stopped_at: "Resumed 2026-11-05; 08-04 waits on Tasks 2-3 (both human)"
-last_updated: "2026-11-05T06:18:49.262Z"
+stopped_at: Phase 9 context gathered
+last_updated: "2026-11-05T06:40:56.954Z"
 last_activity: 2026-11-05
 last_activity_desc: Resumed; B3 resume files archived, reference-host date moved to 2026-11-19
-state_head: 51d197c7a601cfb7145d912a189ac905b69b804a
+state_head: 13bebebb74e400b9d1e3ed260671d1cfea80b1a6
 progress:
-  total_phases: 8
+  total_phases: 9
   completed_phases: 0
   total_plans: 6
   completed_plans: 3
-  percent: 50
+  percent: 0
 ---
 
 # Project State
@@ -32,7 +32,7 @@ Plan: 08-04 (wave 2). Plans 08-01, 08-02, 08-03 done; 08-05 and 08-06 blocked on
 Status: 08-04 Task 1 (gate template) committed in 91a1d50. Task 2 (user types the OQ1/OQ2/OQ7 Answers in 08-GATE.md) and Task 3 (dual-boot reference host and `bpflsm.sh --probe`) are open and human-only.
 Last activity: 2026-11-05 — resumed; D-03 host date moved from 2026-11-04 to 2026-11-19
 
-Progress: [█████░░░░░] 50% of Phase 8 plans (3 of 6). Live milestone: Phases 8-15; Phase 7 retired; Phases 1-6 archived under `.planning/milestones/b3-microkernel/`.
+Progress: [░░░░░░░░░░] 0% of Phase 8 plans (3 of 6). Live milestone: Phases 8-15; Phase 7 retired; Phases 1-6 archived under `.planning/milestones/b3-microkernel/`.
 
 ## Performance Metrics
 
@@ -91,6 +91,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-05
-Stopped at: Resumed; 08-04 waits on Tasks 2-3 (human); proceeding to discuss Phase 9
-Resume file: .planning/phases/08-reference-environment-early-falsifiers-and-threshold-gate/08-GATE.md
+Last session: 2026-11-05T06:40:56.928Z
+Stopped at: Phase 9 context gathered
+Resume file: .planning/phases/09-agent-launcher-and-containment/09-CONTEXT.md
