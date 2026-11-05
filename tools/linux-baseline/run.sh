@@ -3,6 +3,7 @@
 #
 #   tools/linux-baseline/run.sh --run-id ID [--suites micro,broker,deadline,cgroup]
 #       [--configs LIST] [--rounds A-B] [--cpu N] [--smoke] [--tag T]
+#       [--wrap W]    (micro only, needs --tag; W is split on whitespace and goes before bin/micro)
 #
 # Every benchmark process is pinned to one CPU with taskset. Configurations are interleaved within
 # each round (C0 C1a C1b ... in order) and each runs in a fresh process.
@@ -19,9 +20,10 @@ ROUNDS="1-5"
 CPU=2
 SMOKE=0
 TAG=""
+WRAP=""
 
 usage() {
-	sed -n '2,8p' "$0" >&2
+	sed -n '2,9p' "$0" >&2
 	exit 64
 }
 
@@ -34,6 +36,7 @@ while [ $# -gt 0 ]; do
 	--cpu) CPU="$2"; shift 2 ;;
 	--smoke) SMOKE=1; shift ;;
 	--tag) TAG="$2"; shift 2 ;;
+	--wrap) WRAP="$2"; shift 2 ;;
 	*) usage ;;
 	esac
 done
@@ -62,6 +65,15 @@ if [ -n "$TAG" ]; then
 	,micro,) ;;
 	*) echo "run.sh: --tag is valid with --suites micro only" >&2; exit 64 ;;
 	esac
+fi
+if [ -n "$WRAP" ] && [ -z "$TAG" ]; then
+	echo "run.sh: --wrap needs --tag" >&2
+	exit 64
+fi
+# Wrapper argv spliced between taskset and bin/micro. Empty by default, which expands to no words.
+WRAP_ARGV=()
+if [ -n "$WRAP" ]; then
+	read -r -a WRAP_ARGV <<<"$WRAP"
 fi
 
 for b in micro broker deadline cgbench floor; do
@@ -175,6 +187,9 @@ suite_begin() { # suite configs
 	fi
 	kv "requested_${s}_configs" "${cfgs// /,}"
 	kv "requested_${s}_rounds" "$ROUNDS"
+	if [ -n "$WRAP" ]; then
+		kv "wrap_${s}_${TAG}" "$WRAP"
+	fi
 	SUITE_T0=$(date +%s)
 }
 
@@ -207,7 +222,7 @@ run_micro() {
 				exit 3
 			fi
 			log "micro round $r config $label"
-			taskset -c "$CPU" "$BIN/micro" --config "$c" --round "$r" \
+			taskset -c "$CPU" "${WRAP_ARGV[@]}" "$BIN/micro" --config "$c" --round "$r" \
 				--tmpfs-dir "$WORK_TMPFS" --root-dir "$WORK_ROOTFS" \
 				--out "$RUNDIR/micro.csv" --selfcheck "$RUNDIR/selfcheck.txt" \
 				"${SMOKE_ARG[@]}" "${extra[@]}" 2>>"$LOG" || {
