@@ -121,6 +121,36 @@ fn cgroup_directory_rename_is_eperm() {
     let e = fs::rename(&a.dir, &to).expect_err("cgroup2 rename must fail");
     assert_eq!(e.raw_os_error(), Some(libc::EPERM), "{e}");
     assert!(a.dir.exists() && !to.exists());
+    let o = whois(&["--pid", &_live.pid.to_string()]);
+    assert_eq!(kv(&o.stdout)["agent_id"], a.name, "agent_id unchanged");
+}
+
+#[test]
+fn a_second_task_in_the_subtree_resolves_the_same_agent() {
+    let a = Agent::new("second");
+    let live = start_root(&a, &["--on-behalf-of", "alice@example.org"]);
+
+    // A task the launcher never spawned, moved into the agent's main leaf.
+    let mut other = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn sleep");
+    fs::write(a.leaf().join("cgroup.procs"), other.id().to_string()).expect("move task");
+
+    let first = kv(&whois(&["--pid", &live.pid.to_string()]).stdout);
+    let second = whois(&["--pid", &other.id().to_string()]);
+    let _ = other.kill();
+    let _ = other.wait();
+    assert_eq!(second.code, 0, "stderr: {}", second.stderr);
+    let second = kv(&second.stdout);
+    for k in ["agent_id", "on_behalf_of", "parent", "cgroup_id"] {
+        assert_eq!(
+            first[k], second[k],
+            "{k} differs between tasks of one agent"
+        );
+    }
+    assert_eq!(second["agent_id"], a.name);
+    assert_eq!(second["on_behalf_of"], "alice@example.org");
 }
 
 // ---------------------------------------------------------------------------
