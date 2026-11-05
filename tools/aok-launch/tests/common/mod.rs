@@ -106,6 +106,37 @@ fn remove_tree(dir: &Path) {
     }
 }
 
+static SCRATCH: AtomicU32 = AtomicU32::new(0);
+
+/// A fresh directory under the system temp dir (`/tmp`), removed on drop.
+/// Agents get no grant on `/tmp` by default, so a test that wants an agent to
+/// read or run something here passes `--grant` for it.
+pub struct Scratch(PathBuf);
+
+impl Scratch {
+    pub fn new(tag: &str) -> Scratch {
+        let n = SCRATCH.fetch_add(1, Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!("aok-{tag}-{}-{n}", std::process::id()));
+        fs::create_dir(&p).expect("create scratch dir");
+        Scratch(p)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// The directory as a `&str`, for building `--grant` specs.
+    pub fn s(&self) -> &str {
+        self.0.to_str().expect("utf-8 temp path")
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// The result of running the launcher to completion.
 pub struct Out {
     pub code: i32,

@@ -8,34 +8,8 @@
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use common::*;
-
-static DIRS: AtomicU32 = AtomicU32::new(0);
-
-/// A fresh directory under /tmp, removed on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Scratch {
-        let n = DIRS.fetch_add(1, Ordering::SeqCst);
-        let p = std::env::temp_dir().join(format!("aok-{tag}-{}-{n}", std::process::id()));
-        fs::create_dir(&p).expect("create scratch dir");
-        Scratch(p)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn exe() -> &'static str {
     env!("CARGO_BIN_EXE_aok-launch")
