@@ -1,0 +1,17 @@
+[package]
+name = "aok-launch"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "aok_launch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aok-launch"
+path = "src/main.rs"
+
+[dependencies]
+libc = "=0.2.191"
+landlock = "=0.4.7"
+seccompiler = "=0.5.0"
