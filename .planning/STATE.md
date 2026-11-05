@@ -3,7 +3,7 @@ gsd_state_version: "1.0"
 current_phase: 9
 current_phase_name: Agent launcher and containment
 status: executing
-stopped_at: Phase 9 wave 4 complete (09-01 to 09-04 done); wave 5 (09-05) next
+stopped_at: Phase 9 wave 5 complete (09-01 to 09-05 done); wave 6 (09-06) next
 last_updated: "2026-11-05T09:36:32.319Z"
 last_activity: 2026-11-05
 last_activity_desc: Phase 09 execution started
@@ -12,8 +12,8 @@ progress:
   total_phases: 8
   completed_phases: 0
   total_plans: 12
-  completed_plans: 7
-  percent: 58
+  completed_plans: 8
+  percent: 67
 ---
 
 # Project State
@@ -27,17 +27,17 @@ See: .planning/PROJECT.md (updated 2026-10-26)
 
 ## Current Position
 
-Phase: 09 (Agent launcher and containment) — EXECUTING, wave 5 of 6 next (09-01 to 09-04 done)
+Phase: 09 (Agent launcher and containment) — EXECUTING, wave 6 of 6 next (09-01 to 09-05 done)
 Phase 8 (Reference environment, early falsifiers and threshold gate) — parked on human checkpoints. Plan 08-04 (wave 2); plans 08-01, 08-02, 08-03 done; 08-05 and 08-06 blocked on 08-04.
 Phase 8 status: 08-04 Task 1 (gate template) committed in 91a1d50. Task 2 (user types the OQ1/OQ2/OQ7 Answers in 08-GATE.md) and Task 3 (dual-boot reference host and `bpflsm.sh --probe`) are open and human-only.
 Last activity: 2026-11-05 — Phase 09 execution started
 
-Progress: [██████░░░░] 58% of planned plans in the live milestone (7 of 12: Phase 8 has 3 of 6 done, Phase 9 has 4 of 6). Phase 9 planned 2026-11-05 with plan-check override: 09-03 is sized over budget (115k vs 100k, low confidence), one warning accepted. Live milestone: Phases 8-15; Phase 7 retired; Phases 1-6 archived under `.planning/milestones/b3-microkernel/`.
+Progress: [███████░░░] 67% of planned plans in the live milestone (8 of 12: Phase 8 has 3 of 6 done, Phase 9 has 5 of 6). Phase 9 planned 2026-11-05 with plan-check override: 09-03 is sized over budget (115k vs 100k, low confidence), one warning accepted. Live milestone: Phases 8-15; Phase 7 retired; Phases 1-6 archived under `.planning/milestones/b3-microkernel/`.
 
 ## Performance Metrics
 
 **Velocity:**
-- Plans completed in the live milestone: 7 (3 in Phase 8, 4 in Phase 9)
+- Plans completed in the live milestone: 8 (3 in Phase 8, 5 in Phase 9)
 - Average duration: -
 - Total execution time: -
 
@@ -46,7 +46,7 @@ Progress: [██████░░░░] 58% of planned plans in the live mile
 | Phase | Plans done | Total | Avg/Plan |
 |-------|-----------|-------|----------|
 | 08 | 3 | 6 | - |
-| 09 | 4 | 6 | - |
+| 09 | 5 | 6 | - |
 
 *B3 metrics (Phase 1: 8 plans) went to the archive with the milestone.*
 
@@ -93,5 +93,5 @@ Items acknowledged and deferred at milestone close, most recent first:
 ## Session Continuity
 
 Last session: 2026-11-05T09:33:21.392Z
-Stopped at: Phase 9 wave 4 complete (09-01 to 09-04 done); wave 5 (09-05) next
-Resume file: .planning/phases/09-agent-launcher-and-containment/09-05-PLAN.md
+Stopped at: Phase 9 wave 5 complete (09-01 to 09-05 done); wave 6 (09-06) next
+Resume file: .planning/phases/09-agent-launcher-and-containment/09-06-PLAN.md
