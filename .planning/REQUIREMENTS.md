@@ -95,17 +95,17 @@ It is ASSUMED, not shown, that they transfer to bare metal or to the target dist
 
 ### Agent launcher and containment (LNCH)
 
-- [ ] **LNCH-01**: Each agent is spawned with `clone3` and `CLONE_INTO_CGROUP` into its own cgroup v2 cgroup in a delegated subtree; sub-agents are child cgroups of their parent's. On a kernel without the flag, the fork, move, exec fallback runs, and the test reports the spawn-time window it leaves. Test: the child's first action reads its own cgroup and finds the agent cgroup, and a sub-agent's cgroup is a descendant of its parent's. Source: goal 1; ADR 0004 decision 1; gap analysis 1a; scoping-linux.md section 3 (CLONE_INTO_CGROUP fallback). linux-baseline.md section 9 already shows `CLONE_INTO_CGROUP` working on the baseline host.
-- [ ] **LNCH-02**: An agent's identity record (`agent_id`, `on_behalf_of`, parent) is bound to its cgroup id. A peer can resolve it from a pidfd through `PIDFD_GET_INFO` with `PIDFD_INFO_CGROUPID`. Where that is absent, the fallback is `SO_PEERCRED` plus `/proc/PID/cgroup`, which is racy against pid reuse. Test: a peer holding a pidfd for any task in the agent's subtree resolves the same `agent_id`; on the fallback path the test reports the race it cannot close. Source: goal 1; gap analysis 1a, 2f; scoping-linux.md section 3 (PIDFD_GET_INFO fallback).
-- [ ] **LNCH-03**: A sub-agent gets a subset of its parent's authority, never more:
+- [x] **LNCH-01**: Each agent is spawned with `clone3` and `CLONE_INTO_CGROUP` into its own cgroup v2 cgroup in a delegated subtree; sub-agents are child cgroups of their parent's. On a kernel without the flag, the fork, move, exec fallback runs, and the test reports the spawn-time window it leaves. Test: the child's first action reads its own cgroup and finds the agent cgroup, and a sub-agent's cgroup is a descendant of its parent's. Source: goal 1; ADR 0004 decision 1; gap analysis 1a; scoping-linux.md section 3 (CLONE_INTO_CGROUP fallback). linux-baseline.md section 9 already shows `CLONE_INTO_CGROUP` working on the baseline host.
+- [x] **LNCH-02**: An agent's identity record (`agent_id`, `on_behalf_of`, parent) is bound to its cgroup id. A peer can resolve it from a pidfd through `PIDFD_GET_INFO` with `PIDFD_INFO_CGROUPID`. Where that is absent, the fallback is `SO_PEERCRED` plus `/proc/PID/cgroup`, which is racy against pid reuse. Test: a peer holding a pidfd for any task in the agent's subtree resolves the same `agent_id`; on the fallback path the test reports the race it cannot close. Source: goal 1; gap analysis 1a, 2f; scoping-linux.md section 3 (PIDFD_GET_INFO fallback).
+- [x] **LNCH-03**: A sub-agent gets a subset of its parent's authority, never more:
   - its Landlock ruleset is layered on the parent's domain
   - its seccomp filter stacks on the parent's
   - `no_new_privs` is set, by `CLONE_NNP` where present, else by `prctl` before exec.
 
   Test: a sub-agent granted a path its parent lacks still cannot open it; a sub-agent cannot remove an inherited Landlock rule or seccomp filter; and its `/proc/self/status` shows `NoNewPrivs: 1`. Source: goal 1; ADR 0004 decisions 3 and 4; gap analysis 1c; scoping-linux.md section 3 (CLONE_NNP fallback).
-- [ ] **LNCH-04**: A non-agent child of an agent (fork, exec of an ordinary binary, `sh -c`) inherits the agent's cgroup, Landlock domain and seccomp filter, so shelling out does not escape. Test: a `sh -c` grandchild reports the agent's cgroup id and is refused the same out-of-grant path as the agent. Source: goal 1; gap analysis 2i.
-- [ ] **LNCH-05**: The launcher freezes, thaws and kills an agent's whole subtree with `cgroup.freeze` and `cgroup.kill`, and reports exit to the parent through a pidfd. Test: after a freeze, `cgroup.events` reads `frozen 1` and no task in the subtree runs; after `cgroup.kill` every task is reaped. This retires the ASSUMED item that `cgroup.freeze` works on a delegated leaf. Source: goal 1 (lifecycle); ADR 0004 decision 5; linux-baseline.md section 9 (ASSUMED list).
-- [ ] **LNCH-06**: Launcher denials return standard errno values. The seccomp filter is an allowlist that makes no pointer-argument decision. Test: every denial in the Phase 9 test set returns a documented errno rather than killing the process, and the filter source inspects no pointer argument. Source: goal 2 (errno); ADR 0004 decision 4.
+- [x] **LNCH-04**: A non-agent child of an agent (fork, exec of an ordinary binary, `sh -c`) inherits the agent's cgroup, Landlock domain and seccomp filter, so shelling out does not escape. Test: a `sh -c` grandchild reports the agent's cgroup id and is refused the same out-of-grant path as the agent. Source: goal 1; gap analysis 2i.
+- [x] **LNCH-05**: The launcher freezes, thaws and kills an agent's whole subtree with `cgroup.freeze` and `cgroup.kill`, and reports exit to the parent through a pidfd. Test: after a freeze, `cgroup.events` reads `frozen 1` and no task in the subtree runs; after `cgroup.kill` every task is reaped. This retires the ASSUMED item that `cgroup.freeze` works on a delegated leaf. Source: goal 1 (lifecycle); ADR 0004 decision 5; linux-baseline.md section 9 (ASSUMED list).
+- [x] **LNCH-06**: Launcher denials return standard errno values. The seccomp filter is an allowlist that makes no pointer-argument decision. Test: every denial in the Phase 9 test set returns a documented errno rather than killing the process, and the filter source inspects no pointer argument. Source: goal 2 (errno); ADR 0004 decision 4.
 
 ### Broker (BRK)
 
@@ -250,12 +250,12 @@ Each v1 requirement maps to exactly one phase: the phase that first builds or de
 | DEC-03 | Phase 8 | Pending |
 | DEC-04 | Phase 14 | Pending |
 | DEC-05 | Phase 14 | Pending |
-| LNCH-01 | Phase 9 | Pending |
-| LNCH-02 | Phase 9 | Pending |
-| LNCH-03 | Phase 9 | Pending |
-| LNCH-04 | Phase 9 | Pending |
-| LNCH-05 | Phase 9 | Pending |
-| LNCH-06 | Phase 9 | Pending |
+| LNCH-01 | Phase 9 | Complete |
+| LNCH-02 | Phase 9 | Complete |
+| LNCH-03 | Phase 9 | Complete |
+| LNCH-04 | Phase 9 | Complete |
+| LNCH-05 | Phase 9 | Complete |
+| LNCH-06 | Phase 9 | Complete |
 | BRK-01 | Phase 10 | Pending |
 | BRK-02 | Phase 10 | Pending |
 | BRK-03 | Phase 10 | Pending |

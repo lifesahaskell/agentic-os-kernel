@@ -125,7 +125,7 @@ to 13 cannot complete without it.
 ### Linux prototype (current)
 
 - [ ] **Phase 8: Reference environment, early falsifiers and threshold gate** - privileged reference host, BPF-LSM per-hook and per-cgroup cost, adversarial skeleton, early S5 read, S1-S9 and floor acceptance
-- [ ] **Phase 9: Agent launcher and containment** - cgroup per agent via `CLONE_INTO_CGROUP`, pidfd-resolvable identity, Landlock and seccomp narrowing, inheritance, freeze and kill
+- [x] **Phase 9: Agent launcher and containment** - cgroup per agent via `CLONE_INTO_CGROUP`, pidfd-resolvable identity, Landlock and seccomp narrowing, inheritance, freeze and kill (completed 2026-11-05)
 - [ ] **Phase 10: Broker** - kernel-supplied caller identity, tool and egress mediation with held credentials, token, money and wall-time budgets, trusted-path escalation, attribution
 - [ ] **Phase 11: BPF-LSM mediation and adversarial run** - deny-by-default per-agent policy, identity propagation, io_uring closure, S1, S2, S3 and S5 on the full stack
 - [ ] **Phase 12: Distro floor and POSIX non-interference** - stock-kernel boots, TO-VERIFY items, per-distro verdicts and S1, S9 and POSX-02
@@ -460,7 +460,7 @@ Phase 7 is retired. Phases 1-6 are archived (see the archived milestone block ab
 |-------|----------------|--------|-----------|
 | 7. Recursion and cheap-inference spikes | 0/0 | Retired (moved to Phase 15) | - |
 | 8. Reference environment, early falsifiers and threshold gate | 3/6 | In Progress | - |
-| 9. Agent launcher and containment | 6/6 | In Progress | - |
+| 9. Agent launcher and containment | 6/6 | Complete | 2026-11-05 |
 | 10. Broker | 0/0 | Not started | - |
 | 11. BPF-LSM mediation and adversarial run | 0/0 | Not started | - |
 | 12. Distro floor and POSIX non-interference | 0/0 | Not started | - |
