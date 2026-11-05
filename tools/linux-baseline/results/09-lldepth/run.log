@@ -1,0 +1,106 @@
+micro round 1 config C0
+micro round 2 config C0
+micro round 3 config C0
+micro round 4 config C0
+micro round 5 config C0
+done: tools/linux-baseline/results/09-lldepth
+micro round 1 config C0-lldepth-1
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r14160ef5f87e4b859a95378579098d73.scope/lldepth-1
+aok-launch: spawn_path=clone3
+run.sh: micro round 1 config C0-lldepth-1 failed
+micro round 2 config C0-lldepth-1
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-rbdee06c50b9a463a8a797706a0a88d21.scope/lldepth-1
+aok-launch: spawn_path=clone3
+run.sh: micro round 2 config C0-lldepth-1 failed
+micro round 3 config C0-lldepth-1
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-rd9a80f5287f8445bb782badc2f4669a4.scope/lldepth-1
+aok-launch: spawn_path=clone3
+run.sh: micro round 3 config C0-lldepth-1 failed
+micro round 4 config C0-lldepth-1
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r5c60deba82914c16a404f9a520ee3fae.scope/lldepth-1
+aok-launch: spawn_path=clone3
+run.sh: micro round 4 config C0-lldepth-1 failed
+micro round 5 config C0-lldepth-1
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r53f4d852cf59427da501bb26f58328e4.scope/lldepth-1
+aok-launch: spawn_path=clone3
+run.sh: micro round 5 config C0-lldepth-1 failed
+micro round 1 config C0-lldepth-2
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-re0b6b23d7f784c278300676ba8e4a8d3.scope/lldepth-2
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-re0b6b23d7f784c278300676ba8e4a8d3.scope/lldepth-2/d2
+aok-launch: spawn_path=clone3
+aok-launch: spawn_path=clone3
+run.sh: micro round 1 config C0-lldepth-2 failed
+micro round 2 config C0-lldepth-2
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-rcbafb2a0b6de4189a01b9d830cca731d.scope/lldepth-2
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-rcbafb2a0b6de4189a01b9d830cca731d.scope/lldepth-2/d2
+aok-launch: spawn_path=clone3
+run.sh: micro round 2 config C0-lldepth-2 failed
+micro round 3 config C0-lldepth-2
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r112c44f56f8c44c2be6158bb5be8325d.scope/lldepth-2
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r112c44f56f8c44c2be6158bb5be8325d.scope/lldepth-2/d2
+aok-launch: spawn_path=clone3
+run.sh: micro round 3 config C0-lldepth-2 failed
+micro round 4 config C0-lldepth-2
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r85e90d9c00ca4b509e7d71576cfc0d14.scope/lldepth-2
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r85e90d9c00ca4b509e7d71576cfc0d14.scope/lldepth-2/d2
+aok-launch: spawn_path=clone3
+run.sh: micro round 4 config C0-lldepth-2 failed
+micro round 5 config C0-lldepth-2
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r4a4306724d7449389e7e31caebece875.scope/lldepth-2
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r4a4306724d7449389e7e31caebece875.scope/lldepth-2/d2
+aok-launch: spawn_path=clone3
+run.sh: micro round 5 config C0-lldepth-2 failed
+micro round 1 config C0-lldepth-4
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r84caefa225c74f0d9eebea33e3f0db09.scope/lldepth-4
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r84caefa225c74f0d9eebea33e3f0db09.scope/lldepth-4/d2
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r84caefa225c74f0d9eebea33e3f0db09.scope/lldepth-4/d2/d3
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r84caefa225c74f0d9eebea33e3f0db09.scope/lldepth-4/d2/d3/d4
+aok-launch: spawn_path=clone3
+run.sh: micro round 1 config C0-lldepth-4 failed
+micro round 2 config C0-lldepth-4
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r3b0f9ab50b7b4923b121a78288c8737e.scope/lldepth-4
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r3b0f9ab50b7b4923b121a78288c8737e.scope/lldepth-4/d2
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r3b0f9ab50b7b4923b121a78288c8737e.scope/lldepth-4/d2/d3
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r3b0f9ab50b7b4923b121a78288c8737e.scope/lldepth-4/d2/d3/d4
+aok-launch: spawn_path=clone3
+run.sh: micro round 2 config C0-lldepth-4 failed
+micro round 3 config C0-lldepth-4
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-rd94d15da2ad04892986907eca736edf4.scope/lldepth-4
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-rd94d15da2ad04892986907eca736edf4.scope/lldepth-4/d2
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-rd94d15da2ad04892986907eca736edf4.scope/lldepth-4/d2/d3
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-rd94d15da2ad04892986907eca736edf4.scope/lldepth-4/d2/d3/d4
+aok-launch: spawn_path=clone3
+run.sh: micro round 3 config C0-lldepth-4 failed
+micro round 4 config C0-lldepth-4
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r857a3eb9dd63445bae13c9d72494acbf.scope/lldepth-4
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r857a3eb9dd63445bae13c9d72494acbf.scope/lldepth-4/d2
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r857a3eb9dd63445bae13c9d72494acbf.scope/lldepth-4/d2/d3
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r857a3eb9dd63445bae13c9d72494acbf.scope/lldepth-4/d2/d3/d4
+aok-launch: spawn_path=clone3
+run.sh: micro round 4 config C0-lldepth-4 failed
+micro round 5 config C0-lldepth-4
+aok-launch: role=root agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r3ec32fc1a046495eb0a5390d926ac02a.scope/lldepth-4
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r3ec32fc1a046495eb0a5390d926ac02a.scope/lldepth-4/d2
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r3ec32fc1a046495eb0a5390d926ac02a.scope/lldepth-4/d2/d3
+aok-launch: spawn_path=clone3
+aok-launch: spawn_path=clone3
+aok-launch: role=sub agent=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r3ec32fc1a046495eb0a5390d926ac02a.scope/lldepth-4/d2/d3/d4
+aok-launch: spawn_path=clone3
+run.sh: micro round 5 config C0-lldepth-4 failed
