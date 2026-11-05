@@ -147,3 +147,82 @@ fn name_guard() {
         assert_eq!(o.code, 0, "stderr: {}", o.stderr);
     }
 }
+
+/// Run the launcher through the D-13 shim so the kernel appears to lack
+/// `clone3`. The launcher sees a real ENOSYS from a real syscall.
+fn shimmed(fakes: &[&str], launcher_args: &[&str]) -> Out {
+    let mut args: Vec<&str> = Vec::new();
+    for f in fakes {
+        args.push("--fake");
+        args.push(f);
+    }
+    args.push("--");
+    args.push(env!("CARGO_BIN_EXE_aok-launch"));
+    args.extend_from_slice(launcher_args);
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_aok-shim"))
+        .args(&args)
+        .output()
+        .expect("spawn aok-shim");
+    Out {
+        code: o.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn fallback_reaches_cgroup() {
+    let a = Agent::new("fallback");
+    let o = shimmed(
+        &["clone3-enosys"],
+        &[
+            "run",
+            "--name",
+            &a.name,
+            "--",
+            "sh",
+            "-c",
+            "cat /proc/self/cgroup",
+        ],
+    );
+    assert_eq!(o.code, 0, "stderr: {}", o.stderr);
+    // The fork + move fallback lands the child in the same leaf. The cat has
+    // run after the move, so this proves the move happened before exec.
+    assert_eq!(o.stdout.trim(), cgroup_line(&a.leaf()));
+    assert!(
+        o.stderr.contains("spawn_path=fallback"),
+        "stderr: {}",
+        o.stderr
+    );
+    assert!(o.stderr.contains("window_us="), "stderr: {}", o.stderr);
+
+    // Without the fake, the same launch takes the clone3 path.
+    let o = launch(&[
+        "run",
+        "--name",
+        &a.name,
+        "--",
+        "sh",
+        "-c",
+        "cat /proc/self/cgroup",
+    ]);
+    assert_eq!(o.code, 0, "stderr: {}", o.stderr);
+    assert!(
+        o.stderr.contains("spawn_path=clone3"),
+        "stderr: {}",
+        o.stderr
+    );
+}
+
+#[test]
+fn clone3_eperm_is_not_a_fallback() {
+    let a = Agent::new("eperm");
+    let o = shimmed(&["clone3-eperm"], &["run", "--name", &a.name, "--", "true"]);
+    assert_eq!(o.code, 125, "stderr: {}", o.stderr);
+    assert!(o.stderr.contains("clone3: EPERM"), "stderr: {}", o.stderr);
+    assert!(
+        !o.stderr.contains("spawn_path=fallback"),
+        "stderr: {}",
+        o.stderr
+    );
+}
