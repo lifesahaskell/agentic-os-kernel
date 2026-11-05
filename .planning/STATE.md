@@ -1,19 +1,19 @@
 ---
 gsd_state_version: "1.0"
-current_phase: 8
-current_phase_name: Reference environment, early falsifiers and threshold gate
+current_phase: 9
+current_phase_name: Agent launcher and containment
 status: executing
-stopped_at: Phase 9 context gathered
-last_updated: "2026-11-05T06:40:56.954Z"
+stopped_at: Phase 9 planned (6 plans, 6 serial waves); ready to execute
+last_updated: "2026-11-05T09:33:21.392Z"
 last_activity: 2026-11-05
 last_activity_desc: Resumed; B3 resume files archived, reference-host date moved to 2026-11-19
-state_head: 13bebebb74e400b9d1e3ed260671d1cfea80b1a6
+state_head: 2d00053e6ccb4a9a284b5f4693b05f2ff90cc5ad
 progress:
   total_phases: 8
   completed_phases: 0
-  total_plans: 6
+  total_plans: 12
   completed_plans: 3
-  percent: 50
+  percent: 25
 ---
 
 # Project State
@@ -27,12 +27,12 @@ See: .planning/PROJECT.md (updated 2026-10-26)
 
 ## Current Position
 
-Phase: 8 (Reference environment, early falsifiers and threshold gate) — EXECUTING, parked on human checkpoints
-Plan: 08-04 (wave 2). Plans 08-01, 08-02, 08-03 done; 08-05 and 08-06 blocked on 08-04.
-Status: 08-04 Task 1 (gate template) committed in 91a1d50. Task 2 (user types the OQ1/OQ2/OQ7 Answers in 08-GATE.md) and Task 3 (dual-boot reference host and `bpflsm.sh --probe`) are open and human-only.
+Phase: 9 (Agent launcher and containment) — PLANNED, ready to execute. 6 plans in 6 serial waves (09-01 .. 09-06).
+Phase 8 (Reference environment, early falsifiers and threshold gate) — parked on human checkpoints. Plan 08-04 (wave 2); plans 08-01, 08-02, 08-03 done; 08-05 and 08-06 blocked on 08-04.
+Phase 8 status: 08-04 Task 1 (gate template) committed in 91a1d50. Task 2 (user types the OQ1/OQ2/OQ7 Answers in 08-GATE.md) and Task 3 (dual-boot reference host and `bpflsm.sh --probe`) are open and human-only.
 Last activity: 2026-11-05 — resumed; D-03 host date moved from 2026-11-04 to 2026-11-19
 
-Progress: [█████░░░░░] 50% of Phase 8 plans (3 of 6). Phase 9 context gathered 2026-11-05 (`13bebeb`), not yet planned. Live milestone: Phases 8-15; Phase 7 retired; Phases 1-6 archived under `.planning/milestones/b3-microkernel/`.
+Progress: [██░░░░░░░░] 25% of planned plans in the live milestone (3 of 12: Phase 8 has 3 of 6 done, Phase 9 has 0 of 6). Phase 9 planned 2026-11-05 with plan-check override: 09-03 is sized over budget (115k vs 100k, low confidence), one warning accepted. Live milestone: Phases 8-15; Phase 7 retired; Phases 1-6 archived under `.planning/milestones/b3-microkernel/`.
 
 ## Performance Metrics
 
@@ -46,6 +46,7 @@ Progress: [█████░░░░░] 50% of Phase 8 plans (3 of 6). Phase 
 | Phase | Plans done | Total | Avg/Plan |
 |-------|-----------|-------|----------|
 | 08 | 3 | 6 | - |
+| 09 | 0 | 6 | - |
 
 *B3 metrics (Phase 1: 8 plans) went to the archive with the milestone.*
 
@@ -91,6 +92,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-05T06:40:56.928Z
-Stopped at: Phase 9 context gathered
-Resume file: .planning/phases/09-agent-launcher-and-containment/09-CONTEXT.md
+Last session: 2026-11-05T09:33:21.392Z
+Stopped at: Phase 9 planned (6 plans, 6 serial waves); ready to execute
+Resume file: .planning/phases/09-agent-launcher-and-containment/09-01-PLAN.md

@@ -265,7 +265,19 @@ Plans:
   - **The subset rule may not hold.** If a sub-agent ends with authority its parent lacks under Landlock layering and seccomp stacking, launcher-side narrowing is the wrong place for authority, and it moves to the per-agent BPF-LSM policy in Phase 11.
 **Research:** Landlock layering at ABI 6 against ABI 7, because Debian 13 and RHEL 10 sit at ABI 6. `clone3` with `CLONE_INTO_CGROUP` from an unprivileged delegated subtree. Whether seccomp filters can be removed (the gap analysis 1c labels "cannot be removed" A, not verified).
 **Decisions due:** The seccomp default action; LNCH-06 assumes ERRNO *(interpretation)*. Where the identity record lives before Phase 11 adds cgroup or task storage.
-**Plans:** TBD
+**Plans:** 6 plans across 6 waves, one plan per wave. The waves are serial on purpose: 09-03 needs the real registry and runs 09-02's tests under default-deny, 09-03 and 09-04 both write the shared registry, and 09-05's CPU-pinned depth reads must not run beside a cargo test.
+- **Wave 1:**
+  - [ ] 09-01-PLAN.md — crate scaffold, sys module, spawn into cgroup, freeze/thaw/kill, the fork+move+exec fallback and the D-13 shim (LNCH-01, LNCH-05)
+- **Wave 2:**
+  - [ ] 09-02-PLAN.md — pidfd identity resolution, whois, the registry, the SO_PEERCRED fallback, xattr-forgery negative control (LNCH-02)
+- **Wave 3:**
+  - [ ] 09-03-PLAN.md — Landlock layer and floor, hand-assembled seccomp allow-list, errno contract, inheritance across `sh -c`, depth cap, non-widening, the registry out of an agent's reach, and the whole crate green under default-deny (LNCH-02, LNCH-03, LNCH-04, LNCH-06)
+- **Wave 4:**
+  - [ ] 09-04-PLAN.md — shim-driven fallback tests (spawn-fallback window, identity-fallback race), labelled simulated (LNCH-01, LNCH-02)
+- **Wave 5:**
+  - [ ] 09-05-PLAN.md — additive `--wrap` hook in run.sh with a byte-identity proof, D-16 indicative depth reads (LNCH-03)
+- **Wave 6:**
+  - [ ] 09-06-PLAN.md — whole-crate fmt/clippy, full suite in one scope, 09-ALLOWLIST.md, 09-REPORT.md and the VALIDATION sign-off (LNCH-01..LNCH-06)
 
 ### Phase 10: Broker
 
