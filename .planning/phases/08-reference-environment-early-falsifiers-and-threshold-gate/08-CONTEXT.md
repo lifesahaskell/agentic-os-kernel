@@ -35,6 +35,8 @@ whether.
   2026-10-28). Phases 9 and 10 need no privilege and run first meanwhile. If the date passes
   unmet, the roadmap's "wrong thing to do" entry applies: run Phases 9 and 10 first and report the
   untested ADR 0004 decision 2 to the user.
+  *Amended 2026-11-05: the date passed unmet. New target 2026-11-19 (user). Phases 9 and 10 run
+  first; ADR 0004 decision 2 is reported untested until the probe runs.*
 - **D-04:** "Ready" means the probe shows all of: `bpf` in `/sys/kernel/security/lsm`
   (`active_lsms`), BTF present, Landlock ABI recorded, each scoping-linux.md section 3 floor row
   recorded present or absent, and a trivial **global** `lsm/file_open` program loads and attaches

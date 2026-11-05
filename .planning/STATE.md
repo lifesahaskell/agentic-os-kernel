@@ -3,17 +3,17 @@ gsd_state_version: "1.0"
 current_phase: 8
 current_phase_name: Reference environment, early falsifiers and threshold gate
 status: executing
-stopped_at: Phase 8 context gathered
-last_updated: "2026-10-28T07:44:24.904Z"
-last_activity: 2026-10-28
-last_activity_desc: Phase 8 execution started
-state_head: cf8766e5ccc6a82660c210827a18b825cf0abd87
+stopped_at: "Resumed 2026-11-05; 08-04 waits on Tasks 2-3 (both human)"
+last_updated: "2026-11-05T06:18:49.262Z"
+last_activity: 2026-11-05
+last_activity_desc: Resumed; B3 resume files archived, reference-host date moved to 2026-11-19
+state_head: 51d197c7a601cfb7145d912a189ac905b69b804a
 progress:
-  total_phases: 9
-  completed_phases: 1
+  total_phases: 8
+  completed_phases: 0
   total_plans: 6
-  completed_plans: 8
-  percent: 11
+  completed_plans: 3
+  percent: 50
 ---
 
 # Project State
@@ -27,53 +27,42 @@ See: .planning/PROJECT.md (updated 2026-10-26)
 
 ## Current Position
 
-Phase: 8 (Reference environment, early falsifiers and threshold gate) — EXECUTING
-Plan: 1 of 6
-Status: Executing Phase 8
-Last activity: 2026-10-28 — Phase 8 execution started
+Phase: 8 (Reference environment, early falsifiers and threshold gate) — EXECUTING, parked on human checkpoints
+Plan: 08-04 (wave 2). Plans 08-01, 08-02, 08-03 done; 08-05 and 08-06 blocked on 08-04.
+Status: 08-04 Task 1 (gate template) committed in 91a1d50. Task 2 (user types the OQ1/OQ2/OQ7 Answers in 08-GATE.md) and Task 3 (dual-boot reference host and `bpflsm.sh --probe`) are open and human-only.
+Last activity: 2026-11-05 — resumed; D-03 host date moved from 2026-11-04 to 2026-11-19
 
-Progress: [█░░░░░░░░░] 11%
+Progress: [█████░░░░░] 50% of Phase 8 plans (3 of 6). Live milestone: Phases 8-15; Phase 7 retired; Phases 1-6 archived under `.planning/milestones/b3-microkernel/`.
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 8
+- Plans completed in the live milestone: 3 (all Phase 8)
 - Average duration: -
-- Total execution time: 0.0 hours
+- Total execution time: -
 
 **By Phase:**
 
-| Phase | Plans | Total | Avg/Plan |
-|-------|-------|-------|----------|
-| 01 | 8 | - | - |
+| Phase | Plans done | Total | Avg/Plan |
+|-------|-----------|-------|----------|
+| 08 | 3 | 6 | - |
 
-**Recent Trend:**
-- Last 5 plans: -
-- Trend: -
-
-*Updated after each plan completion*
-**Per-Plan Metrics:**
-
-| Plan | Duration | Tasks | Files |
-|------|----------|-------|-------|
-| Phase 1 P01-01 | 10min | 2 tasks | 22 files |
+*B3 metrics (Phase 1: 8 plans) went to the archive with the milestone.*
 
 ## Accumulated Context
 
 ### Decisions
 
-Decisions are logged in PROJECT.md Key Decisions table.
+Decisions are logged in PROJECT.md Key Decisions table. The B3-era roadmap and Phase 1 decisions moved to `.planning/milestones/b3-microkernel/README.md`.
 Recent decisions affecting current work:
 
-- [Roadmap]: 6 phases, not the researched 8. Research phases 1+2 and 7+8 merged; Phase 6 is the largest (16) and splits after SHELL-04 if planning finds it too big.
-- [Roadmap]: Phases 1-5 use Rust ring-3 test binaries; the C os-test suites first run in Phase 6.
-- [Roadmap]: Requirement maps to the phase that builds its primary component; later legs are separate requirements.
-- [Phase 1]: 01-01: abi path dependency resolves under OSDK; Message is Clone (not Copy) carrying Arc<ReplyWait>; sys_call rejects buffer/cap fields until later plans
+- [Phase 8]: D-03 amended 2026-11-05. The reference-host date passed unmet; new target 2026-11-19 (user). Phases 9 and 10 run first. ADR 0004 decision 2 is reported untested until the probe runs.
 
 ### Roadmap Evolution
 
 - Phase 7 added (2026-10-25): Recursion and cheap-inference spikes. Post-MVP, after Phase 6; source is docs/architecture/research/recursion-and-cheap-inference-spikes.md.
 - Phase 7 retired and Phase 15 added (2026-10-27): Recursion and cheap-inference spikes on the Linux prototype, after Phase 14. Same source; Phases 8-14 keep their numbers.
+- B3 microkernel milestone archived (2026-10-27); its resume files (`HANDOFF.json`, three `.continue-here.md`) moved into the archive directory 2026-11-05.
 
 ### Pending Todos
 
@@ -81,14 +70,9 @@ None yet.
 
 ### Blockers/Concerns
 
-- [Phase 1]: All Phase 1 runtime evidence is QEMU TCG, not KVM. OSDK 0.19.0 never emits `-enable-kvm` and OSDK.toml sets no accelerator, so earlier "QEMU/KVM" labels (b2-spike-report.md line 14, 01-04 SUMMARY) are unverified. The WSL2 guest has no `svm` flag, so there is no `/dev/kvm`. IPC-06 (median 5.43M cycles, p99 7.54M, N=10,000, as recorded in ipc-measurements.md; other TCG runs gave 5.45M/7.34M and 5.79M/8.37M) is provisional. Re-run 01-01..01-07 ktests, boot checks and IPC-06 on a KVM host, and decide on `-enable-kvm` in OSDK.toml (the `-cpu Icelake-Server` model may not run under KVM on AMD).
-- [Phase 1]: User-mode FPU/SSE under OSTD 0.19.0 is the highest-risk unknown. Order: safe route, then contained `unsafe` (ledgered, SAFE-01), then Redox re-score only if both fail or an OSTD patch is needed.
-- [Phase 1]: OSTD 0.19.0 docs.rs build failed; read the source for `boot_info()`, initramfs and serial RX.
-- [Phase 2]: Carry-forward from the Phase 1 verification. RR-01: `cow_clone` unwraps and asserts become ring-3 reachable when procmgr fork or spawn calls it (plans 02-06, 02-07); make it fallible or prove the range. RR-03: `futex.rs:88` maps every `handle_cow_fault` error to `FutexError::Budget`. The three frame-allocation failure branches (01-08) are covered by inspection only; OSTD 0.19.0 has no failure injection.
-- [Phase 3]: Open decisions need Corey's sign-off: read-only grant errno (`EROFS` vs `EACCES`) and cross-domain `kill` errno (`ESRCH` vs `EPERM`). One ADR amending option-b.
-- [Phase 4]: musl is the default libc on source-level evidence only; nothing was built. The Phase 4 spike confirms or overturns it.
-- [Phase 6]: KVM on the CI host is assumed, not checked.
-- [Docs]: Kernel gap IDs (K1-K12) in REQUIREMENTS.md do not match the K-numbering in research/ARCHITECTURE.md (only K10 agrees). Use requirement IDs, not K-numbers.
+- [Phase 8]: ADR 0004 decision 2 (BPF-LSM per-hook and per-cgroup cost, the same-uid broker attack) is untested until the dual-boot reference host is probed. Target 2026-11-19. No `tools/linux-baseline/results/ref-probe/` exists.
+- [Phase 9]: DEC-02 and DEC-03 are unmarked in 08-GATE.md, so the launcher's floor fallbacks and the S3 openat bound are not fixed. Landlock fs alone (C2a) adds 21.04% p50 to `openat_tmpfs` on the WSL2 baseline, against the proposed 10% bound (ROADMAP.md Phase 9, "wrong thing to do").
+- [Phase 8]: OQ1, OQ2 and OQ7 Answers are blank. The plan forbids an agent writing them; the user types them in 08-GATE.md.
 
 ### Quick Tasks Completed
 
@@ -107,6 +91,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-28T05:10:43.791Z
-Stopped at: Phase 8 context gathered
-Resume file: .planning/phases/08-reference-environment-early-falsifiers-and-threshold-gate/08-CONTEXT.md
+Last session: 2026-11-05
+Stopped at: Resumed; 08-04 waits on Tasks 2-3 (human); proceeding to discuss Phase 9
+Resume file: .planning/phases/08-reference-environment-early-falsifiers-and-threshold-gate/08-GATE.md
