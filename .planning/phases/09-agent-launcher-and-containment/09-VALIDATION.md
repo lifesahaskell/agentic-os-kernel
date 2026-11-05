@@ -3,9 +3,9 @@ phase: "09"
 slug: "agent-launcher-and-containment"
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: validated
+nyquist_compliant: true
+wave_0_complete: true
 created: "2026-11-05"
 ---
 
@@ -67,10 +67,10 @@ race. A test never kills a cgroup that contains the test process.
 
 ## Wave 0 Requirements
 
-- [ ] `tools/aok-launch/Cargo.toml` and `rust-toolchain.toml` — copy the aok-adv pins; add `landlock` 0.4.7 and `seccompiler` 0.5.0 — **produced by 09-01-01** (Wave 1)
-- [ ] `tools/aok-launch/tests/common/` — a delegated-scope and cgroup-cleanup fixture; every integration test creates its own leaf and tears it down — **produced by 09-01-01** (Wave 1)
-- [ ] the external seccomp shim test wrapper (D-13) — **produced by 09-01-03** (Wave 1)
-- [ ] an additive `--wrap` / `--tag` hook in `tools/linux-baseline/run.sh` for the D-16 depth reads (same file as Phase 8 plan 08-05; keep the edit additive), and `tools/linux-baseline/check-wrap-identity.sh`, the gate that proves it — **produced by 09-05-01** (Wave 5)
+- [x] `tools/aok-launch/Cargo.toml` and `rust-toolchain.toml` — copy the aok-adv pins; add `landlock` 0.4.7 and `seccompiler` 0.5.0 — **produced by 09-01-01** (Wave 1)
+- [x] `tools/aok-launch/tests/common/` — a delegated-scope and cgroup-cleanup fixture; every integration test creates its own leaf and tears it down — **produced by 09-01-01** (Wave 1)
+- [x] the external seccomp shim test wrapper (D-13) — **produced by 09-01-03** (Wave 1)
+- [x] an additive `--wrap` / `--tag` hook in `tools/linux-baseline/run.sh` for the D-16 depth reads (same file as Phase 8 plan 08-05; keep the edit additive), and `tools/linux-baseline/check-wrap-identity.sh`, the gate that proves it — **produced by 09-05-01** (Wave 5)
 
 ---
 
@@ -85,11 +85,11 @@ race. A test never kills a cgroup that contains the test process.
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 90s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references
+- [x] No watch-mode flags
+- [x] Feedback latency < 90s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** validated by 09-06 on 2026-11-05: 93 tests green in one delegated scope (summed test time about 4.9 s, build cached), fmt and clippy clean; see 09-REPORT.md for the recorded limits (simulated and indicative results, CLONE_NNP not exercised, D-04 ASSUMED)
