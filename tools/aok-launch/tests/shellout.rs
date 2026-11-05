@@ -85,7 +85,7 @@ fn floor_refusal() {
     let host_abi = aok_launch::sys::landlock_create_ruleset_version().unwrap_or(0);
     let note = format!(
         "SIMULATED (D-13): the shim makes landlock_create_ruleset return ENOSYS on a kernel that \
-         has Landlock ABI {host_abi}; no real below-floor kernel was used"
+         has Landlock ABI {host_abi}; the below-floor kernel is simulated, not real"
     );
     println!("floor_refusal: {note}");
 
