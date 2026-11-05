@@ -120,6 +120,37 @@ pub fn peer_identity(sock_fd: RawFd) -> io::Result<PeerIdentity> {
     result
 }
 
+/// A pidfd for whoever is connected to `sock_fd` right now, via
+/// `SO_PEERPIDFD`. The caller owns the returned fd, so it can be resolved with
+/// `pidfd_identity` and reused-proof for as long as it is held.
+pub fn peer_pidfd(sock_fd: RawFd) -> io::Result<OwnedFd> {
+    let mut pidfd: libc::c_int = -1;
+    let mut len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `sock_fd` is a caller-owned socket fd valid for this call;
+    // `pidfd` and `len` are live locals, and getsockopt writes at most
+    // `size_of::<c_int>()` bytes, exactly the size `len` names.
+    let rc = unsafe {
+        libc::getsockopt(
+            sock_fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            &mut pidfd as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(owned_fd(pidfd))
+}
+
+/// The real uid of this process. The registry path is built from it and not
+/// from the environment, which an agent controls (D-08).
+pub fn real_uid() -> u32 {
+    // SAFETY: getuid takes no arguments, cannot fail and touches no memory.
+    unsafe { libc::getuid() }
+}
+
 /// The peer pid from `SO_PEERCRED` on a connected Unix socket. This is the
 /// older-kernel fallback for 09-02: the pid is the one the peer had at
 /// connect time and can be recycled, so the caller must treat it as weaker
