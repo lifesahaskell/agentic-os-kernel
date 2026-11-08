@@ -1,0 +1,58 @@
+{
+  "contract": "1.0.0",
+  "flavor": "core",
+  "milestone": null,
+  "phases": [
+    {
+      "number": "7",
+      "name": "Recursion and cheap-inference spikes",
+      "status": "pending"
+    },
+    {
+      "number": "8",
+      "name": "Reference environment, early falsifiers and threshold gate",
+      "status": "in_progress"
+    },
+    {
+      "number": "9",
+      "name": "Agent launcher and containment",
+      "status": "complete"
+    },
+    {
+      "number": "10",
+      "name": "Broker",
+      "status": "pending"
+    },
+    {
+      "number": "11",
+      "name": "BPF-LSM mediation and adversarial run",
+      "status": "pending"
+    },
+    {
+      "number": "12",
+      "name": "Distro floor and POSIX non-interference",
+      "status": "pending"
+    },
+    {
+      "number": "13",
+      "name": "Fork decision gate",
+      "status": "pending"
+    },
+    {
+      "number": "14",
+      "name": "Inference scheduling and admission control",
+      "status": "pending"
+    },
+    {
+      "number": "15",
+      "name": "Recursion and cheap-inference spikes on the Linux prototype",
+      "status": "pending"
+    }
+  ],
+  "next": {
+    "command": "/gsd-progress --next",
+    "label": "Advance to the next step",
+    "reason": "Phase 2 of 9 · 11% · executing"
+  },
+  "updated_at": "2026-11-05T11:12:05.383Z"
+}
